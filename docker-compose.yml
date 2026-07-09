@@ -1,0 +1,29 @@
+services:
+  locomotion-dev:
+    # Reuse the ready-made deps image (python + node + claude-code). Code and
+    # session are supplied via bind mounts below, so this image is never rebuilt
+    # for code changes — nothing here is baked in, everything persists to host.
+    image: locomotion-console:latest
+    container_name: locomotion-dev
+
+    # Share the host network stack (goes through the host's singbox_tun proxy).
+    network_mode: host
+    working_dir: /app
+
+    # Idle by default; exec in to work:  docker exec -it locomotion-dev bash
+    command: ["sleep", "infinity"]
+
+    volumes:
+      # Workspace = source of truth. Every edit inside the container writes
+      # straight back to the host dir, surviving restart / rm / rebuild.
+      - /home/ubuntu/p/locomotion-workspace:/app
+      # Claude Code session (login + history + settings) persists on the host.
+      - /home/ubuntu/p/locomotion-claude-home/.claude:/home/app/.claude
+      - /home/ubuntu/p/locomotion-claude-home/.claude.json:/home/app/.claude.json
+
+    environment:
+      # Optional: subscription token fallback (from .env). Not required if the
+      # mounted .credentials.json already carries a valid login.
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+
+    restart: unless-stopped

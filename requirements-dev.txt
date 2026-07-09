@@ -1,0 +1,10 @@
+# Dev/test dependencies for the Locomotion Console (the runtime deps are in requirements.txt).
+# The web app itself imports only stdlib beyond requirements.txt; these are for the test suite.
+-r requirements.txt
+
+pytest>=7.0
+httpx>=0.24            # FastAPI TestClient
+# CPU torch is enough to exercise the pure-torch reward/loss math tests (no GPU/IsaacLab needed).
+# Install with:  pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+numpy>=1.24

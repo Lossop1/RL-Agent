@@ -1,0 +1,11 @@
+# Locomotion console backend (autotuner.locomotion_console).
+# The heavy ML stack (torch / isaaclab / skrl / gymnasium) is imported lazily
+# only inside diagnostic code paths, so the web console itself needs just these.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+paramiko>=3.3
+PyYAML>=6.0
+# Optional: enables the LLM-backed chat/diagnostic features. Imported lazily;
+# the app degrades gracefully ("openai_sdk_not_installed") if it is absent.
+openai>=1.30

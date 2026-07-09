@@ -1,0 +1,27 @@
+# Convenience compose for the Locomotion Console.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# Defaults to the synthetic ("fake") data source so it runs with no GPU/SSH. To drive a real
+# remote training box, set LOCOMOTION_CONSOLE_SOURCE=real and mount a config/ssh.json (see
+# autotuner/locomotion_console/config.py) or set the LOCOMOTION_CONSOLE_* env vars.
+services:
+  console:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: locomotion-console
+    ports:
+      - "8000:8000"   # FastAPI backend
+      - "5173:5173"   # static frontend
+    environment:
+      LOCOMOTION_CONSOLE_SOURCE: "${LOCOMOTION_CONSOLE_SOURCE:-fake}"
+      LOCOMOTION_CONSOLE_HOST: "0.0.0.0"
+      LOCOMOTION_CONSOLE_PORT: "8000"
+      FRONTEND_PORT: "5173"
+      # CORS: the frontend is served same-origin in the container, so no dev origin is needed.
+      LOCOMOTION_CONSOLE_UI_ORIGIN: "${LOCOMOTION_CONSOLE_UI_ORIGIN:-http://localhost:5173}"
+    # Mount a host config dir for real-mode SSH credentials (git-ignored, never baked into the image).
+    volumes:
+      - ../config:/app/config:ro
+    restart: unless-stopped

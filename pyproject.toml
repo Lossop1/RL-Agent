@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+# Tests live under tests/ and mirror the package layout (tests/autotuner/...).
+# pythonpath="." lets them import the `autotuner` package without an install step.
+minversion = "7.0"
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "torch: test requires the torch stack (reward/env math); skipped where torch is absent",
+    "sim: test requires IsaacLab/GPU; never run in CI, documented only",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

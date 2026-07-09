@@ -1,0 +1,12 @@
+# Keep the build context small and reproducible.
+**/node_modules
+locomotion-console-ui/dist
+frontend/dist
+# Large immutable training-payload build snapshots (rebuilt on the remote box, not needed in the image).
+autotuner/training_payloads/**/.build
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.git
+tests
+# docs/ ships: spec_coverage.py reports docs/taili_spec.md as the acceptance source-of-truth path.

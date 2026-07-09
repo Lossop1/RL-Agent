@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to config/ssh.json to drive a real remote training box. config/ssh.json is git-ignored and never baked into the Docker image (mounted read-only via docker-compose). With ssh_host set, the console auto-selects source=real; leave it empty (or unset LOCOMOTION_CONSOLE_SOURCE) to run the synthetic 'fake' source with no GPU/SSH. Prefer key-based auth over ssh_pass where possible.",
+
+  "ssh_host": "203.0.113.10",
+  "ssh_port": 22,
+  "ssh_user": "root",
+  "ssh_pass": "",
+
+  "work_dir": "/root/robot_lab",
+  "conda_env": "isaaclab",
+  "conda_sh_path": "/opt/conda/etc/profile.d/conda.sh",
+  "shell_init": "",
+
+  "remote_log_path": "",
+  "log_format": "skrl",
+  "diagnostic_python": "/opt/conda/envs/isaaclab/bin/python",
+  "diagnostic_tool_root": "/root/gpufree-data/tools/isaaclab_quad_diag_v051",
+  "diagnostic_output_root": "/root/gpufree-data/diag_runs",
+  "diagnostic_robot_root": "/root/gpufree-data/robot_lab"
+}
