@@ -1,0 +1,26 @@
+name: terrain_probe
+num_envs: 4
+reset_policy: per_case
+reset_initialization: command_start
+terrains:
+  - type: flat
+    level: 0
+  - type: slope_up
+    level: 5
+  - type: rough
+    level: 5
+  - type: stairs_up
+    level: 5
+dr_cases:
+  - level: 0
+commands:
+  - mode: stand
+    vx: 0.0
+    vy: 0.0
+    wz: 0.0
+    duration: 0.5
+  - mode: forward
+    vx: 0.5
+    vy: 0.0
+    wz: 0.0
+    duration: 1.0

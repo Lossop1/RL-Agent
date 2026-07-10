@@ -1,0 +1,34 @@
+name: full_observation
+num_envs: 64
+reset_policy: per_case
+reset_initialization: command_start
+terrains:
+  - type: flat
+    level: 0
+  - type: slope_up
+    level: 5
+  - type: slope_down
+    level: 5
+  - type: rough
+    level: 5
+  - type: boxes
+    level: 5
+  - type: stairs_up
+    level: 5
+  - type: stairs_down
+    level: 5
+dr_cases:
+  - level: 0
+commands:
+  - mode: stand
+    vx: 0.0
+    vy: 0.0
+    wz: 0.0
+    duration: 3.0
+  - mode: forward
+    vx: 0.5
+    vy: 0.0
+    wz: 0.0
+    duration: 5.0
+pushes:
+  enabled: false

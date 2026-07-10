@@ -1,0 +1,32 @@
+robot_name: taili
+
+joint_order:
+  - FL_hip_joint
+  - FR_hip_joint
+  - RL_hip_joint
+  - RR_hip_joint
+  - FL_thigh_joint
+  - FR_thigh_joint
+  - RL_thigh_joint
+  - RR_thigh_joint
+  - FL_calf_joint
+  - FR_calf_joint
+  - RL_calf_joint
+  - RR_calf_joint
+
+leg_order: [FL, FR, RL, RR]
+
+foot_body_names:
+  FL: FL_foot
+  FR: FR_foot
+  RL: RL_foot
+  RR: RR_foot
+
+nominal_stand_height: 0.55
+
+mirror:
+  joint_perm: [1,0,3,2,5,4,7,6,9,8,11,10]
+  joint_sign: [-1,-1,-1,-1,1,1,1,1,1,1,1,1]
+  action_perm: [1,0,3,2,5,4,7,6,9,8,11,10]
+  action_sign: [-1,-1,-1,-1,1,1,1,1,1,1,1,1]
+  command_sign: [1,-1,-1]

@@ -1,0 +1,26 @@
+[project]
+name = "isaaclab-quad-diag"
+version = "0.5.1"
+description = "Observation-only physical diagnostics for Isaac Lab quadruped locomotion policies"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14.0"]
+plots = ["matplotlib>=3.7"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+ilqd-metrics = "isaaclab_quad_diag.metrics:main"
+ilqd-notes = "isaaclab_quad_diag.notes:main"
+ilqd-check = "isaaclab_quad_diag.check:main"
+ilqd-record = "isaaclab_quad_diag.record:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["isaaclab_quad_diag*"]

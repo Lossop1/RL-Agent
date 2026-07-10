@@ -20,6 +20,47 @@ except ImportError:  # local source layout: env_edit is nested one level deeper
     from ..taili_blind_config import active_direction_progress, phase_command_spec
 
 
+def _spec_float(spec, key: str, default: float) -> float:
+    try:
+        return float(spec.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _spec_range(spec, key: str, fallback) -> tuple[float, float]:
+    value = spec.get(key, fallback) if isinstance(spec, dict) else fallback
+    try:
+        lo, hi = value
+        return float(lo), float(hi)
+    except (TypeError, ValueError):
+        lo, hi = fallback
+        return float(lo), float(hi)
+
+
+def _sample_uniform(n: int, lo: float, hi: float, device) -> torch.Tensor:
+    lo = float(lo)
+    hi = max(float(hi), lo)
+    return torch.rand(n, device=device) * (hi - lo) + lo
+
+
+def _command_xy_world_from_root_yaw(root_quat_w: torch.Tensor, command_xy: torch.Tensor) -> torch.Tensor:
+    """Rotate body-frame XY commands into world XY using root yaw only."""
+    q = root_quat_w
+    yaw = torch.atan2(
+        2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+        1.0 - 2.0 * (q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3]),
+    )
+    c = torch.cos(yaw)
+    s = torch.sin(yaw)
+    return torch.stack(
+        (
+            c * command_xy[:, 0] - s * command_xy[:, 1],
+            s * command_xy[:, 0] + c * command_xy[:, 1],
+        ),
+        dim=-1,
+    )
+
+
 class TailiAmpEnv(DirectRLEnv):
     cfg: TailiAmpEnvCfg
 
@@ -62,6 +103,9 @@ class TailiAmpEnv(DirectRLEnv):
         self._cmd_resample_steps = max(1, int(self.cfg.cmd_resample_s / (self.cfg.dt * self.cfg.decimation)))
         self._log_step = 0          # for periodic stdout training diagnostics
         self._terrain_ctx = torch.zeros((self.num_envs, self.cfg.terrain_ctx_dim), device=self.device)
+        self._episode_start_xy = self.robot.data.root_pos_w[:, :2].detach().clone()
+        self._episode_start_root_z = self.robot.data.root_pos_w[:, 2].detach().clone()
+        self._episode_start_cmd_xy = torch.zeros((self.num_envs, 2), device=self.device)
         # GAIT-PHASE clock: a per-env phase in [0,1) advancing only when commanded to move; per-leg phase =
         # phase + diagonal trot offsets (FL,FR,RL,RR). Drives the contact-schedule reward + a policy obs.
         self._gait_phase = torch.zeros(self.num_envs, device=self.device)
@@ -227,6 +271,103 @@ class TailiAmpEnv(DirectRLEnv):
         # SINGLE-AXIS commands with explicit task-demand proportions. Writes the raw TARGET; self.commands low-passes
         # toward it (command buffer). snap=True (on reset) starts the env AT the command (no ramp from a stale value).
         n = len(env_ids); dev = self.device
+        if n == 0:
+            return
+        phase = int(getattr(self, "_phase", getattr(self.cfg, "init_phase", 0)))
+        spec = phase_command_spec(self.cfg, phase) if phase_command_spec is not None else {}
+        mode = str(spec.get("command_mode") or getattr(self.cfg, "training_command_mode", "normal") or "normal")
+        self._last_command_mode = mode
+        self._last_command_spec = spec
+        if mode in {"fixed_forward", "forward_range", "stand_only", "single_axis", "mixed"}:
+            self._cmd_target[env_ids] = 0.0
+
+            def _range_with_ceiling(name: str, fallback, ceiling_attr: str, max_attr: str):
+                lo, hi = _spec_range(spec, name, fallback)
+                hi = min(hi, float(getattr(self, ceiling_attr, hi)), float(getattr(self.cfg, max_attr, hi)))
+                return lo, max(lo, hi)
+
+            f_lo, f_hi = _range_with_ceiling("fwd_range", self.cfg.cmd_fwd_range, "_vel_max_fwd", "cmd_fwd_max")
+            b_lo, b_hi = _range_with_ceiling("back_range", self.cfg.cmd_back_range, "_vel_max_back", "cmd_back_max")
+            l_lo, l_hi = _range_with_ceiling("lat_range", self.cfg.cmd_lat_range, "_vel_max_lat", "cmd_lat_max")
+            y_lo, y_hi = _range_with_ceiling("yaw_range", self.cfg.cmd_yaw_range, "_vel_max_yaw", "cmd_yaw_max")
+
+            terr_frac = None
+            if self.cfg.vel_terrain_decouple and self.cfg.terrain.terrain_type == "generator":
+                tmax = max(1.0, self.cfg.terrain.terrain_generator.num_rows - 1)
+                terr_frac = (self._terrain.terrain_levels[env_ids].float() / tmax).clamp(0.0, 1.0)
+
+            def _sample_range(lo: float, hi):
+                if torch.is_tensor(hi):
+                    return torch.rand(n, device=dev) * (hi - float(lo)).clamp(min=0.0) + float(lo)
+                return _sample_uniform(n, lo, hi, dev)
+
+            f_hi_eff = f_hi
+            b_hi_eff = b_hi
+            if terr_frac is not None:
+                f_hi_eff = f_lo + (f_hi - f_lo) * (1.0 - terr_frac)
+                b_hi_eff = b_lo + (b_hi - b_lo) * (1.0 - terr_frac)
+
+            target = torch.zeros((n, 3), device=dev)
+            if mode == "fixed_forward":
+                target[:, 0] = _spec_float(spec, "fixed_vx", float(getattr(self.cfg, "training_fixed_vx", 0.5)))
+            elif mode == "forward_range":
+                lo_v, hi_v = _spec_range(spec, "forward_range", getattr(self.cfg, "training_forward_range", (0.3, 0.7)))
+                target[:, 0] = _sample_uniform(n, lo_v, hi_v, dev)
+            elif mode == "stand_only":
+                target.zero_()
+            elif mode == "mixed":
+                stand_prob = _spec_float(spec, "stand_prob", float(getattr(self.cfg, "stand_prob", 0.0)))
+                near_zero_prob = _spec_float(spec, "near_zero_prob", 0.0)
+                axis_prob = _spec_float(spec, "mixed_axis_prob", 1.0)
+                active = torch.rand(n, device=dev) >= stand_prob
+                near_zero = active & (torch.rand(n, device=dev) < near_zero_prob)
+                moving = active & ~near_zero
+                p_fwd = max(0.0, _spec_float(spec, "prob_fwd", 0.5))
+                p_back = max(0.0, _spec_float(spec, "prob_back", 0.5))
+                x_is_fwd = torch.rand(n, device=dev) < (p_fwd / max(1e-9, p_fwd + p_back))
+                x_on = torch.rand(n, device=dev) < _spec_float(spec, "x_axis_prob", 1.0)
+                lat_on = torch.rand(n, device=dev) < axis_prob
+                yaw_on = torch.rand(n, device=dev) < axis_prob
+                yaw_on = yaw_on | (~x_on & ~lat_on)
+                lat_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                yaw_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                target[:, 0] = torch.where(x_is_fwd, _sample_range(f_lo, f_hi_eff), -_sample_range(b_lo, b_hi_eff))
+                target[:, 0] = torch.where(x_on, target[:, 0], torch.zeros(n, device=dev))
+                target[:, 1] = torch.where(lat_on, lat_sign * _sample_uniform(n, l_lo, l_hi, dev), torch.zeros(n, device=dev))
+                target[:, 2] = torch.where(yaw_on, yaw_sign * _sample_uniform(n, y_lo, y_hi, dev), torch.zeros(n, device=dev))
+                target = torch.where(moving[:, None], target, torch.zeros_like(target))
+                nz_scale = _spec_float(spec, "near_zero_scale", 0.05)
+                near_noise = (torch.rand((n, 3), device=dev) * 2.0 - 1.0) * nz_scale
+                target = torch.where(near_zero[:, None], near_noise, target)
+            else:
+                stand_prob = _spec_float(spec, "stand_prob", float(getattr(self.cfg, "stand_prob", 0.0)))
+                active = torch.rand(n, device=dev) >= stand_prob
+                weights = torch.tensor([
+                    max(0.0, _spec_float(spec, "prob_fwd", float(getattr(self.cfg, "cmd_prob_fwd", 0.25)))),
+                    max(0.0, _spec_float(spec, "prob_back", float(getattr(self.cfg, "cmd_prob_back", 0.25)))),
+                    max(0.0, _spec_float(spec, "prob_lat", float(getattr(self.cfg, "cmd_prob_lat", 0.25)))),
+                    max(0.0, _spec_float(spec, "prob_yaw", float(getattr(self.cfg, "cmd_prob_yaw", 0.25)))),
+                ], device=dev)
+                if float(weights.sum()) <= 1e-9:
+                    weights = torch.tensor([1.0, 0.0, 0.0, 0.0], device=dev)
+                u = torch.rand(n, device=dev) * weights.sum()
+                c0 = weights[0]
+                c1 = c0 + weights[1]
+                c2 = c1 + weights[2]
+                fwd = active & (u < c0)
+                back = active & (u >= c0) & (u < c1)
+                lat = active & (u >= c1) & (u < c2)
+                yaw = active & (u >= c2)
+                lat_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                yaw_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                target[:, 0] = torch.where(fwd, _sample_range(f_lo, f_hi_eff),
+                                            torch.where(back, -_sample_range(b_lo, b_hi_eff), torch.zeros(n, device=dev)))
+                target[:, 1] = torch.where(lat, lat_sign * _sample_uniform(n, l_lo, l_hi, dev), torch.zeros(n, device=dev))
+                target[:, 2] = torch.where(yaw, yaw_sign * _sample_uniform(n, y_lo, y_hi, dev), torch.zeros(n, device=dev))
+            self._cmd_target[env_ids] = target
+            if snap:
+                self.commands[env_ids] = self._cmd_target[env_ids]
+            return
         self._cmd_target[env_ids] = 0.0
         active = torch.rand(n, device=dev) >= self.cfg.stand_prob
         u = torch.rand(n, device=dev)
@@ -909,7 +1050,11 @@ class TailiAmpEnv(DirectRLEnv):
         ang_under = torch.clamp((cmd_ang.abs() - ang_tol) - wz * torch.sign(cmd_ang), min=0.0)
         r_underspeed = self.cfg.rew_underspeed * (lin_under * lin_under * mv_l.float()
                                                   + ang_under * ang_under * mv_a.float())
-        back_cmd = (self.commands[:, 0] < -0.05) & (self.commands[:, 1].abs() < 0.05)
+        back_cmd = (
+            (self.commands[:, 0] < -0.05)
+            & (self.commands[:, 1].abs() < 0.05)
+            & (self.commands[:, 2].abs() < 0.05)
+        )
         # BACKWARD-ONLY auxiliary shaping: diagnostics showed generic underspeed can collapse forward
         # locomotion into a cautious standing solution. Backward is the weak axis; apply extra gradient
         # only to negative-vx commands and leave forward retention owned by capped progress + overshoot.
@@ -919,6 +1064,14 @@ class TailiAmpEnv(DirectRLEnv):
             self.cfg.rew_backward_underspeed * back_speed_deficit * back_speed_deficit
             + self.cfg.rew_backward_wrong_dir * back_wrong * back_wrong
         ) * back_cmd.float()
+        lat_cmd = (
+            (self.commands[:, 1].abs() > 0.05)
+            & (self.commands[:, 0].abs() < 0.05)
+            & (self.commands[:, 2].abs() < 0.05)
+        )
+        lat_signed_speed = vel_lin[:, 1] * torch.sign(self.commands[:, 1])
+        lat_speed_deficit = torch.clamp((self.commands[:, 1].abs() - lin_tol) - lat_signed_speed, min=0.0)
+        r_lateral_aux = self.cfg.rew_lateral_underspeed * lat_speed_deficit * lat_speed_deficit * lat_cmd.float()
         # WRONG-DIRECTION penalty: a backward command solved by standing still or moving forward keeps
         # capped progress near zero, but previously had little explicit cost. Penalize signed velocity
         # opposite the requested axis so backward/yaw commands get a usable gradient away from shortcuts.
@@ -979,7 +1132,8 @@ class TailiAmpEnv(DirectRLEnv):
         slip_speed = foot_vel_b_xy.norm(dim=-1)                            # (N,4), m/s
         r_stance_slip = self.cfg.rew_stance_slip * (in_contact * slip_speed).sum(dim=1) * mv_any.float()
         # mean stance-slip (m/s) exposed for the phi1->phi2 clean-gait gate
-        self._slip_now = float((in_contact * slip_speed).sum() / in_contact.sum().clamp(min=1.0))
+        slip_now_env = (in_contact * slip_speed).sum(dim=1) / in_contact.sum(dim=1).clamp(min=1.0)
+        self._slip_now = float(slip_now_env.mean())
 
         # 2. SWING DIRECTION: swing foot should move along the commanded body-frame direction. For yaw-only
         # commands, use the tangential direction induced by rotating around the base.
@@ -1009,11 +1163,61 @@ class TailiAmpEnv(DirectRLEnv):
 
         # 3. CLEARANCE: swing foot should clear the terrain under/near the foot, not just move relative to body.
         hits = self._height_scanner.data.ray_hits_w                       # (N,P,3), yaw-aligned grid around base
+        finite_hits = torch.isfinite(hits[:, :, 2])
+        hits_z_valid = torch.where(finite_hits, hits[:, :, 2], torch.zeros_like(hits[:, :, 2]))
         foot_pos = self.robot.data.body_pos_w[:, self.foot_indexes, :]     # (N,4,3)
         dxy = foot_pos[:, :, None, :2] - hits[:, None, :, :2]              # (N,4,P,2)
         nearest = torch.argmin(torch.sum(dxy * dxy, dim=-1), dim=-1)       # (N,4)
         ground_z = torch.gather(hits[:, :, 2], 1, nearest)                 # (N,4)
         foot_clearance = torch.clamp(foot_pos[:, :, 2] - ground_z, min=0.0)
+        contact_w = in_contact.clamp(0.0, 1.0)
+        contact_sum = contact_w.sum(dim=1)
+        support_z_contact = (ground_z * contact_w).sum(dim=1) / contact_sum.clamp(min=1.0)
+        support_z_feet = ground_z.median(dim=1).values
+        support_z = torch.where(contact_sum > 0.5, support_z_contact, support_z_feet)
+        relxy_ahead = hits[:, :, :2] - self.robot.data.root_pos_w[:, None, :2]
+        cmdw_ahead = _command_xy_world_from_root_yaw(self.robot.data.root_quat_w, self.commands[:, :2])
+        cdir_ahead = cmdw_ahead / cmdw_ahead.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        ahead_s = (relxy_ahead * cdir_ahead[:, None, :]).sum(-1)
+        ahead_mask = ahead_s > 0.15
+        has_ahead = ahead_mask.any(dim=1)
+        hz_hi = torch.nan_to_num(hits[:, :, 2], nan=-1e3, posinf=-1e3, neginf=-1e3)
+        hz_lo = torch.nan_to_num(hits[:, :, 2], nan=1e3, posinf=1e3, neginf=1e3)
+        ahead_max = torch.where(ahead_mask, hz_hi, torch.full_like(hz_hi, -1e3)).max(dim=1).values
+        ahead_min = torch.where(ahead_mask, hz_lo, torch.full_like(hz_lo, 1e3)).min(dim=1).values
+        ahead_count = ahead_mask.float().sum(dim=1)
+        ahead_s_min = torch.where(ahead_mask, ahead_s, torch.full_like(ahead_s, 1e3)).min(dim=1).values
+        ahead_s_max = torch.where(ahead_mask, ahead_s, torch.full_like(ahead_s, -1e3)).max(dim=1).values
+        rel_x = relxy_ahead[:, :, 0]
+        rel_y = relxy_ahead[:, :, 1]
+        terrain_scan_probe = {
+            "finite_frac": finite_hits.float().mean(),
+            "hits_z_min": hits_z_valid.min(),
+            "hits_z_max": hits_z_valid.max(),
+            "hits_z_span_mean": (hits_z_valid.max(dim=1).values - hits_z_valid.min(dim=1).values).mean(),
+            "rel_x_min": rel_x.min(),
+            "rel_x_max": rel_x.max(),
+            "rel_y_min": rel_y.min(),
+            "rel_y_max": rel_y.max(),
+            "cmd_world_x_mean": cdir_ahead[:, 0].mean(),
+            "cmd_world_y_mean": cdir_ahead[:, 1].mean(),
+            "ahead_count_mean": ahead_count.mean(),
+            "ahead_count_max": ahead_count.max(),
+            "ahead_has_frac": has_ahead.float().mean(),
+            "ahead_s_min": torch.where(has_ahead, ahead_s_min, torch.zeros_like(ahead_s_min)).mean(),
+            "ahead_s_max": torch.where(has_ahead, ahead_s_max, torch.zeros_like(ahead_s_max)).mean(),
+            "support_z_mean": support_z.mean(),
+            "support_z_min": support_z.min(),
+            "support_z_max": support_z.max(),
+            "ahead_max_z_mean": torch.where(has_ahead, ahead_max, torch.zeros_like(ahead_max)).mean(),
+            "ahead_min_z_mean": torch.where(has_ahead, ahead_min, torch.zeros_like(ahead_min)).mean(),
+            "raw_rise_mean": torch.where(has_ahead, ahead_max - support_z, torch.zeros_like(support_z)).mean(),
+            "raw_rise_max": torch.where(has_ahead, ahead_max - support_z, torch.zeros_like(support_z)).max(),
+            "raw_drop_mean": torch.where(has_ahead, support_z - ahead_min, torch.zeros_like(support_z)).mean(),
+            "raw_drop_max": torch.where(has_ahead, support_z - ahead_min, torch.zeros_like(support_z)).max(),
+        }
+        terrain_rise_ahead = torch.where(has_ahead, torch.clamp(ahead_max - support_z, min=0.0), torch.zeros_like(support_z))
+        terrain_drop_ahead = torch.where(has_ahead, torch.clamp(support_z - ahead_min, min=0.0), torch.zeros_like(support_z))
         # ROUGHNESS-GATED phi2 clearance (per-env): engage heavy lift ONLY where the terrain is actually rough
         # (boxes/stairs/rough tiles); flat stays the efficient 245k base. gate cg = clr_gate(phi2 time fade) x
         # rough_factor(per-env terrain roughness). In phi0/phi1 clr_gate=0 -> cg=0 -> EXACTLY 245k (-1.5, 7cm).
@@ -1049,6 +1253,74 @@ class TailiAmpEnv(DirectRLEnv):
         if bool(lat_mask.any()):  self._lat_prog  = float(lin_prog[lat_mask].mean())
         if bool(yaw_mask.any()):  self._yaw_prog  = float(ang_prog[yaw_mask].mean())
 
+        # Minimal terrain-throughput drive: tracking and clearance alone do not pay for committing upward over
+        # stairs/boxes. Keep this narrow so flat gait is not pulled into wasteful hopping.
+        r_climb = torch.zeros(self.num_envs, device=self.device)
+        r_terrain_up = torch.zeros(self.num_envs, device=self.device)
+        r_terrain_down = torch.zeros(self.num_envs, device=self.device)
+        terrain_probe = {
+            "rise_ahead_mean": terrain_rise_ahead.mean(),
+            "rise_ahead_max": terrain_rise_ahead.max(),
+            "drop_ahead_mean": terrain_drop_ahead.mean(),
+            "drop_ahead_max": terrain_drop_ahead.max(),
+            "disc_frac": torch.zeros((), device=self.device),
+            "moving_lin_frac": torch.zeros((), device=self.device),
+            "upright_frac": torch.zeros((), device=self.device),
+            "slip_weight_mean": torch.zeros((), device=self.device),
+            "common_mean": torch.zeros((), device=self.device),
+            "common_max": torch.zeros((), device=self.device),
+            "up_active_mean": torch.zeros((), device=self.device),
+            "up_active_max": torch.zeros((), device=self.device),
+            "down_active_mean": torch.zeros((), device=self.device),
+            "down_active_max": torch.zeros((), device=self.device),
+            "up_core_mean": torch.zeros((), device=self.device),
+            "down_core_mean": torch.zeros((), device=self.device),
+        }
+        terrain_probe.update(terrain_scan_probe)
+        w_climb = float(getattr(self.cfg, "rew_climb", 0.0))
+        w_terrain_up = float(getattr(self.cfg, "rew_terrain_up", 0.0))
+        w_terrain_down = float(getattr(self.cfg, "rew_terrain_down", 0.0))
+        if (w_climb > 0.0 or w_terrain_up > 0.0 or w_terrain_down > 0.0) and self._phase >= getattr(self, "_terrain_start_phase", 5):
+            self._ensure_gate_mask()
+            disc = getattr(self, "_discrete_terrain_mask", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
+            moving_lin_cmd = cmd_lin_mag > 0.10
+            upright = (-self.robot.data.projected_gravity_b[:, 2]).clamp(0.0, 1.0) > 0.85
+            # Soft slip weight: a hard cutoff at the target made climb reward disappear exactly when the
+            # policy still needed gradient. Keep full credit below the target and taper to zero over ~0.18 m/s.
+            slip_target = float(getattr(self.cfg, "climb_slip_gate", 0.30))
+            slip_span = max(float(getattr(self.cfg, "climb_slip_soft_span", 0.18)), 1e-6)
+            slip_weight = torch.clamp(1.0 - torch.clamp(slip_now_env - slip_target, min=0.0) / slip_span, 0.0, 1.0)
+            common = disc.float() * moving_lin_cmd.float() * upright.float() * slip_weight
+            eps = float(getattr(self.cfg, "terrain_transition_eps", 0.05))
+            span = max(float(getattr(self.cfg, "terrain_transition_span", 0.08)), 1e-6)
+            up_active = torch.clamp((terrain_rise_ahead - eps) / span, 0.0, 1.0)
+            down_active = torch.clamp((terrain_drop_ahead - eps) / span, 0.0, 1.0)
+            up_cap = max(float(getattr(self.cfg, "terrain_up_vz_cap", getattr(self.cfg, "climb_vz_cap", 0.6))), 1e-6)
+            down_cap = max(float(getattr(self.cfg, "terrain_down_vz_cap", 0.5)), 1e-6)
+            up_v = self.robot.data.root_lin_vel_w[:, 2].clamp(min=0.0, max=up_cap)
+            down_v = (-self.robot.data.root_lin_vel_w[:, 2]).clamp(min=0.0, max=down_cap)
+            down_target = max(float(getattr(self.cfg, "terrain_down_vz_target", 0.18)), 1e-6)
+            down_control = torch.clamp(1.0 - torch.clamp(down_v - down_target, min=0.0) / down_target, 0.0, 1.0)
+            up_core = 0.55 * lin_prog + 0.45 * (up_v / up_cap)
+            down_core = lin_prog * (0.50 + 0.50 * down_control)
+            r_terrain_up = w_terrain_up * up_active * common * up_core
+            r_terrain_down = w_terrain_down * down_active * common * down_core
+            r_climb = w_climb * up_active * common * up_core
+            terrain_probe.update({
+                "disc_frac": disc.float().mean(),
+                "moving_lin_frac": moving_lin_cmd.float().mean(),
+                "upright_frac": upright.float().mean(),
+                "slip_weight_mean": slip_weight.mean(),
+                "common_mean": common.mean(),
+                "common_max": common.max(),
+                "up_active_mean": up_active.mean(),
+                "up_active_max": up_active.max(),
+                "down_active_mean": down_active.mean(),
+                "down_active_max": down_active.max(),
+                "up_core_mean": up_core.mean(),
+                "down_core_mean": down_core.mean(),
+            })
+
         self._dbg = (
             float(lin_prog[mv_l].mean()) if bool(mv_l.any()) else 0.0,
             float(ang_prog[mv_a].mean()) if bool(mv_a.any()) else 0.0,
@@ -1064,7 +1336,11 @@ class TailiAmpEnv(DirectRLEnv):
             "stand": float(r_stand.mean()), "height": float(r_height.mean()), "slip": float(r_stance_slip.mean()),
             "clear": float(r_clearance.mean()), "hip": float(r_hip.mean()), "offax": float(r_offaxis.mean()),
             "over": float(r_overshoot.mean()), "under": float(r_underspeed.mean()),
-            "back_aux": float(r_backward_aux.mean()), "wrong": float(r_wrong_dir.mean()),
+            "back_aux": float(r_backward_aux.mean()), "lat_aux": float(r_lateral_aux.mean()), "wrong": float(r_wrong_dir.mean()),
+            "climb": float(r_climb.mean()), "terr_up": float(r_terrain_up.mean()), "terr_down": float(r_terrain_down.mean()),
+            "terr_probe_rise": float(terrain_probe["rise_ahead_mean"]),
+            "terr_probe_up_active": float(terrain_probe["up_active_mean"]),
+            "terr_probe_common": float(terrain_probe["common_mean"]),
             "land": float((pg * r_land_decel).mean()), "torq": float(r_torque.mean()),
             "arate": float(r_arate.mean()), "vz": float(r_vz.mean()), "wxy": float(r_wxy.mean()),
             "stand_still": float(r_stand_still.mean()),   # P5: now ALWAYS-ON (no longer pg-gated) -> log un-gated
@@ -1076,7 +1352,7 @@ class TailiAmpEnv(DirectRLEnv):
         # still (gait_match 0.5, upright 1.0, prog~0.1 for 8k+ steps). The leg-holding degeneration that motivated
         # the gate came from clearance -8 (HEAVY), not from penalties existing; clearance is back at 245k's -1.5.
         base_penalties = (
-            r_offaxis + r_overshoot + r_underspeed + r_backward_aux + r_wrong_dir
+            r_offaxis + r_overshoot + r_underspeed + r_backward_aux + r_lateral_aux + r_wrong_dir
             + r_hip + r_stance_slip + r_clearance + r_swing_drag
         )
         # TRUE post-245k REFINEMENTS (fade in phi1+ on a walking policy): land_decel + gait_enforce.
@@ -1089,6 +1365,7 @@ class TailiAmpEnv(DirectRLEnv):
         # is penalized), so it is bootstrap-safe and protects the (sim) motors from the first step.
         reward = (r_lin + r_ang + r_alive + r_arate + r_jacc + r_vz + r_wxy + r_air
                   + r_gait + r_imitate + r_height + r_stand + r_stand_still + r_swing_dir + r_torque
+                  + r_climb + r_terrain_up + r_terrain_down
                   + base_penalties
                   + self._penalty_gate * refinement_penalties)
         return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)   # never let a NaN reward poison PPO
@@ -1125,15 +1402,31 @@ class TailiAmpEnv(DirectRLEnv):
         # Terrain curriculum (terrain_levels_vel) — grade by distance walked BEFORE repositioning:
         # walked > half a terrain tile -> harder; < half the commanded distance -> easier.
         if self.cfg.terrain.terrain_type == "generator":
-            dist = torch.norm(self.robot.data.root_pos_w[env_ids, :2]
-                              - self._terrain.env_origins[env_ids, :2], dim=1)
-            cmd_mag = torch.norm(self.commands[env_ids, :2], dim=1)
+            root_xy = self.robot.data.root_pos_w[env_ids, :2]
+            root_z = self.robot.data.root_pos_w[env_ids, 2]
+            dist = torch.norm(root_xy - self._terrain.env_origins[env_ids, :2], dim=1)
+            cmd_xy = self._episode_start_cmd_xy[env_ids]
+            cmd_mag = torch.norm(cmd_xy, dim=1)
+            cmd_dir = cmd_xy / cmd_mag.unsqueeze(1).clamp(min=1e-6)
+            episode_delta_xy = root_xy - self._episode_start_xy[env_ids]
+            forward_dist = torch.sum(episode_delta_xy * cmd_dir, dim=1)
+            height_delta = root_z - self._episode_start_root_z[env_ids]
             valid_episode = self.episode_length_buf[env_ids] > 0
             # TERRAIN only advances in phase >= 2 AND while not regressed (the regression guard). Frozen at the
             # easiest level during bootstrap (phi 0) + gait-cleaning (phi 1) so those happen on near-flat ground.
             terrain_unlocked = (self._phase >= getattr(self, "_terrain_start_phase", 5)) and self._advance_ok
-            move_up = (dist > self.cfg.terrain_move_up_dist) & valid_episode & terrain_unlocked
-            move_down = (dist < cmd_mag * self.max_episode_length_s * 0.5) & ~move_up & valid_episode
+            height_gain = float(getattr(self.cfg, "terrain_curriculum_height_gain", 0.08))
+            height_loss = float(getattr(self.cfg, "terrain_curriculum_height_loss", 0.08))
+            controlled_up = (height_delta > height_gain) & (forward_dist > 0.25) & valid_episode
+            controlled_down = (height_delta < -height_loss) & (forward_dist > 0.25) & valid_episode
+            move_up = ((dist > self.cfg.terrain_move_up_dist) | controlled_up | controlled_down) & valid_episode & terrain_unlocked
+            move_down = (
+                (dist < cmd_mag * self.max_episode_length_s * 0.5)
+                & ~controlled_up
+                & ~controlled_down
+                & ~move_up
+                & valid_episode
+            )
             self._terrain.update_env_origins(env_ids, move_up, move_down)
         self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
@@ -1236,6 +1529,9 @@ class TailiAmpEnv(DirectRLEnv):
         self.robot.write_joint_state_to_sim(jp, jv, None, env_ids)
         self.last_actions[env_ids] = 0.0
         self._gait_phase[env_ids] = torch.rand(len(env_ids), device=self.device)   # phase diversity across envs
+        self._episode_start_xy[env_ids] = root[:, 0:2].detach()
+        self._episode_start_root_z[env_ids] = root[:, 2].detach()
+        self._episode_start_cmd_xy[env_ids] = self.commands[env_ids, :2].detach()
 
     def _push_strided_amp(self, amp):
         """AMP STRIDE WINDOW policy side: push the newest raw frame into the deep adjacent-frame ring, then

@@ -226,9 +226,9 @@ env:
     phase_gate_diag_0: 0.45
     phase_gate_duty_0: 0.55
     phase_gate_air_0: 0.0
-    phase_gate_slip_1: 0.28
+    phase_gate_slip_1: 0.31
     phase_gate_diag_1: 0.5
-    phase_gate_duty_1: 0.64
+    phase_gate_duty_1: 0.61
     phase_gate_air_1: 0.0
     phase_gate_terrain_2: 3.5
     phase_gate_fall_2: 0.05
@@ -302,6 +302,34 @@ env:
     sym_augment: false
     speed_tol_abs: 0.1
     speed_tol_rel: 0.15
+    rew_stance_slip: -0.8
+    rew_land_decel: -1.5
+    rew_clearance: -1.5
+    rew_clearance_heavy: -8.0
+    rew_gait_enforce: -1.4
+    rew_underspeed: 0.0
+    rew_backward_underspeed: -0.45
+    rew_backward_wrong_dir: 0.0
+    rew_lateral_underspeed: -0.30
+    rew_wrong_dir: 0.0
+    w_imitate_live: 1.6
+    imitate_sigma_live: 0.09
+    imitate_fwd_floor: 0.5
+    w_swing_dir: 0.0
+    rew_climb: 0.8
+    climb_slip_gate: 0.30
+    climb_slip_soft_span: 0.18
+    climb_vz_cap: 0.8
+    rew_terrain_up: 1.2
+    rew_terrain_down: 0.8
+    terrain_transition_eps: 0.05
+    terrain_transition_span: 0.08
+    terrain_up_vz_cap: 0.6
+    terrain_down_vz_cap: 0.5
+    terrain_down_vz_target: 0.18
+    terrain_curriculum_height_gain: 0.08
+    terrain_curriculum_height_loss: 0.08
+    discrete_clearance: false
     base_clearance: 0.08
     stance_dx: 0.05
     clr_rough_flat: 0.01
@@ -343,7 +371,7 @@ reward:
   slip_free_speed: 0.05
   slip_speed_scale: 1.0
   w_landing_impact: 0.15
-  w_landing_impact_late: 0.85
+  w_landing_impact_late: 1.2
   impact_speed_scale: 1.0
   w_orient: 0.3
   orient_soft_rad: 0.09
@@ -369,7 +397,7 @@ reward:
   terrain_clearance_drive: 0.75
   validated_tracking_floor: 0.40
   tracking_validity_terrain_mix: 1.0
-  w_stance_slip_high_late: 1.5
+  w_stance_slip_high_late: 2.2
 skrl:
   seed: 42
   models:

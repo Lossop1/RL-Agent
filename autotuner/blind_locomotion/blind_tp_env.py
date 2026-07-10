@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover - local fallback for unusual import layout
         active_direction_progress = None
         phase_command_spec = None
 
-from .taili_amp_env import TailiAmpEnv, quaternion_to_tangent_and_normal
+from .taili_amp_env import TailiAmpEnv, quaternion_to_tangent_and_normal, _command_xy_world_from_root_yaw
 from .parametric_ref import flat_reference   # analytic reference joints for the LIVE imitation reward (RANK-1)
 
 HIST_LEN = 25
@@ -600,6 +600,39 @@ class TailiBlindTPEnv(TailiAmpEnv):
         _r_cp = torch.tensor([0.0, 0.0, -0.014], device=dev).view(1, 1, 3)
         _foot_cp_vel = foot_vel + torch.cross(_foot_ang, _r_cp.expand_as(_foot_ang), dim=-1)
         foot_vel_xy = _foot_cp_vel[:, :, :2].norm(dim=-1)
+        terrain_rise_ahead = torch.zeros(N, device=dev)
+        terrain_drop_ahead = torch.zeros(N, device=dev)
+        _scan_probe_zero = torch.zeros((), device=dev)
+        _scan_probe_one = torch.ones((), device=dev)
+        terrain_scan_probe = {
+            "scan_ok": _scan_probe_zero,
+            "scan_failed": _scan_probe_one,
+            "scan_stage": _scan_probe_zero,
+            "finite_frac": _scan_probe_zero,
+            "hits_z_min": _scan_probe_zero,
+            "hits_z_max": _scan_probe_zero,
+            "hits_z_span_mean": _scan_probe_zero,
+            "rel_x_min": _scan_probe_zero,
+            "rel_x_max": _scan_probe_zero,
+            "rel_y_min": _scan_probe_zero,
+            "rel_y_max": _scan_probe_zero,
+            "cmd_world_x_mean": _scan_probe_zero,
+            "cmd_world_y_mean": _scan_probe_zero,
+            "ahead_count_mean": _scan_probe_zero,
+            "ahead_count_max": _scan_probe_zero,
+            "ahead_has_frac": _scan_probe_zero,
+            "ahead_s_min": _scan_probe_zero,
+            "ahead_s_max": _scan_probe_zero,
+            "support_z_mean": _scan_probe_zero,
+            "support_z_min": _scan_probe_zero,
+            "support_z_max": _scan_probe_zero,
+            "ahead_max_z_mean": _scan_probe_zero,
+            "ahead_min_z_mean": _scan_probe_zero,
+            "raw_rise_mean": _scan_probe_zero,
+            "raw_rise_max": _scan_probe_zero,
+            "raw_drop_mean": _scan_probe_zero,
+            "raw_drop_max": _scan_probe_zero,
+        }
         # #10 TERRAIN-AWARE FOOT CLEARANCE (0705 physeval B3 fix). The old code measured clearance vs
         # the base-MEDIAN terrain height and hardwired local_obstacle_h=0, so the reward's clearance
         # target stayed a flat 0.08 m EVEN on terrain — forcing the policy to over-lift everywhere
@@ -610,16 +643,92 @@ class TailiBlindTPEnv(TailiAmpEnv):
         # low flat swing is the reward-optimal gait on flat while high lift is still free on terrain.
         try:
             _hits = self._height_scanner.data.ray_hits_w                              # (N,P,3) world
+            terrain_scan_probe["scan_stage"] = torch.full((), 1.0, device=dev)
+            _finite_hits = torch.isfinite(_hits[:, :, 2])
+            _hz_valid = torch.where(_finite_hits, _hits[:, :, 2], torch.zeros_like(_hits[:, :, 2]))
             _hz = torch.nan_to_num(_hits[:, :, 2], nan=0.0, posinf=0.0, neginf=0.0)
             _dxy = foot_pos[:, :, None, :2] - _hits[:, None, :, :2]                    # (N,4,P,2)
             _nearest = torch.argmin(torch.nan_to_num((_dxy * _dxy).sum(dim=-1), nan=1e9), dim=-1)  # (N,4)
             _ground_z = torch.gather(_hz, 1, _nearest)                                # (N,4)
+            terrain_scan_probe["scan_stage"] = torch.full((), 2.0, device=dev)
             foot_clearance_terr = torch.clamp(foot_pos[:, :, 2] - _ground_z, min=0.0)  # (N,4) above local ground
+            _contact_w = in_contact.clamp(0.0, 1.0)
+            _contact_sum = _contact_w.sum(dim=1)
+            _support_z_contact = (_ground_z * _contact_w).sum(dim=1) / _contact_sum.clamp(min=1.0)
+            _support_z_feet = _ground_z.median(dim=1).values
+            _support_z = torch.where(_contact_sum > 0.5, _support_z_contact, _support_z_feet)
+            terrain_scan_probe["scan_stage"] = torch.full((), 3.0, device=dev)
+            terrain_scan_probe.update({
+                "finite_frac": _finite_hits.float().mean(),
+                "hits_z_min": _hz_valid.min(),
+                "hits_z_max": _hz_valid.max(),
+                "hits_z_span_mean": (_hz_valid.max(dim=1).values - _hz_valid.min(dim=1).values).mean(),
+                "support_z_mean": _support_z.mean(),
+                "support_z_min": _support_z.min(),
+                "support_z_max": _support_z.max(),
+            })
+            terrain_scan_probe["scan_stage"] = torch.full((), 31.0, device=dev)
             _rough = self._terrain_ctx[:, 2] if self._terrain_ctx.shape[-1] > 2 else torch.zeros(N, device=dev)
+            terrain_scan_probe["scan_stage"] = torch.full((), 32.0, device=dev)
             local_obstacle_h = (torch.clamp(
                 (_rough - float(getattr(self.cfg, "clr_rough_flat", 0.01)))
                 / max(float(getattr(self.cfg, "clr_rough_span", 0.12)), 1e-6), 0.0, 1.0)
                 * float(getattr(self.cfg, "clr_rough_bonus_max", 0.26)))              # (N,) 0 on flat, ->~0.26 on rough
+            terrain_scan_probe["scan_stage"] = torch.full((), 41.0, device=dev)
+            _relxy_tp = _hits[:, :, :2] - self.robot.data.root_pos_w[:, None, :2]
+            terrain_scan_probe["scan_stage"] = torch.full((), 42.0, device=dev)
+            terrain_scan_probe["scan_stage"] = torch.full((), 43.0, device=dev)
+            _cmdw_tp = _command_xy_world_from_root_yaw(self.robot.data.root_quat_w, self.commands[:, :2])
+            terrain_scan_probe["scan_stage"] = torch.full((), 44.0, device=dev)
+            _cn_tp = _cmdw_tp / _cmdw_tp.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            _ahead_s_tp = (_relxy_tp * _cn_tp[:, None, :]).sum(-1)
+            _ahead_tp = _ahead_s_tp > 0.15
+            _has_ahead_tp = _ahead_tp.any(dim=1)
+            terrain_scan_probe["scan_stage"] = torch.full((), 45.0, device=dev)
+            _hz_hi_tp = torch.nan_to_num(_hits[:, :, 2], nan=-1e3, posinf=-1e3, neginf=-1e3)
+            _hz_lo_tp = torch.nan_to_num(_hits[:, :, 2], nan=1e3, posinf=1e3, neginf=1e3)
+            _ahead_max_tp = torch.where(_ahead_tp, _hz_hi_tp, torch.full_like(_hz_hi_tp, -1e3)).max(dim=1).values
+            _ahead_min_tp = torch.where(_ahead_tp, _hz_lo_tp, torch.full_like(_hz_lo_tp, 1e3)).min(dim=1).values
+            _ahead_count_tp = _ahead_tp.float().sum(dim=1)
+            _ahead_s_min_tp = torch.where(_ahead_tp, _ahead_s_tp, torch.full_like(_ahead_s_tp, 1e3)).min(dim=1).values
+            _ahead_s_max_tp = torch.where(_ahead_tp, _ahead_s_tp, torch.full_like(_ahead_s_tp, -1e3)).max(dim=1).values
+            _relx = _relxy_tp[:, :, 0]
+            _rely = _relxy_tp[:, :, 1]
+            terrain_scan_probe = {
+                "scan_ok": torch.ones((), device=dev),
+                "scan_failed": torch.zeros((), device=dev),
+                "scan_stage": torch.full((), 5.0, device=dev),
+                "finite_frac": _finite_hits.float().mean(),
+                "hits_z_min": _hz_valid.min(),
+                "hits_z_max": _hz_valid.max(),
+                "hits_z_span_mean": (_hz_valid.max(dim=1).values - _hz_valid.min(dim=1).values).mean(),
+                "rel_x_min": _relx.min(),
+                "rel_x_max": _relx.max(),
+                "rel_y_min": _rely.min(),
+                "rel_y_max": _rely.max(),
+                "cmd_world_x_mean": _cn_tp[:, 0].mean(),
+                "cmd_world_y_mean": _cn_tp[:, 1].mean(),
+                "ahead_count_mean": _ahead_count_tp.mean(),
+                "ahead_count_max": _ahead_count_tp.max(),
+                "ahead_has_frac": _has_ahead_tp.float().mean(),
+                "ahead_s_min": torch.where(_has_ahead_tp, _ahead_s_min_tp, torch.zeros_like(_ahead_s_min_tp)).mean(),
+                "ahead_s_max": torch.where(_has_ahead_tp, _ahead_s_max_tp, torch.zeros_like(_ahead_s_max_tp)).mean(),
+                "support_z_mean": _support_z.mean(),
+                "support_z_min": _support_z.min(),
+                "support_z_max": _support_z.max(),
+                "ahead_max_z_mean": torch.where(_has_ahead_tp, _ahead_max_tp, torch.zeros_like(_ahead_max_tp)).mean(),
+                "ahead_min_z_mean": torch.where(_has_ahead_tp, _ahead_min_tp, torch.zeros_like(_ahead_min_tp)).mean(),
+                "raw_rise_mean": torch.where(_has_ahead_tp, _ahead_max_tp - _support_z, torch.zeros_like(_support_z)).mean(),
+                "raw_rise_max": torch.where(_has_ahead_tp, _ahead_max_tp - _support_z, torch.zeros_like(_support_z)).max(),
+                "raw_drop_mean": torch.where(_has_ahead_tp, _support_z - _ahead_min_tp, torch.zeros_like(_support_z)).mean(),
+                "raw_drop_max": torch.where(_has_ahead_tp, _support_z - _ahead_min_tp, torch.zeros_like(_support_z)).max(),
+            }
+            terrain_rise_ahead = torch.where(
+                _has_ahead_tp, torch.clamp(_ahead_max_tp - _support_z, min=0.0), terrain_rise_ahead
+            )
+            terrain_drop_ahead = torch.where(
+                _has_ahead_tp, torch.clamp(_support_z - _ahead_min_tp, min=0.0), terrain_drop_ahead
+            )
             # DISCRETE terrains (stairs/boxes) FORCE a full obstacle height (0706, terrain diag D3p):
             # on stair TREADS the roughness std reads low → the target relaxed toward flat 0.08 → the
             # swing foot clipped the next RISER (38° pitch spike, forward-ascent stumble). Same
@@ -632,16 +741,15 @@ class TailiBlindTPEnv(TailiAmpEnv):
                 # 方向盲的整环境强制曾在下行帧也逼高抬腿 → 更长滞空+更重落地+前倾栽头,
                 # 把 D[stairs] 摔倒率从 18.8% 推到 40.6%(boxes 平顶无下行,故同修复反而受益)。
                 # 奖励侧允许特权信息:用高度扫描的前方最高点 - 脚下地面 = 前方升量。
-                from isaaclab.utils.math import quat_apply
                 _hitsw = self._height_scanner.data.ray_hits_w                       # (N,P,3)
                 _relxy = _hitsw[:, :, :2] - self.robot.data.root_pos_w[:, None, :2]
-                _cmd3 = torch.nn.functional.pad(self.commands[:, :2], (0, 1))
-                _cmdw = quat_apply(self.robot.data.root_quat_w, _cmd3)[:, :2]
+                _cmdw = _command_xy_world_from_root_yaw(self.robot.data.root_quat_w, self.commands[:, :2])
                 _cn = _cmdw / _cmdw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 _ahead = (_relxy * _cn[:, None, :]).sum(-1) > 0.15                   # 指令方向前方的扫描点
                 _hz2 = torch.nan_to_num(_hitsw[:, :, 2], nan=-1e3, posinf=-1e3, neginf=-1e3)
                 _ahead_max = torch.where(_ahead, _hz2, torch.full_like(_hz2, -1e3)).max(dim=1).values
                 _rise = _ahead_max - terrain_h                                       # >0 = 前方升高
+                _rise = terrain_rise_ahead
                 _ascending = _disc & (_rise > 0.04) & (self.commands[:, :2].norm(dim=-1) > 0.1)
                 # ADAPTIVE clearance (0706): the old fixed clamp(min=0.22) capped the lift target at ~0.22-0.26m
                 # regardless of the ACTUAL step height, so 25-30cm risers were unclimbable (foot maxed at 0.20m).
@@ -731,6 +839,27 @@ class TailiBlindTPEnv(TailiAmpEnv):
         )
         comp = taili_reward.compute_reward_components(inp, cfg)
         total = comp["total"] - cfg.w_terminal * terminal_window                      # per-env terminal penalty
+        # Narrow lateral tracking aid for pure lateral commands. Generic tracking still
+        # owns the main objective; this only fixes the weak lateral axis without taxing
+        # forward/back/yaw samples.
+        _lat_aux_w = float(getattr(self.cfg, "rew_lateral_underspeed", 0.0))
+        if _lat_aux_w != 0.0:
+            _lat_cmd = (
+                (self.commands[:, 1].abs() > 0.05)
+                & (self.commands[:, 0].abs() < 0.05)
+                & (self.commands[:, 2].abs() < 0.05)
+            )
+            _cmd_vy_abs = self.commands[:, 1].abs()
+            _lin_tol = torch.maximum(
+                torch.full_like(_cmd_vy_abs, float(getattr(self.cfg, "speed_tol_abs", 0.10))),
+                float(getattr(self.cfg, "speed_tol_rel", 0.15)) * _cmd_vy_abs,
+            )
+            _lat_signed_speed = rd.root_lin_vel_b[:, 1] * torch.sign(self.commands[:, 1])
+            _lat_deficit = torch.clamp((_cmd_vy_abs - _lin_tol) - _lat_signed_speed, min=0.0)
+            comp["lateral_underspeed"] = _lat_aux_w * _lat_deficit * _lat_deficit * _lat_cmd.float()
+        else:
+            comp["lateral_underspeed"] = torch.zeros(N, device=dev)
+        total = total + comp["lateral_underspeed"]
         # 绊脚惩罚 (0706 D3q): 足端水平接触力 > 2x 竖直力 = 脚踹在台阶沿/竖直面上(绊脚),这是
         # D[stairs] 摔倒(40.6%)的直接机制 —— 经典 legged-gym feet_stumble 项。仅在真实接触(>5N)
         # 且水平主导时触发;量级为绊脚足占比(0~1),W=1.0 与其他步态罚同阶。
@@ -745,13 +874,79 @@ class TailiBlindTPEnv(TailiAmpEnv):
         # terrain so climbing a riser PAYS. Stateless (no prev-height buffer to reset); clamp(min=0) so a
         # downstroke is never penalised. Gated to real forward intent + discrete terrain only (flat/slope
         # unaffected). W matched to a mid gait term.
-        _disc_climb = getattr(self, "_discrete_terrain_mask", None)
-        if _disc_climb is not None:
-            _moving_cmd = self.commands[:, :2].norm(dim=-1) > 0.1
-            _climb = self.robot.data.root_lin_vel_w[:, 2].clamp(min=0.0) \
-                * _disc_climb.float() * _moving_cmd.float()
-            comp["climb"] = float(getattr(self.cfg, "w_climb", 1.0)) * _climb          # 进 TPREW 日志
-            total = total + comp["climb"]
+        comp["climb"] = torch.zeros(N, device=dev)
+        comp["terrain_up"] = torch.zeros(N, device=dev)
+        comp["terrain_down"] = torch.zeros(N, device=dev)
+        terrain_probe = {
+            "rise_ahead_mean": terrain_rise_ahead.mean(),
+            "rise_ahead_max": terrain_rise_ahead.max(),
+            "drop_ahead_mean": terrain_drop_ahead.mean(),
+            "drop_ahead_max": terrain_drop_ahead.max(),
+            "disc_frac": torch.zeros((), device=dev),
+            "moving_lin_frac": torch.zeros((), device=dev),
+            "upright_frac": torch.zeros((), device=dev),
+            "slip_weight_mean": torch.zeros((), device=dev),
+            "no_stumble_mean": torch.zeros((), device=dev),
+            "common_mean": torch.zeros((), device=dev),
+            "common_max": torch.zeros((), device=dev),
+            "up_active_mean": torch.zeros((), device=dev),
+            "up_active_max": torch.zeros((), device=dev),
+            "down_active_mean": torch.zeros((), device=dev),
+            "down_active_max": torch.zeros((), device=dev),
+            "up_core_mean": torch.zeros((), device=dev),
+            "down_core_mean": torch.zeros((), device=dev),
+        }
+        terrain_probe.update(terrain_scan_probe)
+        _w_climb = float(getattr(self.cfg, "rew_climb", 0.0))
+        _w_up = float(getattr(self.cfg, "rew_terrain_up", 0.0))
+        _w_down = float(getattr(self.cfg, "rew_terrain_down", 0.0))
+        if (_w_climb > 0.0 or _w_up > 0.0 or _w_down > 0.0) and int(getattr(self, "_phase", getattr(self.cfg, "init_phase", 0))) >= int(getattr(self, "_terrain_start_phase", 5)):
+            self._ensure_gate_mask()
+            _disc_climb = getattr(self, "_discrete_terrain_mask", None)
+            if _disc_climb is not None:
+                _slip = quality["slip_speed"].to(device=dev)
+                _slip_target = float(getattr(self.cfg, "climb_slip_gate", 0.30))
+                _slip_span = max(float(getattr(self.cfg, "climb_slip_soft_span", 0.18)), 1e-6)
+                _slip_weight = torch.clamp(1.0 - torch.clamp(_slip - _slip_target, min=0.0) / _slip_span, 0.0, 1.0)
+                _cmd_xy = self.commands[:, :2]
+                _cmd_xy_norm = _cmd_xy.norm(dim=-1)
+                _moving_lin_cmd = _cmd_xy_norm > 0.10
+                _v_along = torch.sum(rd.root_lin_vel_b[:, :2] * _cmd_xy, dim=1) / _cmd_xy_norm.clamp(min=1e-6)
+                _progress = torch.clamp(_v_along / _cmd_xy_norm.clamp(min=1e-6), 0.0, 1.0)
+                _upright = (-rd.projected_gravity_b[:, 2]).clamp(0.0, 1.0) > 0.85
+                _no_stumble = torch.clamp(1.0 - _stumble, 0.0, 1.0)
+                _common = _disc_climb.float() * _moving_lin_cmd.float() * _upright.float() * gate * _slip_weight * _no_stumble
+                _eps = float(getattr(self.cfg, "terrain_transition_eps", 0.05))
+                _span = max(float(getattr(self.cfg, "terrain_transition_span", 0.08)), 1e-6)
+                _up_active = torch.clamp((terrain_rise_ahead - _eps) / _span, 0.0, 1.0)
+                _down_active = torch.clamp((terrain_drop_ahead - _eps) / _span, 0.0, 1.0)
+                _up_cap = max(float(getattr(self.cfg, "terrain_up_vz_cap", getattr(self.cfg, "climb_vz_cap", 0.6))), 1e-6)
+                _down_cap = max(float(getattr(self.cfg, "terrain_down_vz_cap", 0.5)), 1e-6)
+                _up_v = rd.root_lin_vel_w[:, 2].clamp(min=0.0, max=_up_cap)
+                _down_v = (-rd.root_lin_vel_w[:, 2]).clamp(min=0.0, max=_down_cap)
+                _down_target = max(float(getattr(self.cfg, "terrain_down_vz_target", 0.18)), 1e-6)
+                _down_control = torch.clamp(1.0 - torch.clamp(_down_v - _down_target, min=0.0) / _down_target, 0.0, 1.0)
+                _up_core = 0.55 * _progress + 0.45 * (_up_v / _up_cap)
+                _down_core = _progress * (0.50 + 0.50 * _down_control)
+                comp["terrain_up"] = _w_up * _up_active * _common * _up_core
+                comp["terrain_down"] = _w_down * _down_active * _common * _down_core
+                comp["climb"] = _w_climb * _up_active * _common * _up_core
+                terrain_probe.update({
+                    "disc_frac": _disc_climb.float().mean(),
+                    "moving_lin_frac": _moving_lin_cmd.float().mean(),
+                    "upright_frac": _upright.float().mean(),
+                    "slip_weight_mean": _slip_weight.mean(),
+                    "no_stumble_mean": _no_stumble.mean(),
+                    "common_mean": _common.mean(),
+                    "common_max": _common.max(),
+                    "up_active_mean": _up_active.mean(),
+                    "up_active_max": _up_active.max(),
+                    "down_active_mean": _down_active.mean(),
+                    "down_active_max": _down_active.max(),
+                    "up_core_mean": _up_core.mean(),
+                    "down_core_mean": _down_core.mean(),
+                })
+                total = total + comp["climb"] + comp["terrain_up"] + comp["terrain_down"]
         # (A) LIVE JOINT-IMITATION reward (RANK-1, 0707) — THE positive attractor toward the clean reference
         # gait. The parent's r_imitate (taili_amp_env._get_rewards) is DEAD in this TP subclass: it OVERRIDES
         # _get_rewards and never calls super(), so the policy only ever saw the reference through the
@@ -967,6 +1162,13 @@ class TailiBlindTPEnv(TailiAmpEnv):
                 "clear": float((comp["clearance_under"] + comp["clearance_over"]).mean()),
                 "hip": 0.0,
                 "offax": float(comp["off_axis"].mean()),
+                "lat_aux": float(comp["lateral_underspeed"].mean()),
+                "climb": float(comp["climb"].mean()),
+                "terr_up": float(comp["terrain_up"].mean()),
+                "terr_down": float(comp["terrain_down"].mean()),
+                "terr_probe_rise": float(terrain_probe["rise_ahead_mean"]),
+                "terr_probe_up_active": float(terrain_probe["up_active_mean"]),
+                "terr_probe_common": float(terrain_probe["common_mean"]),
                 "land": float(comp["landing_impact"].mean()),
                 "torq": float((comp["torque_margin"] + comp["torque_saturation"]).mean()),
                 "arate": float(comp["action_rate"].mean()),
@@ -1038,8 +1240,13 @@ class TailiBlindTPEnv(TailiAmpEnv):
                     "upright": float((-rd.projected_gravity_b[:, 2]).clamp(0.0, 1.0).mean()),
                 }
                 for name, value in comp.items():
+                    if name == "total":
+                        continue
                     if torch.is_tensor(value) and value.numel() > 0:
                         reward_payload[name] = float(value.mean())
+                for name, value in terrain_probe.items():
+                    if torch.is_tensor(value) and value.numel() > 0:
+                        reward_payload[f"terrain_probe_{name}"] = float(value.mean())
                 if not self._reward_cfg_printed:
                     self._reward_cfg_printed = True
                     try:
@@ -1175,6 +1382,7 @@ class TailiBlindTPEnv(TailiAmpEnv):
         # `total` (the env-level terminal penalty applied outside `comp` is routed to the "stab"
         # group via `extra_by_group`), so summing the vector reproduces the scalar reward exactly.
         # _get_observations surfaces this into `extras` AFTER it resets extras. Flag UNSET -> skipped.
+        comp["total"] = total + cfg.w_terminal * terminal_window
         if os.environ.get("TAILI_MULTI_CRITIC") == "1":
             try:
                 _mc_extra = {"stab": -cfg.w_terminal * terminal_window}

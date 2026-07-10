@@ -1,0 +1,10 @@
+# Example only. Not used by default diagnostics.
+rules:
+  example_tracking_observation_condition:
+    metric: tracking.command_settled_and_stable_pose.vx_abs_error.p90
+    op: "<="
+    value: 0.10
+  example_torque_observation_condition:
+    metric: hardware.torque_utilization.p99.5
+    op: "<="
+    value: 0.85

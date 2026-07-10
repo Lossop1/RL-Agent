@@ -612,13 +612,14 @@ _REWARD_GROUP_OF = {
     "tracking_yaw": "turn", "tracking_yaw_far": "turn",   # YAW gets its own normalized advantage
     "tracking_lin_far": "track",
     "terrain_progress": "track", "stand": "track", "stand_contact": "track",
-    "stand_far": "track", "climb": "track", "feet_air_time": "track",
+    "stand_far": "track", "climb": "track", "terrain_up": "track",
+    "terrain_down": "track", "feet_air_time": "track",
     # gait quality (rhythm / contact schedule / slip / clearance band)
     "gait_anchor": "gait", "diagonal_contact": "gait", "duty_balance": "gait",
     "stance_slip": "gait", "clearance_under": "gait", "clearance_over": "gait",
     # stability / posture / safety
     "orient": "stab", "base_vz": "stab", "base_wxy": "stab", "off_axis": "stab",
-    "wrong_dir": "stab", "hip_deviation": "stab", "landing_impact": "stab",
+    "wrong_dir": "stab", "lateral_underspeed": "stab", "hip_deviation": "stab", "landing_impact": "stab",
     "stumble": "stab", "terminal_penalty": "stab",
     # style / effort / smoothness penalties
     "torque_margin": "style", "torque_saturation": "style", "action_rate": "style",

@@ -1,0 +1,21 @@
+name: push_probe
+num_envs: 4
+reset_policy: per_case
+reset_initialization: command_start
+terrains:
+  - type: flat
+    level: 0
+dr_cases:
+  - level: 0
+commands:
+  - mode: stand
+    vx: 0.0
+    vy: 0.0
+    wz: 0.0
+    duration: 1.0
+pushes:
+  enabled: true
+  events:
+    - segment: 0
+      time: 0.5
+      vector: [0.0, 0.5, 0.0]

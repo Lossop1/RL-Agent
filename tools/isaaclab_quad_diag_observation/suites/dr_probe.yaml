@@ -1,0 +1,21 @@
+name: dr_probe
+num_envs: 4
+reset_policy: per_case
+reset_initialization: command_start
+terrains:
+  - type: flat
+    level: 0
+dr_cases:
+  - level: 0
+  - level: 3
+commands:
+  - mode: stand
+    vx: 0.0
+    vy: 0.0
+    wz: 0.0
+    duration: 0.5
+  - mode: forward
+    vx: 0.5
+    vy: 0.0
+    wz: 0.0
+    duration: 1.0

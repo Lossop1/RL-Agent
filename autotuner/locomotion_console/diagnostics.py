@@ -142,15 +142,10 @@ PRESETS: tuple[_Preset, ...] = (
     _Preset(
         "directions",
         "All directions",
-        "Run forward, backward, lateral, and yaw suites independently.",
+        "Run forward, backward, lateral, and yaw in one IsaacLab session.",
         "direction",
-        6,
-        (
-            _Stage("forward", "Forward", "direction_forward.yaml", 2),
-            _Stage("backward", "Backward", "direction_backward.yaml", 2),
-            _Stage("lateral", "Lateral", "direction_lateral.yaml", 2),
-            _Stage("yaw", "Yaw", "direction_yaw.yaml", 2),
-        ),
+        3,
+        (_Stage("directions", "All directions", "directions_combined.yaml", 5),),
     ),
     _Preset(
         "terrain",
@@ -288,10 +283,10 @@ def _default_plan_for_preset(preset: _Preset) -> dict[str, Any]:
     elif preset.id == "directions":
         commands = [
             {"id": "stand", "label": "Stand baseline", "mode": "stand", "vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 1.0, "repeats": 1},
-            {"id": "forward", "label": "Forward", **_direction_command("forward"), "repeats": 1},
-            {"id": "backward", "label": "Backward", **_direction_command("backward"), "repeats": 1},
-            {"id": "lateral", "label": "Lateral", **_direction_command("lateral"), "repeats": 1},
-            {"id": "yaw", "label": "Yaw", **_direction_command("yaw"), "repeats": 1},
+            {"id": "forward", "label": "Forward", **_direction_command("forward"), "settle_s": 0.4, "repeats": 1},
+            {"id": "backward", "label": "Backward", **_direction_command("backward"), "settle_s": 0.4, "repeats": 1},
+            {"id": "lateral", "label": "Lateral", **_direction_command("lateral"), "settle_s": 0.4, "repeats": 1},
+            {"id": "yaw", "label": "Yaw", **_direction_command("yaw"), "settle_s": 0.4, "repeats": 1},
         ]
     elif preset.id == "terrain":
         commands = [
@@ -1320,7 +1315,7 @@ class DiagnosticsController:
     @staticmethod
     def _stage_plan(job: _Job, stage: _Stage) -> dict[str, Any]:
         plan = dict(job.plan or _default_plan_for_preset(job.preset))
-        if len(job.preset.stages) <= 1:
+        if len(job.preset.stages) <= 1 or stage.id == "directions":
             return plan
         commands = plan.get("commands") if isinstance(plan.get("commands"), list) else []
         filtered = []

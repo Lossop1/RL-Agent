@@ -170,6 +170,19 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     w_swing_dir = 0.0        # 脚在空中往滑 fix: positive mid-swing command-directional attractor (foot fore-aft vel -> commanded vfx=vx-wz*foot_y0)
     swing_dir_margin = 0.15
     swing_dir_sigma  = 0.08
+    rew_climb = 0.0
+    climb_slip_gate = 0.18
+    climb_slip_soft_span = 0.18
+    climb_vz_cap = 0.8
+    rew_terrain_up = 0.0
+    rew_terrain_down = 0.0
+    terrain_transition_eps = 0.05
+    terrain_transition_span = 0.08
+    terrain_up_vz_cap = 0.6
+    terrain_down_vz_cap = 0.5
+    terrain_down_vz_target = 0.18
+    terrain_curriculum_height_gain = 0.08
+    terrain_curriculum_height_loss = 0.08
     w_settle_brake = 2.0    # A3/C settle: reward per-step deceleration when cmd~0 & still-moving (breaks the coast; settle 1.54s->target<1.0s)   # per-step joint-error scale (0707: 0.12→0.18 — a broader kernel gives a gradient
                                 # even when far from the reference, a smoother/gentler pull than the tight 0.12)
     # (B) WITHDRAWN: forcing a fixed 30cm lift on stair tiles violates spec-3 (3-5cm) and needs to KNOW the terrain
@@ -197,6 +210,7 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     rew_underspeed   = 0.0      # Default no-op; generic banded underspeed penalty outside A1 tolerance.
     rew_backward_underspeed = 0.0  # Directional aux: only for backward vx commands, avoids damaging forward retention.
     rew_backward_wrong_dir  = 0.0  # Directional aux: only for backward vx commands moving forward.
+    rew_lateral_underspeed = 0.0   # Directional aux: only for near-pure lateral commands.
     directional_aux_backward_only = True
     speed_tol_abs    = 0.10     # A1 absolute tolerance used by banded underspeed reward and diagnostics.
     speed_tol_rel    = 0.15     # A1 relative tolerance used by banded underspeed reward and diagnostics.

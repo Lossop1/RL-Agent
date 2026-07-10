@@ -1,0 +1,10 @@
+# Used only to extract observation events and slices. These are not acceptance thresholds.
+command_settle_s: 0.30
+event_window_s: 0.50
+large_roll_deg: 35.0
+large_pitch_deg: 35.0
+height_ratio_low: 0.65
+hard_impact_vz: 0.40
+high_slip_xy: 0.50
+torque_spike_util: 0.95
+torque_clamp_util: 0.999
