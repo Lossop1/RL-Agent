@@ -4,7 +4,10 @@ A raised parse error propagates up and is misclassified as a remote-SSH failure,
 box into a self-inflicted cooldown outage (the bad line stays in `tail -n 240` and re-fails every
 poll, escalating the cooldown). parse_telemetry_jsonl must be resilient to bad numeric fields.
 """
-from autotuner.locomotion_console.telemetry import parse_telemetry_jsonl
+from autotuner.locomotion_console.telemetry import (
+    _actual_phase_gate_from_config,
+    parse_telemetry_jsonl,
+)
 
 
 def test_bad_numeric_field_is_dropped_not_raised():
@@ -46,6 +49,54 @@ def test_playback_keeps_one_real_env_across_cases():
     assert len([r for r in out if r["case_id"] == "0"]) == 10
     assert len([r for r in out if r["case_id"] == "1"]) == 8
     assert {int(r["env_id"]) for r in out} == {0}
+
+
+def test_gate_thresholds_carry_config_vs_default_provenance():
+    """Each gate threshold must be labelled 'config' (this run's real strategy value)
+    or 'default' (UI fallback), so the console never passes a default off as fact."""
+    text = "\n".join([
+        "env:",
+        "  curriculum:",
+        "    phase_gate_prog_1: 0.72",   # present -> config
+        "    phase_gate_diag_1: 0.83",   # present -> config
+        "    phase_max_steps: 30000",    # present -> config
+        # phase_gate_slip_* / duty_* / phase_intervals absent -> default
+    ])
+    gate = _actual_phase_gate_from_config(text, phase=1)
+    assert gate["available"] is True
+    cond = gate["conditions"]
+    src = gate["conditions_source"]
+
+    assert cond["progress_min"] == 0.72 and src["progress_min"] == "config"
+    assert cond["diagonal_min"] == 0.83 and src["diagonal_min"] == "config"
+    assert src["phase_max_steps"] == "config"
+    assert src["slip_max"] == "default"          # no phase_gate_slip_* in config
+    assert src["duty_min"] == "default"
+    assert src["phase_intervals"] == "default"
+    assert src["penalty_gate_min"] == "constant"  # definitional, not a per-strategy knob
+    # phase 1 < terrain_start (5): terrain-only conditions must be absent, not defaulted
+    assert "fall_max" not in cond
+
+
+def test_gate_thresholds_include_terrain_conditions_in_terrain_phase():
+    text = "\n".join([
+        "env:",
+        "  curriculum:",
+        "    terrain_start_phase: 5",
+        "    phase_gate_fall_2: 0.04",   # present -> config
+        # phase_gate_terrain_2 absent -> default 0.0
+    ])
+    gate = _actual_phase_gate_from_config(text, phase=5)
+    cond = gate["conditions"]
+    src = gate["conditions_source"]
+    assert cond["fall_max"] == 0.04 and src["fall_max"] == "config"
+    assert cond["terrain_min"] == 0.0 and src["terrain_min"] == "default"
+
+
+def test_gate_unavailable_when_config_missing():
+    gate = _actual_phase_gate_from_config("", phase=1)
+    assert gate["available"] is False
+    assert gate["conditions"] == {}
 
 
 def test_playback_keeps_same_env_after_reset():

@@ -227,9 +227,34 @@ def active_command_directions(cfg: Any, phase: int | None = None) -> tuple[str, 
     return active or ("fwd", "back", "lat", "yaw")
 
 
-def active_direction_progress(progress: Mapping[str, float], cfg: Any, phase: int | None = None) -> tuple[float, tuple[str, ...]]:
-    """Return min progress over active directions plus the active direction list."""
+def phase_progress_directions(cfg: Any, phase: int | None = None) -> tuple[str, ...]:
+    """Directions used by phase/curriculum progress gates.
+
+    Command sampling can still train every direction, including yaw. This helper only
+    controls which directions are allowed to block curriculum progress. It lets terrain
+    unlock depend on traversable linear motion while yaw remains an independently
+    logged and rewarded objective.
+    """
     active = tuple(name for name in active_command_directions(cfg, phase) if name != "stand")
+    phase_id = int(phase if phase is not None else _obj_value(cfg, "current_training_phase", _obj_value(cfg, "init_phase", 0)))
+    raw = _obj_value(cfg, f"phase_progress_dirs_{phase_id}", None)
+    if raw is None:
+        raw = _obj_value(cfg, "phase_progress_dirs", None)
+    if raw is None:
+        return active
+    if isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(part) for part in raw]
+    else:
+        return active
+    selected = tuple(name for name in items if name in active and name in {"fwd", "back", "lat", "yaw"})
+    return selected or active
+
+
+def active_direction_progress(progress: Mapping[str, float], cfg: Any, phase: int | None = None) -> tuple[float, tuple[str, ...]]:
+    """Return min progress over phase-gated directions plus that direction list."""
+    active = phase_progress_directions(cfg, phase)
     values = [float(progress[name]) for name in active if name in progress]
     if not values:
         values = [float(v) for v in progress.values()]
@@ -333,6 +358,19 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "cmd_resample_s_min": "resample_s_min",
             "cmd_resample_s_max": "resample_s_max",
             "cmd_smooth_alpha": "smooth_alpha",
+            "cmd_transition_enable": "transition_enable",
+            "cmd_transition_cycles": "transition_cycles",
+            "cmd_transition_min_s": "transition_min_s",
+            "cmd_transition_max_s": "transition_max_s",
+            "cmd_transition_fast_s": "transition_fast_s",
+            "cmd_transition_sign_flip_v": "transition_sign_flip_v",
+            "cmd_transition_sign_flip_w": "transition_sign_flip_w",
+            "cmd_transition_low_speed_v": "transition_low_speed_v",
+            "cmd_transition_low_speed_w": "transition_low_speed_w",
+            "cmd_transition_contact_feet": "transition_contact_feet",
+            "cmd_transition_zero_frac_min": "transition_zero_frac_min",
+            "cmd_transition_zero_frac_max": "transition_zero_frac_max",
+            "cmd_transition_stop_zero_frac": "transition_stop_zero_frac",
             "cmd_fwd_max": "fwd_max",
             "cmd_back_max": "back_max",
             "cmd_lat_max": "lat_max",
@@ -414,13 +452,47 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "climb_vz_cap",
             "rew_terrain_up",
             "rew_terrain_down",
+            "rew_terrain_support_transfer",
+            "rew_terrain_contact_quality",
+            "rew_terrain_event_collapse",
+            "rew_ang_vel_xy",
+            "rew_hip_neutral",
+            "hip_neutral_lat_scale",
+            "strict_blind_terrain_reward",
+            "w_lateral_foot_excursion",
+            "lateral_foot_margin",
+            "lateral_foot_scale",
             "terrain_transition_eps",
             "terrain_transition_span",
+            "terrain_event_latch_s",
             "terrain_up_vz_cap",
             "terrain_down_vz_cap",
             "terrain_down_vz_target",
+            "terrain_event_quality_floor",
+            "terrain_front_duty_margin",
+            "terrain_rear_duty_floor",
+            "terrain_support_scale",
+            "terrain_torque_soft_frac",
+            "terrain_event_collapse_height",
+            "terrain_event_collapse_wxy",
+            "terrain_event_collapse_speed_ratio",
+            "terrain_event_collapse_speed_min",
+            "terrain_event_collapse_speed_scale",
             "terrain_curriculum_height_gain",
             "terrain_curriculum_height_loss",
+            "terrain_curriculum_forward_min",
+            "terrain_curriculum_stable_h",
+            "terrain_curriculum_stable_upright",
+            "terrain_curriculum_stable_contact_min",
+            "terrain_curriculum_stable_wxy_max",
+            "terrain_curriculum_speed_cap_ratio",
+            "terrain_curriculum_speed_cap_min",
+            "terrain_curriculum_failure_h",
+            "terrain_curriculum_failure_upright",
+            "terrain_curriculum_failure_wxy",
+            "terrain_curriculum_floor_after_peak",
+            "terrain_curriculum_peak_drop",
+            "terrain_curriculum_move_down_patience",
             "discrete_clearance",
             "speed_tol_abs",
             "speed_tol_rel",

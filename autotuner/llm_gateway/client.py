@@ -50,6 +50,11 @@ class LLMResponse:
     elapsed_s: float
     attempt: int                    # which retry attempt produced this
     error: Optional[str] = None
+    # The model's thinking (`reasoning_content`). DeepSeek returns it even under
+    # response_format=json_object, where `content` gets squeezed to a sentence — so the
+    # substance often lives HERE. Historically discarded at this layer; captured now so
+    # callers can surface/use it instead of paying for thinking and throwing it away.
+    reasoning: str = ""
 
 
 def _resolve_api_key(raw: str) -> str:
@@ -96,12 +101,16 @@ def call_llm_with_schema(system_prompt: str,
                             user_prompt: str,
                             schema_name: str,
     max_retries: int = 1,
+                            model: Optional[str] = None,
                             ) -> LLMResponse:
     """Call configured LLM, expect JSON object back, return parsed.
 
     Schema validation is the CALLER'S responsibility — we just deliver
     a parsed dict (or None on failure).  This keeps `client.py` agnostic
     about which schema is being enforced for any given call.
+
+    `model` overrides config's model for this call (e.g. route cheap tool-picking
+    hops to a fast model, keep the expensive model for final synthesis).
     """
     try:
         cfg = _load_config()
@@ -123,7 +132,7 @@ def call_llm_with_schema(system_prompt: str,
 
     timeout_s = float(os.environ.get("LOCOMOTION_CONSOLE_LLM_TIMEOUT_S", cfg.get("timeout_s", 35.0)))
     client = OpenAI(api_key=api_key, base_url=cfg.get("base_url"), timeout=timeout_s)
-    model = cfg.get("model", "deepseek-chat")
+    model = model or cfg.get("model", "deepseek-chat")
     temperature = float(cfg.get("temperature", 0.0))
 
     t0 = time.time()
@@ -141,7 +150,10 @@ def call_llm_with_schema(system_prompt: str,
                 ],
                 response_format={"type": "json_object"},
             )
-            raw_text = completion.choices[0].message.content or ""
+            message = completion.choices[0].message
+            raw_text = message.content or ""
+            # Not every provider/SDK exposes reasoning_content; default to "" if absent.
+            reasoning = getattr(message, "reasoning_content", "") or ""
             parsed = json.loads(raw_text)
             elapsed = time.time() - t0
             _audit_log({
@@ -152,10 +164,11 @@ def call_llm_with_schema(system_prompt: str,
                 "system": system_prompt,
                 "user": user_prompt,
                 "raw": raw_text,
+                "reasoning": reasoning,
                 "parsed": parsed,
             })
             return LLMResponse(parsed=parsed, raw_text=raw_text, model=model,
-                                elapsed_s=elapsed, attempt=attempt)
+                                elapsed_s=elapsed, attempt=attempt, reasoning=reasoning)
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             if attempt < max_retries:

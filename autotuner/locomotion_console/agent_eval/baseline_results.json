@@ -1,0 +1,79 @@
+[
+  {
+    "id": "A1_gate_values",
+    "class": "A",
+    "elapsed_s": 23.7,
+    "content_chars": 583,
+    "reasoning_chars": 1038,
+    "score": {
+      "app_score": 0.0,
+      "model_score": 0.0,
+      "facts": 5
+    }
+  },
+  {
+    "id": "A2_penalty_ramp",
+    "class": "A",
+    "elapsed_s": 77.2,
+    "content_chars": 2022,
+    "reasoning_chars": 4509,
+    "score": {
+      "app_score": 0.75,
+      "model_score": 0.75,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A3_actual_vx",
+    "class": "A",
+    "elapsed_s": 23.1,
+    "content_chars": 1014,
+    "reasoning_chars": 891,
+    "score": {
+      "app_score": 0.25,
+      "model_score": 0.25,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A4_terrain_progression",
+    "class": "A",
+    "elapsed_s": 27.9,
+    "content_chars": 1324,
+    "reasoning_chars": 179,
+    "score": {
+      "app_score": 0.5,
+      "model_score": 0.5,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A5_stair_height_level3",
+    "class": "A",
+    "elapsed_s": 78.5,
+    "content_chars": 248,
+    "reasoning_chars": 4425,
+    "score": {
+      "app_score": 0.2,
+      "model_score": 0.2,
+      "facts": 5
+    }
+  },
+  {
+    "id": "B1_tuning_step_fraction",
+    "class": "B",
+    "elapsed_s": 81.8,
+    "content_chars": 3435,
+    "reasoning_chars": 1651,
+    "score": {
+      "passed": false,
+      "committed_fallacy": [
+        "0%",
+        "1%"
+      ],
+      "referenced_real_signal": [
+        "阶段"
+      ]
+    }
+  }
+]

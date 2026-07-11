@@ -764,13 +764,31 @@ class RealDataSource(RunDataSource):
         return " ".join(self._run_globs())
 
     def _newest_run(self, remote) -> str:
+        import shlex
+
         globs = self._run_glob_shell()
         if not globs:
             return ""
-        cmd = f"ls -dt {globs} 2>/dev/null"
+        listing = f"ls -dt {globs} 2>/dev/null"
         if self.s.run_filter:
-            cmd += f" | grep -- {self.s.run_filter!r}"
-        cmd += " | head -1"
+            listing += f" | grep -F -- {shlex.quote(str(self.s.run_filter))}"
+        script = (
+            f"{listing} | while IFS= read -r d; do "
+            '[ -d "$d" ] || continue; '
+            'if [ -f "$d/train.telemetry.jsonl" ] || '
+            '[ -f "$d/telemetry.jsonl" ] || '
+            '[ -f "$d/train.jsonl" ] || '
+            '[ -f "$d/train.log" ] || '
+            '[ -f "$d/console.log" ] || '
+            '[ -f "$d/effective_config.yaml" ] || '
+            '[ -f "$d/agent.skrl.yaml" ] || '
+            '[ -f "$d/taili_blind_config.yaml" ] || '
+            '[ -d "$d/checkpoints" ]; then '
+            'printf "%s\\n" "$d"; break; '
+            "fi; "
+            "done"
+        )
+        cmd = "bash -lc " + shlex.quote(script)
         out = remote.exec_out(cmd)
         return (out or "").strip().rstrip("/")
 
@@ -1324,7 +1342,7 @@ class RealDataSource(RunDataSource):
         effective_config_text = ""
         if paths.effective_config_path:
             effective_config_text = remote.exec_out(
-                f"sed -n '1,260p' {shlex.quote(paths.effective_config_path)} 2>/dev/null",
+                f"sed -n '1,900p' {shlex.quote(paths.effective_config_path)} 2>/dev/null",
                 timeout=10,
             ) or ""
         log_text = ""

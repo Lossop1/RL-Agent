@@ -297,7 +297,7 @@ def _default_plan_for_preset(preset: _Preset) -> dict[str, Any]:
             {"type": "flat", "level": 0, "params": {}},
             {"type": "slope", "level": 5, "params": {}},
             {"type": "rough", "level": 5, "params": {}},
-            {"type": "stairs_up", "level": 5, "params": {"direction": "up"}},
+            {"type": "stairs_up", "level": 5, "params": {"direction": "up", "step_height": 0.18}},
         ]
     elif preset.id == "dr":
         commands = [
@@ -318,6 +318,7 @@ def _default_plan_for_preset(preset: _Preset) -> dict[str, Any]:
     return {
         "name": preset.label,
         "template": preset.id,
+        "init_phase": 0,
         "num_envs": 1,
         "reset_policy": "per_case",
         "reset_initialization": "command_start",
@@ -419,6 +420,8 @@ def _normalize_plan(preset: _Preset, requested_plan: DiagnosticPlan | dict[str, 
             normalized_params["direction"] = "up"
         elif terrain_type == "stairs_down":
             normalized_params["direction"] = "down"
+        if terrain_type in {"stairs", "stairs_up", "stairs_down"}:
+            normalized_params["step_height"] = _clamp_float(normalized_params.get("step_height"), 0.02, 0.40, 0.18)
         terrains.append(
             {
                 "type": terrain_type,
@@ -483,6 +486,7 @@ def _normalize_plan(preset: _Preset, requested_plan: DiagnosticPlan | dict[str, 
     return {
         "name": str(raw.get("name") or preset.label),
         "template": str(raw.get("template") or preset.id),
+        "init_phase": _clamp_int(raw.get("init_phase"), 0, 9, 0),
         "num_envs": _clamp_int(raw.get("num_envs"), 1, 64, 1),
         "reset_policy": str(raw.get("reset_policy") or "per_case"),
         "reset_initialization": str(raw.get("reset_initialization") or "command_start"),
@@ -523,6 +527,7 @@ def _plan_summary(plan: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "name": plan.get("name", ""),
         "template": plan.get("template", ""),
+        "init_phase": plan.get("init_phase", 0),
         "commands": len(commands),
         "modes": modes,
         "terrains": [item.get("type") for item in terrains if isinstance(item, dict)],
@@ -568,6 +573,7 @@ def _plan_to_suite_yaml(plan: dict[str, Any], suite_name: str) -> str:
     payload = {
         "name": suite_name,
         "num_envs": int(plan.get("num_envs", 1) or 1),
+        "init_phase": int(plan.get("init_phase", 0) or 0),
         "reset_policy": str(plan.get("reset_policy") or "per_case"),
         "reset_initialization": str(plan.get("reset_initialization") or "command_start"),
         "terrains": plan.get("terrains") or [{"type": "flat", "level": 0}],
@@ -1175,8 +1181,11 @@ class DiagnosticsController:
             stage_out = self._stage_output(job, stage)
             suite = f"{stage_out}/diagnostic_suite.yaml"
             commands.append(f"mkdir -p {shlex.quote(stage_out)}")
+            stage_plan = self._stage_plan(job, stage)
+            init_phase = _clamp_int(stage_plan.get("init_phase"), 0, 9, 0)
             diag_cmd = " ".join(
                 [
+                    f"TAILI_INIT_PHASE={init_phase}",
                     shlex.quote(s.diagnostic_python),
                     "-u",
                     "-m",

@@ -73,15 +73,15 @@ export default function LineChart({
       preserveAspectRatio="none"
     >
       {label && (
-        <text x={pad + 2} y={16} fill="#7a8699" fontSize={11} fontFamily="monospace">
+        <text x={pad + 2} y={16} fill="#8a8a8f" fontSize={11} fontFamily="monospace">
           {label}
         </text>
       )}
       {flat.length > 0 && (
         <>
-          <line x1={pad} x2={width - pad} y1={height - pad} y2={height - pad} stroke="#2b3129" strokeWidth={1} />
-          <line x1={pad} x2={width - pad} y1={pad} y2={pad} stroke="#2b3129" strokeWidth={1} />
-          <line x1={pad} x2={width - pad} y1={height / 2} y2={height / 2} stroke="#222720" strokeWidth={1} />
+          <line x1={pad} x2={width - pad} y1={height - pad} y2={height - pad} stroke="rgba(0,0,0,0.12)" strokeWidth={1} />
+          <line x1={pad} x2={width - pad} y1={pad} y2={pad} stroke="rgba(0,0,0,0.06)" strokeWidth={1} />
+          <line x1={pad} x2={width - pad} y1={height / 2} y2={height / 2} stroke="rgba(0,0,0,0.05)" strokeWidth={1} />
         </>
       )}
       {allSeries.map((item, index) => (
@@ -100,18 +100,18 @@ export default function LineChart({
           : null
       ))}
       {maxLength === 0 && (
-        <text x={width / 2} y={height / 2} fill="#7a8699" fontSize={12}
+        <text x={width / 2} y={height / 2} fill="#8a8a8f" fontSize={12}
               fontFamily="sans-serif" textAnchor="middle">
           {emptyLabel}
         </text>
       )}
       {flat.length > 0 && (
         <>
-          <text x={width - pad} y={16} fill="#7a8699" fontSize={11}
+          <text x={width - pad} y={16} fill="#8a8a8f" fontSize={11}
                 fontFamily="monospace" textAnchor="end">
             {axisLabel(max)}
           </text>
-          <text x={width - pad} y={height - pad} fill="#7a8699" fontSize={11}
+          <text x={width - pad} y={height - pad} fill="#8a8a8f" fontSize={11}
                 fontFamily="monospace" textAnchor="end">
             {axisLabel(min)}
           </text>

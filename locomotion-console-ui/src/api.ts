@@ -787,6 +787,7 @@ export interface DiagnosticPushSpec {
 export interface DiagnosticPlan {
   name: string;
   template: string;
+  init_phase: number;
   num_envs: number;
   reset_policy: string;
   reset_initialization: string;

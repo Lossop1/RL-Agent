@@ -72,6 +72,21 @@ def _progress(out_dir: Path, *, status: str, stage: str, rows_written: int = 0, 
     print(f"[TAILI_DIAG_CASES] stage={stage} status={status} rows={rows_written}", flush=True)
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _safe_name(value: Any) -> str:
     text = str(value or "case").strip().lower()
     keep = []
@@ -180,6 +195,8 @@ def _write_merged_meta(
     rows_written: int,
     status: str,
 ) -> None:
+    strict_reset = _as_bool(suite.get("diagnostic_strict_reset", suite.get("strict_reset")), default=False)
+    reset_policy_note = "training_strict_reset" if strict_reset else "observe_past_height_termination"
     executed_cases: list[dict[str, Any]] = []
     for case_id, (case_dir, spec) in enumerate(zip(case_dirs, case_specs)):
         child_meta = _load_case_meta(case_dir)
@@ -196,7 +213,7 @@ def _write_merged_meta(
             }
         )
     payload = {
-        "schema_version": "ilqd_observation_record_v0.5.1",
+        "schema_version": "ilqd_observation_record_v0.5.2",
         "task": args.task,
         "checkpoint": args.checkpoint,
         "suite_path": args.suite,
@@ -206,6 +223,9 @@ def _write_merged_meta(
             "cases": executed_cases,
             "record_capture": "post_step_terminal_safe",
             "reset_initialization": suite.get("reset_initialization", "command_start"),
+            "diagnostic_reset_policy": reset_policy_note,
+            "diagnostic_strict_reset": strict_reset,
+            "height_termination_recorded_as": "would_terminate",
             "payload_local": True,
         },
         "num_envs_requested": int(args.num_envs or suite.get("num_envs") or 1),
@@ -215,6 +235,11 @@ def _write_merged_meta(
             "payload-local Taili diagnostic; no robot_lab imports",
             "one terrain/DR case per child process to avoid IsaacLab global-state reuse",
             "policy action uses mean_actions when available",
+            (
+                "diagnostic suppresses training height termination and records would_terminate/diagnostic_reset_suppressed"
+                if not strict_reset
+                else "diagnostic uses training-strict reset behavior"
+            ),
         ],
         "semantics": "Observation-only. No pass/fail labels are emitted by the recorder.",
     }

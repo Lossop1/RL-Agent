@@ -583,6 +583,7 @@ class DiagnosticCriteriaSpec(BaseModel):
 class DiagnosticPlan(BaseModel):
     name: str = ""
     template: str = ""
+    init_phase: int = 0
     num_envs: int = 1
     reset_policy: str = "per_case"
     reset_initialization: str = "command_start"

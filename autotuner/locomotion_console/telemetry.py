@@ -464,6 +464,96 @@ def _gate_thresholds_from_config(effective_config_text: str) -> tuple[dict[str, 
     return thresholds, notes
 
 
+def _actual_phase_gate_from_config(effective_config_text: str, phase: Any) -> dict[str, Any]:
+    """Return the training code's actual phase-advance gate for the current phase."""
+    phase_idx = _phase_index(phase)
+    empty = {
+        "available": False,
+        "source": "unavailable",
+        "phase_index": phase_idx,
+        "conditions": {},
+    }
+    if phase_idx is None or not effective_config_text.strip():
+        return empty
+    try:
+        import yaml
+
+        raw = yaml.safe_load(effective_config_text) or {}
+    except Exception:
+        return empty
+
+    curriculum = _nested_get(raw, "env", "curriculum")
+    if not isinstance(curriculum, dict):
+        curriculum = _nested_get(raw, "curriculum")
+    if not isinstance(curriculum, dict):
+        return empty
+
+    def present(key: str) -> bool:
+        """True when the config actually carries this key (vs. a fallback default)."""
+        return _as_float(curriculum.get(key)) is not None
+
+    def cfg_num(key: str, default: float | None = None) -> float | None:
+        value = _as_float(curriculum.get(key))
+        return value if value is not None else default
+
+    def phase_thr(name: str, default: float) -> tuple[float, str]:
+        # Walk down from the current phase like the training env does; report
+        # whether the threshold came from config or fell back to a default.
+        for p in range(int(phase_idx), -1, -1):
+            value = _as_float(curriculum.get(f"phase_gate_{name}_{p}"))
+            if value is not None:
+                return float(value), "config"
+        return float(default), "default"
+
+    # `conditions` stays numeric (unchanged contract); `conditions_source` is a
+    # parallel map giving each threshold's provenance so the UI can present a
+    # defaulted threshold as a fact, not pass it off as the run's real strategy:
+    #   "config"   value parsed from this run's effective_config.yaml
+    #   "default"  config key absent — using a hardcoded fallback
+    #   "constant" definitional, never a per-strategy knob (e.g. penalty gate == 1.0)
+    conditions: dict[str, Any] = {}
+    conditions_source: dict[str, str] = {}
+
+    def put(key: str, value: Any, source: str) -> None:
+        conditions[key] = value
+        conditions_source[key] = source
+
+    prog_v, prog_s = phase_thr("prog", 0.70)
+    slip_v, slip_s = phase_thr("slip", 0.20)
+    diag_v, diag_s = phase_thr("diag", 0.80)
+    duty_v, duty_s = phase_thr("duty", 0.80)
+    air_v, air_s = phase_thr("air", 0.0)
+    terrain_slip_high = _as_float(curriculum.get("terrain_gate_slip_high"))
+    terrain_slip_v = max(slip_v, float(terrain_slip_high) if terrain_slip_high is not None else 0.22)
+    terrain_slip_s = "config" if (slip_s == "config" or terrain_slip_high is not None) else "default"
+    terrain_start = int(cfg_num("terrain_start_phase", 5) or 5)
+
+    put("penalty_gate_min", 1.0, "constant")
+    put("progress_min", prog_v, prog_s)
+    put("slip_max", slip_v, slip_s)
+    put("terrain_slip_max", terrain_slip_v, terrain_slip_s)
+    put("diagonal_min", diag_v, diag_s)
+    put("duty_min", duty_v, duty_s)
+    put("air_min", air_v, air_s)
+    put("phase_intervals", int(cfg_num("phase_intervals", 5) or 5), "config" if present("phase_intervals") else "default")
+    put("phase_max_steps", int(cfg_num("phase_max_steps", 25000) or 25000), "config" if present("phase_max_steps") else "default")
+    put("terrain_start_phase", terrain_start, "config" if present("terrain_start_phase") else "default")
+    put("max_training_phase", int(cfg_num("max_training_phase", 3) or 3), "config" if present("max_training_phase") else "default")
+
+    if int(phase_idx) >= terrain_start:
+        put("terrain_min", cfg_num("phase_gate_terrain_2", 0.0), "config" if present("phase_gate_terrain_2") else "default")
+        put("discrete_terrain_min", cfg_num("phase_gate_discrete_terrain_2", 0.0), "config" if present("phase_gate_discrete_terrain_2") else "default")
+        put("fall_max", cfg_num("phase_gate_fall_2", 0.05), "config" if present("phase_gate_fall_2") else "default")
+
+    return {
+        "available": True,
+        "source": "effective_config.yaml/env.curriculum",
+        "phase_index": phase_idx,
+        "conditions": conditions,
+        "conditions_source": conditions_source,
+    }
+
+
 def _progress_threshold_from(thresholds: dict[str, Any], phase: Any) -> float:
     idx = _phase_index(phase)
     progress = thresholds.get("progress") if isinstance(thresholds, dict) else None
@@ -1643,6 +1733,11 @@ def build_telemetry(
     if points and side_log_text:
         _augment_points_from_side_log(points, side_log_text)
     latest = points[-1] if points else None
+    if latest is not None:
+        latest.curriculum["phase_gate"] = _actual_phase_gate_from_config(
+            effective_config_text,
+            latest.curriculum.get("phase"),
+        )
     if not points and not error:
         limitations.append("远程训练脚本尚未输出 telemetry JSONL，且日志里没有可解析的 [TPREW] 行。")
     resolved_source_stats: dict[str, Any] = dict(source_stats or {})

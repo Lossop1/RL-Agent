@@ -1,0 +1,80 @@
+[
+  {
+    "id": "A1_gate_values",
+    "class": "A",
+    "elapsed_s": 2.7,
+    "content_chars": 227,
+    "reasoning_chars": 209,
+    "score": {
+      "app_score": 1.0,
+      "model_score": 1.0,
+      "facts": 5
+    }
+  },
+  {
+    "id": "A2_penalty_ramp",
+    "class": "A",
+    "elapsed_s": 2.5,
+    "content_chars": 276,
+    "reasoning_chars": 180,
+    "score": {
+      "app_score": 1.0,
+      "model_score": 1.0,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A3_actual_vx",
+    "class": "A",
+    "elapsed_s": 2.1,
+    "content_chars": 141,
+    "reasoning_chars": 46,
+    "score": {
+      "app_score": 1.0,
+      "model_score": 1.0,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A4_terrain_progression",
+    "class": "A",
+    "elapsed_s": 2.5,
+    "content_chars": 214,
+    "reasoning_chars": 51,
+    "score": {
+      "app_score": 1.0,
+      "model_score": 1.0,
+      "facts": 4
+    }
+  },
+  {
+    "id": "A5_stair_height_level3",
+    "class": "A",
+    "elapsed_s": 4.2,
+    "content_chars": 229,
+    "reasoning_chars": 335,
+    "score": {
+      "app_score": 0.8,
+      "model_score": 1.0,
+      "facts": 5
+    }
+  },
+  {
+    "id": "B1_tuning_step_fraction",
+    "class": "B",
+    "elapsed_s": 10.5,
+    "content_chars": 532,
+    "reasoning_chars": 667,
+    "score": {
+      "passed": false,
+      "committed_fallacy": [
+        "1%"
+      ],
+      "referenced_real_signal": [
+        "阶段",
+        "gate",
+        "门控"
+      ]
+    }
+  }
+]

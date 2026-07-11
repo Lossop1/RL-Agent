@@ -1,4 +1,4 @@
-# Taili quadruped AMP locomotion env. Task=velocity tracking; AMP style from trot reference.
+# Taili 四足 AMP 运动环境：任务是速度跟踪，AMP 提供小跑风格约束。
 from __future__ import annotations
 import math
 import os
@@ -11,12 +11,19 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
 from .taili_amp_env_cfg import TailiAmpEnvCfg
-from .motions import MotionLoader  # noqa: F401 (kept for compat)
+from .motions import MotionLoader  # noqa: F401，保留兼容导入。
 from .multi_motion_loader import MultiMotionLoader
 from .parametric_ref import flat_reference
 try:
+    from .taili_core.terrain_curriculum import compute_terrain_curriculum_moves
+except ImportError:
+    try:
+        from autotuner.taili_core.terrain_curriculum import compute_terrain_curriculum_moves
+    except ImportError:
+        from taili_core.terrain_curriculum import compute_terrain_curriculum_moves
+try:
     from .taili_blind_config import active_direction_progress, phase_command_spec
-except ImportError:  # local source layout: env_edit is nested one level deeper
+except ImportError:  # 本地源码布局下 env_edit 可能多嵌套一级。
     from ..taili_blind_config import active_direction_progress, phase_command_spec
 
 
@@ -44,7 +51,7 @@ def _sample_uniform(n: int, lo: float, hi: float, device) -> torch.Tensor:
 
 
 def _command_xy_world_from_root_yaw(root_quat_w: torch.Tensor, command_xy: torch.Tensor) -> torch.Tensor:
-    """Rotate body-frame XY commands into world XY using root yaw only."""
+    """只使用 root yaw，把机体系 XY 命令旋转到世界系 XY。"""
     q = root_quat_w
     yaw = torch.atan2(
         2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
@@ -61,6 +68,18 @@ def _command_xy_world_from_root_yaw(root_quat_w: torch.Tensor, command_xy: torch
     )
 
 
+def _yaw_from_quat_w(root_quat_w: torch.Tensor) -> torch.Tensor:
+    q = root_quat_w
+    return torch.atan2(
+        2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+        1.0 - 2.0 * (q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3]),
+    )
+
+
+def _wrap_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
 class TailiAmpEnv(DirectRLEnv):
     cfg: TailiAmpEnvCfg
 
@@ -72,18 +91,15 @@ class TailiAmpEnv(DirectRLEnv):
                                                 sigma=self.cfg.cond_sigma, slope_sigma=self.cfg.slope_sigma)
         self.ref_body_index = self.robot.data.body_names.index(self.cfg.reference_body)
         self.foot_indexes = [self.robot.data.body_names.index(n) for n in self.cfg.foot_body_names]
-        # feet in the CONTACT SENSOR's own body ordering (NOT robot's — they differ; see memory).
+        # 接触传感器有自己的 body 顺序，不直接等同于 robot body 顺序。
         self._feet_contact_ids, _ = self._contact_sensor.find_bodies(self.cfg.foot_body_names)
         self.motion_dof_indexes = self._motion_loader.get_dof_index(self.robot.data.joint_names)
         self.motion_ref_body_index = self._motion_loader.get_body_index([self.cfg.reference_body])[0]
         self.motion_foot_indexes = self._motion_loader.get_body_index(self.cfg.foot_body_names)
         self.n_feet = len(self.foot_indexes)
-        # AMP STRIDE WINDOW (TAILI_AMP_STRIDE=1): make the style window span ~one gait period (~400ms)
-        # instead of 2 adjacent frames. We raise num_amp_observations (2->6) and subsample the AMP obs
-        # ring by amp_frame_stride (~4 steps ~80ms) on BOTH the policy and reference sides, so the exported
-        # window is [t, t-stride, t-2*stride, ...]. The discriminator input auto-scales to
-        # amp_observation_space * num_amp_observations. FLAG UNSET => stride=1, no cfg/buffer change,
-        # byte-identical behavior.
+        # AMP stride 窗口：启用 TAILI_AMP_STRIDE=1 时，让风格窗口覆盖约一个步态周期。
+        # 策略侧和参考侧使用相同 amp_frame_stride 子采样，判别器输入维度随帧数自动扩展。
+        # 未启用时 stride=1，不改变配置和缓冲行为。
         self._amp_frame_stride = 1
         if os.environ.get("TAILI_AMP_STRIDE") == "1":
             self._amp_frame_stride = int(getattr(self.cfg, "amp_frame_stride", 4))
@@ -92,24 +108,34 @@ class TailiAmpEnv(DirectRLEnv):
         self.amp_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.amp_observation_size,))
         self.amp_observation_buffer = torch.zeros(
             (self.num_envs, self.cfg.num_amp_observations, self.cfg.amp_observation_space), device=self.device)
-        # Deep raw ring holding enough ADJACENT frames to build the strided export window (stride>1 only).
+        # 原始 AMP 环形缓冲：stride>1 时保留足够相邻帧来构造导出窗口。
         if self._amp_frame_stride > 1:
             self._amp_raw_depth = (self.cfg.num_amp_observations - 1) * self._amp_frame_stride + 1
             self._amp_raw_ring = torch.zeros(
                 (self.num_envs, self._amp_raw_depth, self.cfg.amp_observation_space), device=self.device)
-        self.commands = torch.zeros((self.num_envs, 3), device=self.device)        # SMOOTHED command (what the policy tracks)
-        self._cmd_target = torch.zeros((self.num_envs, 3), device=self.device)      # raw target; commands low-passes toward it
+        self.commands = torch.zeros((self.num_envs, 3), device=self.device)        # 平滑后的命令，策略实际跟踪它。
+        self._cmd_target = torch.zeros((self.num_envs, 3), device=self.device)      # 原始目标命令，commands 向它低通靠近。
+        self._cmd_motion_target = torch.zeros_like(self.commands)                  # 过渡整形后的目标命令。
+        self._cmd_transition_start = torch.zeros_like(self.commands)
+        self._cmd_transition_goal = torch.zeros_like(self.commands)
+        self._cmd_transition_timer = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_total = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_via_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_zero_frac = torch.full((self.num_envs,), 0.5, device=self.device)
+        self._cmd_transition_strength = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_heading_ref = torch.zeros(self.num_envs, device=self.device)
+        self._heading_error = torch.zeros(self.num_envs, device=self.device)
         self.last_actions = torch.zeros((self.num_envs, 12), device=self.device)
         self._cmd_resample_steps = max(1, int(self.cfg.cmd_resample_s / (self.cfg.dt * self.cfg.decimation)))
-        self._log_step = 0          # for periodic stdout training diagnostics
+        self._log_step = 0          # 周期性 stdout 训练诊断计数。
         self._terrain_ctx = torch.zeros((self.num_envs, self.cfg.terrain_ctx_dim), device=self.device)
         self._episode_start_xy = self.robot.data.root_pos_w[:, :2].detach().clone()
         self._episode_start_root_z = self.robot.data.root_pos_w[:, 2].detach().clone()
         self._episode_start_cmd_xy = torch.zeros((self.num_envs, 2), device=self.device)
-        # GAIT-PHASE clock: a per-env phase in [0,1) advancing only when commanded to move; per-leg phase =
-        # phase + diagonal trot offsets (FL,FR,RL,RR). Drives the contact-schedule reward + a policy obs.
+        # 步态相位时钟：每个 env 一个 [0,1) 相位，只在运动命令下推进。
+        # 单腿相位 = 全局相位 + 对角小跑偏置，用于接触节律奖励和策略观测。
         self._gait_phase = torch.zeros(self.num_envs, device=self.device)
-        self._trot_offsets = torch.tensor([0.0, 0.5, 0.5, 0.0], device=self.device)   # FL,FR,RL,RR diagonal
+        self._trot_offsets = torch.tensor([0.0, 0.5, 0.5, 0.0], device=self.device)   # FL,FR,RL,RR 对角小跑。
         self._hip_idx = [self.robot.data.joint_names.index(f"{lg}_hip_joint") for lg in ["FL", "FR", "RL", "RR"]]
         def _joint_gain_vector(attr_name: str, defaults: dict[str, float]) -> torch.Tensor:
             role_cfg = getattr(self.cfg, attr_name, defaults)
@@ -130,13 +156,13 @@ class TailiAmpEnv(DirectRLEnv):
         self._actuator_damping_base = _joint_gain_vector(
             "actuator_damping", {"hip": 10.0, "thigh": 10.0, "calf": 10.0}
         )
-        # PROPRIOCEPTIVE HISTORY buffer — FIFO ring of the last H proprio frames (all real-robot-measurable).
-        # Enables implicit stair sensing + velocity estimation without lin_vel or height scanner.
+        # 本体历史缓冲：最近 H 帧真实机器人可测的本体信息。
+        # 不直接使用 lin_vel 或 height scanner，也能提供隐式地形/速度线索。
         H, P = self.cfg.obs_history_len, self.cfg.obs_history_dim
         self._obs_history = torch.zeros((self.num_envs, H, P), device=self.device)
-        # CONTROL DELAY buffer — apply action from previous step to simulate ~20ms compute+comm latency.
+        # 控制延迟缓冲：执行上一控制步动作，模拟约 20ms 计算和通信延迟。
         self._delayed_action = torch.zeros((self.num_envs, 12), device=self.device)
-        # PER-DIRECTION velocity curriculum: each direction has its own speed ceiling + progress tracker.
+        # 分方向速度课程：每个方向都有独立速度上限和进展跟踪。
         self._vel_curriculum_enable = bool(getattr(self.cfg, "vel_curriculum_enable", True))
         phase0_spec = phase_command_spec(self.cfg, 0) if phase_command_spec is not None else {}
         def _phase_hi(name: str, fallback) -> float:
@@ -152,60 +178,42 @@ class TailiAmpEnv(DirectRLEnv):
         self._vel_max_fwd = float(self.cfg.cmd_fwd_max) if not self._vel_curriculum_enable else _phase_hi("fwd_range", self.cfg.cmd_fwd_range)
         self._vel_max_back = float(self.cfg.cmd_back_max) if not self._vel_curriculum_enable else _phase_hi("back_range", self.cfg.cmd_back_range)
         self._vel_max_lat = float(self.cfg.cmd_lat_max) if not self._vel_curriculum_enable else _phase_hi("lat_range", self.cfg.cmd_lat_range)
-        # YAW starts EASY and ramps up. In-place rotation at the full [0.25, 0.90] range from step 0
-        # is far harder than the linear ranges — the progress metric averaged in the 0.90 rad/s
-        # commands and pinned yaw_prog ~0.55, which then gated all of phi0. Start the yaw ceiling at
-        # an achievable rate (~range_lo + 0.20) so competence builds on easy turns; the velocity
-        # curriculum ramps it toward cmd_yaw_max as yaw_prog succeeds. (fwd/back/lat handle their
-        # ranges fine, so they still start at the phase high.)
+        # yaw 从较容易的上限起步，再随进展提高。原地转向从满范围开始过难，
+        # 会让 yaw_prog 卡住并阻塞早期阶段；先学会中等 yaw，再扩展到目标上限。
         yaw_lo = _phase_lo("yaw_range", self.cfg.cmd_yaw_range)
         yaw_hi = _phase_hi("yaw_range", self.cfg.cmd_yaw_range)
-        # YAW REACHABLE RAMP (0707 v2): the yaw curriculum had two failure modes — the ORIGINAL "build from
-        # easy" collapsed the ceiling to 0.30 (yaw_prog plateaus ~0.50 < vel_cur_down 0.55 → shrinks; grow
-        # needs yaw_prog>=vel_cur_up 0.85, NEVER reached), so the robot only practiced yaw≈0.3 while A2 tests
-        # 0.4/0.8 (out-of-distribution). The v1 fix (TAILI_YAW_FULLRANGE, pin BOTH to yaw_hi=0.9) over-corrected:
-        # a from-scratch policy gets ~0 reward on 0.9-yaw, earns NOTHING, and ABANDONS yaw for linear (measured:
-        # tracking_yaw peaked ~14k then declined). v2 = a REACHABLE easy→hard ramp: start easy (yaw_lo+0.20),
-        # FLOOR at 0.45 (covers A2 yaw04=0.4, can't collapse to the too-easy 0.3), and GROW the ceiling toward
-        # yaw_hi on a REACHABLE yaw-specific threshold (yaw_vel_cur_up, default 0.40) so competence at moderate
-        # yaw expands the range up to 0.9 — bootstrapping easy yaw wins first, then covering the test range.
+        # yaw 可达 ramp：起始上限易学，floor 保证不会退到过低范围；
+        # 达到 yaw 专用进展阈值后再向 yaw_hi 扩展。
         self._vel_max_yaw = float(self.cfg.cmd_yaw_max) if not self._vel_curriculum_enable else min(yaw_hi, yaw_lo + 0.20)
-        # Floors = phase range LOW (was = the ceiling, a bug: the curriculum could never ease a
-        # struggling direction below its starting ceiling). Now a regressing direction can drop
-        # back toward its easy end and rebuild.
+        # floor 使用阶段速度范围下限；退化方向可以回到更容易的速度端重新建立能力。
         self._vel_floor_fwd = _phase_lo("fwd_range", self.cfg.cmd_fwd_range)
         self._vel_floor_back = _phase_lo("back_range", self.cfg.cmd_back_range)
         self._vel_floor_lat = _phase_lo("lat_range", self.cfg.cmd_lat_range)
-        # yaw floor = 0.45 (covers A2 yaw04=0.4; prevents the collapse-to-0.30 that made yaw practice too easy
-        # and out-of-distribution), but never above yaw_hi.
+        # yaw floor 设为不高于 yaw_hi 的 0.45，避免退到过低 yaw 练习。
         self._vel_floor_yaw = min(yaw_hi, max(yaw_lo, 0.45))
         self._fwd_prog = 0.0; self._back_prog = 0.0; self._lat_prog = 0.0; self._yaw_prog = 0.0
-        # DR LEVEL SYSTEM: starts at 0 (no DR), gates on demonstrated locomotion capability.
-        self._dr_level = int(getattr(self.cfg, "dr_start_level", 0))   # gates up 0->1->2->3
-        self._dr_gate_count = 0     # consecutive log intervals above level gate
+        # DR 等级系统：从 0 级开始，按已展示的运动能力逐级打开。
+        self._dr_level = int(getattr(self.cfg, "dr_start_level", 0))   # 按门控从 0 升到 3。
+        self._dr_gate_count = 0     # 连续满足 DR 升级门槛的日志间隔数。
         _push_s = getattr(self.cfg, f"dr_push_interval_s_{self._dr_level}", 0.0)
         _sdt = self.cfg.dt * self.cfg.decimation
         self._push_steps = max(1, int(_push_s / _sdt)) if _push_s > 0 else int(1e9)
-        # IMU bias (level-3 DR): per-episode constant gyro+gravity offset (sensor miscalibration). [angv(3), grav(3)]
+        # IMU 偏置：每个 episode 固定的 gyro+gravity 偏移，模拟传感器标定误差。
         self._imu_bias = torch.zeros((self.num_envs, 6), device=self.device)
-        self._dr_warned = set()     # one-time warnings for unavailable physx DR APIs
-        self._default_masses = None # stored once (CPU) for mass DR: reset-to-default + delta (no drift)
-        self._dr_mat_level = -1        # highest DR level whose friction/CoM was written (re-fire on level-up; ROOT-4)
-        self._default_coms = None      # stored once for CoM DR: reset-to-default + offset (no drift on per-level re-fire)
+        self._dr_warned = set()     # PhysX DR API 不可用时的一次性告警集合。
+        self._default_masses = None # mass DR 的默认质量缓存，用于先复位再加扰动。
+        self._dr_mat_level = -1        # 已写入摩擦/CoM 的最高 DR 等级。
+        self._default_coms = None      # CoM DR 的默认质心缓存，用于先复位再加偏移。
         self._dbg = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         self._last_gait_match = 0.0
-        # UNIFIED TRAINING PHASE phi (0..3): coordinates all four curricula in strict dependency order
-        # 0 bootstrap locomotion -> 1 clean gait -> 2 scale speed+terrain -> 3 harden DR.
-        # Quality penalties / velocity ramp / terrain move-up / DR are each gated on phi (see _log_training_diag).
-        # init_phase: fresh starts at 0 (full bootstrap). On RESUME of an already-walking checkpoint, set env var
-        # TAILI_INIT_PHASE=2 to continue in the walker's TRAINED regime (penalties full, terrain on) instead of
-        # dropping it back to phi0 (penalties off) — that phase-reset is a distribution shift AND wastes ~20k steps
-        # re-climbing. clearance_gate still starts 0 so the new heavy clearance fades in gently even on resume.
+        # 统一训练阶段 phi：协调速度、步态质量、地形和 DR。
+        # fresh 默认从 0 开始；从已有行走检查点 resume 时可用 TAILI_INIT_PHASE 跳到已训练阶段。
+        # clearance_gate 仍从 0 开始，避免重约束在 resume 时突然生效。
         self._phase = int(os.environ.get("TAILI_INIT_PHASE", getattr(self.cfg, "init_phase", 0)))
-        self._phase_count = 0          # consecutive intervals meeting the current phase's advance gate
-        self._penalty_gate = 1.0 if self._phase >= 1 else 0.0   # past bootstrap -> quality penalties already full
-        self._budget_ratio_ema = 0.0   # |regular penalties| / positive task reward (set by the reward step)
-        self._clearance_gate = 0.0     # phi2 terrain clearance ramp: clearance -1.5->-8, base 0.07->0.09 (ramps 0->1 over phase 2)
+        self._phase_count = 0          # 连续满足当前阶段推进门槛的日志间隔数。
+        self._penalty_gate = 1.0 if self._phase >= 1 else 0.0   # bootstrap 之后质量惩罚已完全打开。
+        self._budget_ratio_ema = 0.0   # 常规惩罚绝对值 / 正向任务奖励。
+        self._clearance_gate = 0.0     # 地形 clearance 渐入门控。
         self._terrain_start_phase = int(getattr(self.cfg, "terrain_start_phase", 5))
         self._dr_start_phase = int(getattr(self.cfg, "dr_start_phase", self._terrain_start_phase))
         configured_max_phase = getattr(self.cfg, "max_training_phase", None)
@@ -220,11 +228,11 @@ class TailiAmpEnv(DirectRLEnv):
         self._max_training_phase = int(configured_max_phase)
         if self._phase > 0:
             print(f"[ENV] init_phase={self._phase} (resume in trained regime; penalty_gate={self._penalty_gate})", flush=True)
-        self._advance_ok = True        # regression guard: pause terrain/speed advance when capability regresses
-        self._slip_ema = 0.0           # running mean foot slip speed (for the phi1->phi2 clean-gait gate)
-        # Contact cache (computed in _get_observations, used in _get_rewards to avoid double query)
+        self._advance_ok = True        # 回退保护：能力退化时暂停地形/速度推进。
+        self._slip_ema = 0.0           # 足端滑移运行均值，用于清步态阶段门控。
+        # 接触缓存：在 _get_observations 中计算，在 _get_rewards 中复用。
         self._in_contact = torch.zeros((self.num_envs, 4), device=self.device)
-        # SYMMETRY augmentation: mirror the PPO batch to force a left-right symmetric gait.
+        # 对称增强：镜像 PPO batch，约束左右对称步态。
         if getattr(self.cfg, "sym_augment", False):
             from . import symmetry
             symmetry.set_mirrors(self._build_hscan_mirror_perm(), self.device)
@@ -251,14 +259,14 @@ class TailiAmpEnv(DirectRLEnv):
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self.robot
-        # Height scanner — always in scene: used for terrain_ctx (AMP conditioning), privileged critic
-        # obs, and clearance reward. The ACTOR policy never sees it (BlindGaussianPolicy slices it out).
+        # 高度扫描器始终在场景中：用于 terrain_ctx、critic 特权观测和 clearance 奖励。
+        # actor 策略不直接读取它，BlindGaussianPolicy 会切掉特权部分。
         self._height_scanner = RayCaster(self.cfg.height_scanner)
         self.scene.sensors["height_scanner"] = self._height_scanner
-        # contact sensor (foot air-time for the stepping reward)
+        # 接触传感器，用于足端滞空时间和接触奖励。
         self._contact_sensor = ContactSensor(self.cfg.contact_sensor)
         self.scene.sensors["contact_sensor"] = self._contact_sensor
-        # terrain importer with generator + curriculum (anymal_c direct pattern)
+        # 地形导入器，启用生成器和课程。
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
@@ -267,9 +275,168 @@ class TailiAmpEnv(DirectRLEnv):
         light = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light.func("/World/Light", light)
 
+    def _command_transition_steps(self) -> int:
+        step_dt = float(self.cfg.dt) * float(self.cfg.decimation)
+        base_period = float(getattr(self.cfg, "gait_period", 0.55))
+        cycles = float(getattr(self.cfg, "cmd_transition_cycles", 0.75))
+        min_s = float(getattr(self.cfg, "cmd_transition_min_s", 0.25))
+        max_s = float(getattr(self.cfg, "cmd_transition_max_s", 0.80))
+        duration = min(max(base_period * cycles, min_s), max_s)
+        return max(1, int(round(duration / max(step_dt, 1e-6))))
+
+    def _begin_command_transition(self, env_ids, snap: bool = False):
+        if len(env_ids) == 0:
+            return
+        target = self._cmd_target[env_ids]
+        yaw = _yaw_from_quat_w(self.robot.data.root_quat_w[env_ids])
+        self._cmd_heading_ref[env_ids] = yaw
+        self._heading_error[env_ids] = 0.0
+        if snap or not bool(getattr(self.cfg, "cmd_transition_enable", True)):
+            self.commands[env_ids] = target
+            self._cmd_motion_target[env_ids] = target
+            self._cmd_transition_start[env_ids] = target
+            self._cmd_transition_goal[env_ids] = target
+            self._cmd_transition_timer[env_ids] = 0
+            self._cmd_transition_total[env_ids] = 1
+            self._cmd_transition_via_zero[env_ids] = False
+            self._cmd_transition_zero_frac[env_ids] = 0.5
+            self._cmd_transition_strength[env_ids] = 0.0
+            return
+
+        current = self.commands[env_ids]
+        v_thr = float(getattr(self.cfg, "cmd_transition_sign_flip_v", 0.08))
+        w_thr = float(getattr(self.cfg, "cmd_transition_sign_flip_w", 0.10))
+        cur_lin = torch.linalg.norm(current[:, :2], dim=-1)
+        tgt_lin = torch.linalg.norm(target[:, :2], dim=-1)
+        cur_move = (cur_lin > v_thr) | (current[:, 2].abs() > w_thr)
+        tgt_move = (tgt_lin > v_thr) | (target[:, 2].abs() > w_thr)
+        sign_flip = (
+            (current[:, 0] * target[:, 0] < -(v_thr * v_thr))
+            | (current[:, 1] * target[:, 1] < -(v_thr * v_thr))
+            | (current[:, 2] * target[:, 2] < -(w_thr * w_thr))
+        )
+        current_axis = torch.stack(
+            (current[:, 0].abs() / max(v_thr, 1e-6),
+             current[:, 1].abs() / max(v_thr, 1e-6),
+             current[:, 2].abs() / max(w_thr, 1e-6)),
+            dim=-1,
+        )
+        target_axis = torch.stack(
+            (target[:, 0].abs() / max(v_thr, 1e-6),
+             target[:, 1].abs() / max(v_thr, 1e-6),
+             target[:, 2].abs() / max(w_thr, 1e-6)),
+            dim=-1,
+        )
+        current_family = current_axis.argmax(dim=-1)
+        target_family = target_axis.argmax(dim=-1)
+        family_change = cur_move & tgt_move & (current_family != target_family)
+        through_stop = cur_move & (~tgt_move)
+        actual_lin = torch.linalg.norm(self.robot.data.root_lin_vel_b[env_ids, :2], dim=-1)
+        actual_yaw = self.robot.data.root_ang_vel_b[env_ids, 2].abs()
+        contact_min = float(getattr(self.cfg, "cmd_transition_contact_feet", 3.0))
+        contact_count = self._in_contact[env_ids].sum(dim=1) if hasattr(self, "_in_contact") else torch.full_like(cur_lin, 4.0)
+        low_v = float(getattr(self.cfg, "cmd_transition_low_speed_v", 0.12))
+        low_w = float(getattr(self.cfg, "cmd_transition_low_speed_w", 0.16))
+        low_speed_ready = (
+            (cur_lin <= low_v)
+            & (actual_lin <= low_v)
+            & (current[:, 2].abs() <= low_w)
+            & (actual_yaw <= low_w)
+            & (contact_count >= contact_min)
+        )
+        abrupt = (sign_flip | family_change | through_stop) & ~low_speed_ready
+        direct = ~abrupt
+        if bool(direct.any()):
+            ids = env_ids[direct]
+            self._cmd_motion_target[ids] = self._cmd_target[ids]
+            self._cmd_transition_start[ids] = self.commands[ids]
+            self._cmd_transition_goal[ids] = self._cmd_target[ids]
+            self._cmd_transition_timer[ids] = 0
+            self._cmd_transition_total[ids] = 1
+            self._cmd_transition_via_zero[ids] = False
+            self._cmd_transition_zero_frac[ids] = 0.5
+            self._cmd_transition_strength[ids] = 0.0
+        if bool(abrupt.any()):
+            ids = env_ids[abrupt]
+            idx = abrupt
+            max_v = max(
+                float(getattr(self.cfg, "cmd_fwd_max", 1.0)),
+                float(getattr(self.cfg, "cmd_back_max", 0.8)),
+                float(getattr(self.cfg, "cmd_lat_max", 0.5)),
+                low_v,
+            )
+            max_w = max(float(getattr(self.cfg, "cmd_yaw_max", 1.0)), low_w)
+            delta_lin = torch.linalg.norm((target - current)[:, :2], dim=-1) / max(max_v, 1e-6)
+            delta_w = (target[:, 2] - current[:, 2]).abs() / max(max_w, 1e-6)
+            delta_norm = torch.maximum(delta_lin, delta_w)
+            speed_norm = torch.maximum(
+                torch.maximum(cur_lin / max(low_v, 1e-6), actual_lin / max(low_v, 1e-6)),
+                torch.maximum(current[:, 2].abs() / max(low_w, 1e-6), actual_yaw / max(low_w, 1e-6)),
+            )
+            airborne = (contact_count < contact_min).float()
+            severity = torch.clamp(0.35 * delta_norm + 0.35 * speed_norm + 0.20 * airborne + 0.10 * sign_flip.float(), 0.0, 1.0)
+            step_dt = max(float(self.cfg.dt) * float(self.cfg.decimation), 1e-6)
+            fast_s = float(getattr(self.cfg, "cmd_transition_fast_s", 0.16))
+            fast_steps = max(1, int(round(fast_s / step_dt)))
+            base_steps = self._command_transition_steps()
+            max_steps = max(base_steps, int(round(float(getattr(self.cfg, "cmd_transition_max_s", 0.80)) / step_dt)))
+            steps = torch.round(
+                float(fast_steps) + (float(base_steps) - float(fast_steps)) * severity[idx]
+            ).long().clamp(min=fast_steps, max=max_steps)
+            z_min = float(getattr(self.cfg, "cmd_transition_zero_frac_min", 0.48))
+            z_max = float(getattr(self.cfg, "cmd_transition_zero_frac_max", 0.70))
+            stop_z = float(getattr(self.cfg, "cmd_transition_stop_zero_frac", 0.80))
+            zero_frac_all = torch.clamp(z_min + (z_max - z_min) * severity, 0.05, 0.95)
+            zero_frac_all = torch.where(tgt_move, zero_frac_all, torch.full_like(zero_frac_all, stop_z))
+            self._cmd_transition_start[ids] = self.commands[ids]
+            self._cmd_transition_goal[ids] = self._cmd_target[ids]
+            self._cmd_transition_timer[ids] = steps
+            self._cmd_transition_total[ids] = steps
+            self._cmd_transition_via_zero[ids] = True
+            self._cmd_transition_zero_frac[ids] = zero_frac_all[idx]
+            self._cmd_transition_strength[ids] = severity[idx]
+
+    def _update_command_transition(self):
+        active = self._cmd_transition_timer > 0
+        if bool(active.any()):
+            total = self._cmd_transition_total[active].float().clamp(min=1.0)
+            timer = self._cmd_transition_timer[active].float()
+            p = ((total - timer + 1.0) / total).clamp(0.0, 1.0)
+            s = p * p * p * (10.0 + p * (-15.0 + 6.0 * p))
+            start = self._cmd_transition_start[active]
+            goal = self._cmd_transition_goal[active]
+            shaped = start + (goal - start) * s[:, None]
+            via_zero = self._cmd_transition_via_zero[active]
+            if bool(via_zero.any()):
+                s_v = s[via_zero]
+                start_v = start[via_zero]
+                goal_v = goal[via_zero]
+                zfrac = self._cmd_transition_zero_frac[active][via_zero].clamp(0.05, 0.95)
+                first = s_v < zfrac
+                shaped_v = torch.empty_like(start_v)
+                s_first = (s_v / zfrac).clamp(0.0, 1.0)
+                s_second = ((s_v - zfrac) / (1.0 - zfrac).clamp(min=1e-6)).clamp(0.0, 1.0)
+                s_first = s_first * s_first * s_first * (10.0 + s_first * (-15.0 + 6.0 * s_first))
+                s_second = s_second * s_second * s_second * (10.0 + s_second * (-15.0 + 6.0 * s_second))
+                shaped_v[first] = start_v[first] * (1.0 - s_first[first, None])
+                shaped_v[~first] = goal_v[~first] * s_second[~first, None]
+                shaped[via_zero] = shaped_v
+            self._cmd_motion_target[active] = shaped
+            self._cmd_transition_timer[active] -= 1
+            done = active & (self._cmd_transition_timer <= 0)
+            if bool(done.any()):
+                self._cmd_motion_target[done] = self._cmd_transition_goal[done]
+                self._cmd_transition_strength[done] = 0.0
+
+    def _update_heading_error(self):
+        yaw = _yaw_from_quat_w(self.robot.data.root_quat_w)
+        yaw_active = (self.commands[:, 2].abs() > 0.05) | (self._cmd_target[:, 2].abs() > 0.05)
+        self._cmd_heading_ref = torch.where(yaw_active, yaw, self._cmd_heading_ref)
+        self._heading_error = _wrap_pi(yaw - self._cmd_heading_ref)
+
     def _resample_commands(self, env_ids, snap=False):
-        # SINGLE-AXIS commands with explicit task-demand proportions. Writes the raw TARGET; self.commands low-passes
-        # toward it (command buffer). snap=True (on reset) starts the env AT the command (no ramp from a stale value).
+        # 单轴命令采样：按任务比例写入原始目标命令，self.commands 通过命令缓冲低通靠近它。
+        # reset 时 snap=True，直接从新命令开始，避免从旧命令 ramp 过来。
         n = len(env_ids); dev = self.device
         if n == 0:
             return
@@ -365,8 +532,7 @@ class TailiAmpEnv(DirectRLEnv):
                 target[:, 1] = torch.where(lat, lat_sign * _sample_uniform(n, l_lo, l_hi, dev), torch.zeros(n, device=dev))
                 target[:, 2] = torch.where(yaw, yaw_sign * _sample_uniform(n, y_lo, y_hi, dev), torch.zeros(n, device=dev))
             self._cmd_target[env_ids] = target
-            if snap:
-                self.commands[env_ids] = self._cmd_target[env_ids]
+            self._begin_command_transition(env_ids, snap=snap)
             return
         self._cmd_target[env_ids] = 0.0
         active = torch.rand(n, device=dev) >= self.cfg.stand_prob
@@ -382,8 +548,8 @@ class TailiAmpEnv(DirectRLEnv):
         def uniform(lo, hi):
             return torch.empty(n, device=dev).uniform_(lo, hi)
 
-        # Per-direction curriculum ceilings — each direction ramps independently.
-        # Forward: terrain-decoupled (scale down ceiling on hard terrain to avoid double difficulty).
+        # 分方向课程速度上限：每个方向独立调整。
+        # 前进：地形解耦，在高难地形上降低速度上限，避免难度叠加。
         fwd_ceil = self._vel_max_fwd
         _terr_frac = None
         if self.cfg.vel_terrain_decouple and self.cfg.terrain.terrain_type == "generator":
@@ -391,9 +557,7 @@ class TailiAmpEnv(DirectRLEnv):
             _terr_frac = (self._terrain.terrain_levels[env_ids].float() / tmax).clamp(0.0, 1.0)
             fwd_ceil = self.cfg.cmd_fwd_range[0] + (self._vel_max_fwd - self.cfg.cmd_fwd_range[0]) * (1.0 - _terr_frac)
         fwd_cmd = torch.rand(n, device=dev) * (fwd_ceil - self.cfg.cmd_fwd_range[0]) + self.cfg.cmd_fwd_range[0]
-        # Back: curriculum ceiling ramps independently — but TERRAIN-decoupled like forward (0706
-        # D3p): backward was commanded at its FULL ceiling down stairs, and eccentric braking on the
-        # 110 N·m thigh hit the torque clamp (terrain diag: torque_clamp_bout, backward@stairs).
+        # 后退：与前进一样地形解耦，避免下台阶后退时速度过高导致力矩饱和。
         back_hi  = max(self.cfg.cmd_back_range[0], min(self._vel_max_back, self.cfg.cmd_back_max))
         if _terr_frac is not None:
             back_hi = self.cfg.cmd_back_range[0] + (back_hi - self.cfg.cmd_back_range[0]) * (1.0 - _terr_frac)
@@ -401,44 +565,41 @@ class TailiAmpEnv(DirectRLEnv):
         self._cmd_target[env_ids, 0] = torch.where(
             fwd, fwd_cmd,
             torch.where(back, -back_cmd, torch.zeros(n, device=dev)))
-        # Lateral: curriculum ceiling
+        # 横移速度课程上限。
         lat_hi  = max(self.cfg.cmd_lat_range[0], min(self._vel_max_lat, self.cfg.cmd_lat_max))
         lat_cmd = torch.rand(n, device=dev) * (lat_hi - self.cfg.cmd_lat_range[0]) + self.cfg.cmd_lat_range[0]
         self._cmd_target[env_ids, 1] = torch.where(
             lat, lat_cmd * torch.where(torch.rand(n, device=dev) < 0.5, 1.0, -1.0), torch.zeros(n, device=dev))
-        # Yaw: curriculum ceiling
+        # yaw 速度课程上限。
         yaw_hi  = max(self.cfg.cmd_yaw_range[0], min(self._vel_max_yaw, self.cfg.cmd_yaw_max))
         yaw_cmd = torch.rand(n, device=dev) * (yaw_hi - self.cfg.cmd_yaw_range[0]) + self.cfg.cmd_yaw_range[0]
         self._cmd_target[env_ids, 2] = torch.where(
             yaw, yaw_cmd * torch.where(torch.rand(n, device=dev) < 0.5, 1.0, -1.0), torch.zeros(n, device=dev))
-        if snap:                              # reset: snap commands to target (no ramp from a stale prior value)
-            self.commands[env_ids] = self._cmd_target[env_ids]
+        self._begin_command_transition(env_ids, snap=snap)
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions.clone()
-        # COMMAND BUFFER (low-pass): self.commands smoothly ramps toward the raw target _cmd_target instead of
-        # stepping instantly -> NATURAL decel on stop (spec-5 "crisp but natural": no hard brake) + smooth accel/turn.
-        # Steady-state commands==target so velocity-tracking accuracy (A1) is unchanged; only transients are smoothed.
-        # Part of the command INTERFACE -> runs in both training and deploy (external mode sets _cmd_target).
-        self.commands += (1.0 - self.cfg.cmd_smooth_alpha) * (self._cmd_target - self.commands)
-        # advance the gait clock ONCE per env step, ONLY when commanded to move (frozen at zero command ->
-        # no rhythm -> policy stands still). SPEED-ADAPTIVE: period shortens with the commanded planar speed
-        # (step frequency rises with command), so the contact clock matches the high-speed reference clips.
+        # 命令缓冲：self.commands 平滑靠近 _cmd_target，而不是瞬间跳变。
+        # 这会让停步、反向和转向有自然过渡；稳态仍等于目标命令，不改变速度跟踪语义。
+        # 这是命令接口的一部分，训练和部署都会执行。
+        target_changed = (self._cmd_target - self._cmd_transition_goal).abs().amax(dim=1) > 1e-6
+        if bool(target_changed.any()):
+            self._begin_command_transition(target_changed.nonzero(as_tuple=False).flatten(), snap=False)
+        self._update_command_transition()
+        self.commands += (1.0 - self.cfg.cmd_smooth_alpha) * (self._cmd_motion_target - self.commands)
+        self._update_heading_error()
+        # 每个 env step 推进一次步态时钟；零命令时冻结，使策略自然站立。
+        # 周期随命令速度缩短，命令越快步频越高。
         step_dt = self.cfg.dt * self.cfg.decimation
         spd = torch.norm(self.commands[:, :2], dim=1)
-        moving = (spd > 0.1) | (self.commands[:, 2].abs() > 0.05)   # yaw thr 0.1->0.05, match yaw_cmd_gate (0704)
-        # YAW-INCLUSIVE OBSERVED CADENCE (0707 arch-fix #1): the actor's OBSERVED sin/cos gait clock was the LAST
-        # component still ticking at PLANAR-only cadence, while the air-time reward (blind_tp_env.py:702) and the
-        # AMP reference (taili_amp_reference.py period_speed) already use spd + 0.15*|wz|. During turns the clock
-        # fed the actor a SLOW phase while it was rewarded + style-matched to a FASTER turn cadence — an
-        # observation/reward inconsistency on exactly the failing A2-yaw gate. Match them (0.15 = validated; 0.30
-        # broke F2). Keep the `moving` mask on planar spd.
+        moving = (spd > 0.1) | (self.commands[:, 2].abs() > 0.05)   # 与奖励侧 yaw_cmd_gate 对齐。
+        # yaw 感知 cadence：观测中的 gait clock、滞空奖励和 AMP 参考都使用同一速度语义。
+        # 转向时把 0.15*|wz| 加入 period_speed，使高 yaw 命令获得更快步频。
         period_speed = spd + 0.15 * self.commands[:, 2].abs()
         period = torch.clamp(self.cfg.gait_period - self.cfg.gait_period_slope * period_speed,
                              min=self.cfg.gait_period_min, max=self.cfg.gait_period)
         self._gait_phase = (self._gait_phase + (step_dt / period) * moving.float()) % 1.0
-        # DOMAIN RANDOMIZATION — random base PUSHES (disturbance-rejection robustness for sim2real). Every
-        # push_steps, kick due envs with a random horizontal base velocity.
+        # 域随机化：周期性给 base 随机推力速度，训练扰动恢复能力。
         if self.cfg.dr_enable:
             due = (self.episode_length_buf % self._push_steps == 0) & (self.episode_length_buf > 0)
             if bool(due.any()):
@@ -447,28 +608,29 @@ class TailiAmpEnv(DirectRLEnv):
                 if push_vel <= 0.0:
                     return
                 vel = torch.cat([self.robot.data.root_lin_vel_w[ids],
-                                 self.robot.data.root_ang_vel_w[ids]], dim=-1).clone()  # (M, 6) world lin+ang
-                vel[:, 0:2] += (torch.rand((len(ids), 2), device=self.device) * 2 - 1) * push_vel   # linear shove
-                # YAW angular kick (rad/s) too, so the policy also recovers from ROTATIONAL disturbances, not just
-                # translational pushes. Scaled by dr_push_ang_scale x push_vel.
+                                 self.robot.data.root_ang_vel_w[ids]], dim=-1).clone()  # (M, 6)，世界系线速度+角速度。
+                vel[:, 0:2] += (torch.rand((len(ids), 2), device=self.device) * 2 - 1) * push_vel   # 线速度推扰。
+                # 同时加入 yaw 角速度扰动，使策略学习旋转扰动恢复。
                 vel[:, 5] += (torch.rand(len(ids), device=self.device) * 2 - 1) * push_vel * self.cfg.dr_push_ang_scale
                 self.robot.write_root_com_velocity_to_sim(vel, ids)
 
     def _leg_phases(self):
-        # per-leg phase in [0,1): global phase + diagonal trot offsets -> (N, 4) for FL,FR,RL,RR.
+        # 每条腿的 [0,1) 相位：全局相位 + 对角小跑偏置。
         return (self._gait_phase[:, None] + self._trot_offsets[None, :]) % 1.0
 
     def _ensure_gate_mask(self):
-        """Build (once) the CURRICULUM-GATE env mask = envs NOT on the hard sub-terrain types (slope_inv, boxes).
-        Those types stay stuck at low terrain levels (blind discrete-obstacle / pit-spawn limits), so including
-        their low prog / higher falls in the metrics that gate DR / velocity / phase / regression DRAGS the whole
-        curriculum for the 75% of envs that are fine. Gate on the mastered-terrain envs instead. terrain_types is
-        fixed per env, so this mask is constant -> build once."""
+        """构建课程门控 env mask。
+
+        hard 子地形会长期停在低等级；如果直接纳入阶段/速度/DR 门控，会拖慢已经稳定的 env。
+        terrain_types 对每个 env 固定，因此该 mask 只需构建一次。
+        """
         if getattr(self, "_gate_mask", None) is not None:
             return
         if not (hasattr(self, "_terrain") and hasattr(self._terrain, "terrain_types")):
             self._gate_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
             self._discrete_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self._flat_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self._real_terrain_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
             return
         sg = self.cfg.terrain.terrain_generator
         props = np.array([s.proportion for s in sg.sub_terrains.values()], dtype=np.float64)
@@ -478,22 +640,59 @@ class TailiAmpEnv(DirectRLEnv):
         self._type_names = list(sg.sub_terrains.keys())
         et = self._col_type[self._terrain.terrain_types]
         hard = torch.zeros_like(et, dtype=torch.bool)
-        for nm in ("slope_inv", "boxes", "stairs_up"):   # stairs_up = pit-spawn ascend, hard like slope_inv
+        for nm in ("slope_inv", "boxes", "stairs_up"):   # stairs_up 是坑内上楼梯，按 hard 类型处理。
             if nm in self._type_names:
                 hard |= (et == self._type_names.index(nm))
         self._gate_mask = ~hard
-        # (B) DISCRETE-OBSTACLE mask (stairs/boxes): these need a high foot lift the roughness-gated clearance
-        # under-provisions when stuck at low level. Used to FORCE the clearance demand there (break the catch-22).
+        # 离散障碍 mask：楼梯/boxes 可能需要比粗糙度门控更高的抬脚目标。
         self._discrete_terrain_mask = torch.zeros_like(et, dtype=torch.bool)
         for nm in ("stairs", "boxes", "stairs_up"):
             if nm in self._type_names:
                 self._discrete_terrain_mask |= (et == self._type_names.index(nm))
+        self._flat_terrain_mask = torch.zeros_like(et, dtype=torch.bool)
+        if "flat" in self._type_names:
+            self._flat_terrain_mask = et == self._type_names.index("flat")
+        self._real_terrain_mask = ~self._flat_terrain_mask
         print(f"[GATE] curriculum gates exclude hard terrain types {[n for n in ('slope_inv','boxes','stairs_up') if n in self._type_names]}"
               f" -> {int(self._gate_mask.sum())}/{self.num_envs} envs gate the curriculum"
-              f" | discrete(stairs/boxes/stairs_up) types present: {[n for n in ('stairs','boxes','stairs_up') if n in self._type_names]}", flush=True)
+              f" | real_nonflat={int(self._real_terrain_mask.sum())}/{self.num_envs}"
+              f" | discrete(stairs/boxes/stairs_up)={int(self._discrete_terrain_mask.sum())}/{self.num_envs}", flush=True)
+
+    def _terrain_level_stats(self) -> dict[str, float | int]:
+        stats: dict[str, float | int] = {
+            "terrain_mean": 0.0,
+            "terrain_max": 0,
+            "terrain_flat_mean": 0.0,
+            "terrain_flat_max": 0,
+            "terrain_real_mean": 0.0,
+            "terrain_real_max": 0,
+            "terrain_discrete_mean": 0.0,
+            "terrain_discrete_max": 0,
+            "terrain_real_frac": 0.0,
+            "terrain_discrete_frac": 0.0,
+        }
+        levels = getattr(getattr(self, "_terrain", None), "terrain_levels", None)
+        if levels is None:
+            return stats
+        lv = levels.float()
+        stats["terrain_mean"] = float(lv.mean())
+        stats["terrain_max"] = int(lv.max().item())
+        self._ensure_gate_mask()
+
+        def _fill(prefix: str, mask: torch.Tensor):
+            if bool(mask.any()):
+                vals = lv[mask]
+                stats[f"{prefix}_mean"] = float(vals.mean())
+                stats[f"{prefix}_max"] = int(vals.max().item())
+                stats[f"{prefix}_frac"] = float(mask.float().mean())
+
+        _fill("terrain_flat", getattr(self, "_flat_terrain_mask", torch.zeros_like(lv, dtype=torch.bool)))
+        _fill("terrain_real", getattr(self, "_real_terrain_mask", torch.ones_like(lv, dtype=torch.bool)))
+        _fill("terrain_discrete", getattr(self, "_discrete_terrain_mask", torch.zeros_like(lv, dtype=torch.bool)))
+        return stats
 
     def _apply_action(self):
-        # CONTROL DELAY: apply the action from the PREVIOUS step (simulates ~20ms compute+comm latency).
+        # 控制延迟：执行上一控制步动作，模拟约 20ms 计算和通信延迟。
         self.robot.set_joint_position_target(self.action_offset + self.action_scale * self._delayed_action)
         self._delayed_action = self.actions.clone()
 
@@ -505,12 +704,9 @@ class TailiAmpEnv(DirectRLEnv):
     def _compute_terrain_ctx(self):
         if self.cfg.terrain_ctx_dim == 0:
             return torch.zeros(self.num_envs, 0, device=self.device)
-        # terrain_ctx_dim == 3: [fore_slope, lat_slope, roughness]
-        # roughness = std of base-relative ground height over the scan grid
-        # TRUE terrain slope (fore, lat) in the HEADING frame. The scanner is attach_yaw_only (horizontal,
-        # yaw-aligned) so it measures terrain independent of body pitch/roll -> transform hits by YAW ONLY
-        # (using full quat would cancel the slope when the body aligns to it). Grid symmetric -> decoupled
-        # least-squares slope = Sum(fx*dz)/Sum(fx^2), Sum(fy*dz)/Sum(fy^2).
+        # terrain_ctx_dim == 3：[前后坡度, 横向坡度, 粗糙度]。
+        # 坡度在 heading 坐标系下计算；扫描器只跟 yaw 对齐，因此只用 yaw 变换扫描点。
+        # 粗糙度是扫描网格上相对 base 地面高度的标准差。
         hits = self._height_scanner.data.ray_hits_w                       # (N, P, 3)
         base = self.robot.data.root_pos_w                                 # (N, 3)
         q = self.robot.data.root_quat_w                                   # (N, 4) wxyz
@@ -524,7 +720,7 @@ class TailiAmpEnv(DirectRLEnv):
         dz = torch.nan_to_num(hits[..., 2] - base[:, 2:3], nan=0.0, posinf=0.0, neginf=0.0)
         fore = (fx * dz).sum(-1) / (fx * fx).sum(-1).clamp(min=1e-6)
         lat  = (fy * dz).sum(-1) / (fy * fy).sum(-1).clamp(min=1e-6)
-        # Roughness: std of base-relative terrain height (3rd dim of terrain_ctx)
+        # 粗糙度：base 相对地形高度标准差，对应 terrain_ctx 第三维。
         rough = dz.std(dim=-1).clamp(0.0, 0.3)
         ctx = torch.stack([fore.clamp(-0.6, 0.6), lat.clamp(-0.6, 0.6), rough], dim=-1)
         return torch.nan_to_num(ctx, nan=0.0, posinf=0.0, neginf=0.0)
@@ -537,11 +733,8 @@ class TailiAmpEnv(DirectRLEnv):
         rel_b = self._feet_rel_base(self.robot.data.body_pos_w[:, self.foot_indexes],
                                     self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.n_feet)
         self._terrain_ctx = self._compute_terrain_ctx()
-        # AMP = STYLE ONLY: pure kinematic style (jp,jv,bh,tn,foot_rel) conditioned ONLY on terrain_ctx, so the
-        # discriminator learns "style | terrain" (high lift on rough/stairs, tilted posture on slope). Velocity
-        # and command are DELIBERATELY EXCLUDED — speed/command tracking is owned by the two-sided tracking reward,
-        # not the discriminator. (The old achieved-velocity channel demanded no-slip command speed → penalized real
-        # slip as "off-style" and was too weak to brake overspeed; physeval-confirmed it didn't work.)
+        # AMP 只表达风格：纯运动学状态 + terrain_ctx。
+        # 速度和命令不进入判别器；速度/命令跟踪由双侧 tracking 奖励负责。
         return torch.cat([jp, jv, bh, tn, rel_b, self._terrain_ctx], dim=-1)
 
     def _get_observations(self) -> dict:
@@ -552,16 +745,16 @@ class TailiAmpEnv(DirectRLEnv):
         lp = self._leg_phases()                                       # (N, 4) per-leg phase
         gait_obs = torch.cat([torch.sin(2 * math.pi * lp), torch.cos(2 * math.pi * lp)], dim=-1)  # (N, 8)
         N, dev = self.num_envs, self.device
-        # OBSERVATION NOISE — added before scaling so magnitudes match real sensor specs.
+        # 观测噪声：缩放前加入，使量级接近真实传感器规格。
         jpos_n  = self.robot.data.joint_pos  + torch.randn(N, 12, device=dev) * self.cfg.obs_noise_jpos
         jvel_n  = self.robot.data.joint_vel  + torch.randn(N, 12, device=dev) * self.cfg.obs_noise_jvel
         angv_n  = self.robot.data.root_ang_vel_b  + torch.randn(N, 3, device=dev) * self.cfg.obs_noise_angvel
         grav_n  = self.robot.data.projected_gravity_b + torch.randn(N, 3, device=dev) * self.cfg.obs_noise_gravity
-        # IMU BIAS (level-3 DR): add the per-episode constant offset (zero below level 3)
+        # IMU 偏置：每个 episode 固定偏移，低 DR 等级下为 0。
         angv_n  = angv_n + self._imu_bias[:, 0:3]
         grav_n  = grav_n + self._imu_bias[:, 3:6]
-        # PROPRIOCEPTIVE HISTORY update (FIFO): push current frame to front, drop oldest.
-        # History dim = 42: jpos-default(12)+jvel(12)+angvel(3)+gravity(3)+lastact(12) — all motor+IMU.
+        # 本体历史 FIFO：当前帧入队，最旧帧出队。
+        # 单帧 42 维：jpos-default(12)+jvel(12)+angvel(3)+gravity(3)+lastact(12)。
         prop_now = torch.cat([
             jpos_n - self.action_offset,   # 12
             jvel_n * 0.05,                 # 12
@@ -570,11 +763,11 @@ class TailiAmpEnv(DirectRLEnv):
             self.last_actions,             # 12
         ], dim=-1)                         # (N, 42)
         self._obs_history = torch.cat([prop_now.unsqueeze(1), self._obs_history[:, :-1]], dim=1)  # FIFO
-        # FOOT CONTACT (cached here for use in _get_rewards without double query)
+        # 足端接触缓存，供 _get_rewards 复用，避免重复查询。
         forces_now = self._contact_sensor.data.net_forces_w[:, self._feet_contact_ids, :].norm(dim=-1)
         self._in_contact = (forces_now > 1.0).float()   # (N, 4)
 
-        # BLIND OBS (473 dims) — what the actor policy actually uses (motor+IMU+history only):
+        # 盲策略观测 473 维：actor 实际使用的信息，只包含电机、IMU、命令和本体历史。
         #   ang_vel(3)+gravity(3)+cmd(3)+jpos(12)+jvel(12)+lastact(12)+gait(8)+history(42×H)
         blind_parts = [
             angv_n * 0.25,
@@ -588,7 +781,7 @@ class TailiAmpEnv(DirectRLEnv):
         ]
         blind_obs = torch.cat(blind_parts, dim=-1)   # (N, 473)
 
-        # PRIVILEGED EXTRAS (197 dims) — only for critic/AMP; actor NEVER sees these.
+        # 特权补充 197 维：只供 critic/AMP 使用，actor 不直接读取。
         #   lin_vel(3) + height_scan(187) + terrain_ctx(3) + foot_contact(4)
         hits = self._height_scanner.data.ray_hits_w                          # (N, P, 3)
         hscan = (self.robot.data.root_pos_w[:, 2:3] - hits[:, :, 2]
@@ -603,11 +796,10 @@ class TailiAmpEnv(DirectRLEnv):
             self._in_contact,                         # 4
         ], dim=-1)                                    # (N, 670)
 
-        # Full observation = privileged (670 dims). BlindGaussianPolicy slices [:, :473] internally.
+        # 完整 observation 为 670 维；BlindGaussianPolicy 内部切片 [:, :473] 给 actor。
         obs = priv_obs
-        # NaN/Inf DIAGNOSTIC + GUARD: a physics blowup can make obs non-finite; log it once (to find the
-        # culprit) then sanitize so it never reaches the network or the rollout buffer (prevents the silent
-        # update-time CUDA deadlock). The blown-up env is reset by the non-finite check in _get_dones.
+        # NaN/Inf 保护：物理爆炸可能产生非有限观测，先记录再清理，避免写入网络和 rollout。
+        # 对应 env 会在 _get_dones 的非有限检查中 reset。
         finite = torch.isfinite(obs).all(dim=1)
         if not bool(finite.all()):
             bad = (~finite).nonzero(as_tuple=False).flatten()
@@ -629,8 +821,7 @@ class TailiAmpEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _log_training_diag(self):
-        # periodic stdout reference metrics (goes to the train log via tee) so progress is visible:
-        # how well velocity is tracked, mean speed reached, per-direction command coverage, uprightness.
+        # 周期性 stdout 训练指标：速度跟踪、平均速度、方向覆盖和直立情况。
         with torch.no_grad():
             vb = self.robot.data.root_lin_vel_b
             wb = self.robot.data.root_ang_vel_b
@@ -642,34 +833,30 @@ class TailiAmpEnv(DirectRLEnv):
             self._ensure_gate_mask()
             upright = (self.robot.data.projected_gravity_b[self._gate_mask, 2] < -0.7).float().mean().item()
             moving = (cmd_mag > 0.05)
-            # rough per-direction fractions of the commanded population
+            # 命令样本中各方向的粗略占比。
             fwd = (cmd[:, 0] > 0.2).float().mean().item()
             bwd = (cmd[:, 0] < -0.2).float().mean().item()
             lat = (cmd[:, 1].abs() > 0.15).float().mean().item()
             yaw = (cmd[:, 2].abs() > 0.2).float().mean().item()
-        # plane/flat TerrainImporter (diagnostics) has no curriculum levels — guard, don't crash env.step
-        _tl = getattr(getattr(self, "_terrain", None), "terrain_levels", None)
-        tlvl = float(_tl.float().mean()) if _tl is not None else 0.0
+        # 平面/诊断 TerrainImporter 可能没有课程等级；这里做保护，避免 env.step 崩溃。
+        terrain_stats = self._terrain_level_stats()
+        tlvl = float(terrain_stats["terrain_mean"])
+        real_tlvl = float(terrain_stats["terrain_real_mean"])
+        disc_tlvl = float(terrain_stats["terrain_discrete_mean"])
         tctx = self._terrain_ctx.abs().mean(0) if self.cfg.terrain_ctx_dim > 0 else None
         with torch.no_grad():
-            # last_air_time = per-foot COMPLETED stride air duration (held between touchdowns), the
-            # same unit as air_time_target and phase_gate_air_* (~0.27 s for a clean trot). The
-            # instantaneous current_air_time mean reads ~T_air/2 × swing-fraction (~0.07 for a
-            # perfect trot) and would make the air gate unreachable.
+            # last_air_time 是每只脚已完成摆动相的滞空时长，单位与 air_time_target 一致。
+            # current_air_time 是瞬时值，不能用于阶段门控。
             air = float(self._contact_sensor.data.last_air_time[:, self._feet_contact_ids].mean())
             act_std = float(self.actions.std()) if hasattr(self, "actions") else 0.0
             act_mag = float(self.actions.abs().mean()) if hasattr(self, "actions") else 0.0
         lp, ap, rl, ra, rair, gm = self._dbg
 
         self._ensure_gate_mask()
-        # FALL = body LOW **and** TILTED. The old `root_pos_w[z] < termination_height` used ABSOLUTE world height,
-        # so an UPRIGHT robot standing on low terrain (descended a slope/stair — abs z < 0.35 while perfectly fine)
-        # was counted as "fallen". At phi0 that pinned fall_rate at ~0.10 (10% of gate-mask envs upright-but-low)
-        # while upright≈0.995 — a contradiction that structurally BLOCKED the phi0→phi1 gate (needs fall_rate<0.05),
-        # regardless of policy/imitation. A real fall is low AND not-upright; gate the height check by tilt so
-        # upright-on-low-terrain no longer masquerades as a fall (0707).
+        # 跌倒 = 低高度且大倾斜。只按绝对 z 会把下坡/下台阶后的直立机器人误判为跌倒。
+        # 因此 fall_rate 同时检查低高度和非直立。
         _below = self.robot.data.root_pos_w[self._gate_mask, 2] < self.cfg.termination_height
-        _tilted = self.robot.data.projected_gravity_b[self._gate_mask, 2] >= -0.7   # NOT upright
+        _tilted = self.robot.data.projected_gravity_b[self._gate_mask, 2] >= -0.7   # 非直立。
         fall_rate = float((_below & _tilted).float().mean())
         progress_by_dir = {
             "fwd": self._fwd_prog,
@@ -682,18 +869,12 @@ class TailiAmpEnv(DirectRLEnv):
         diag_contact = float(getattr(self, "_diag_contact", 0.0))
         duty_balance = float(getattr(self, "_duty_balance", 0.0))
         C = self.cfg
-        # IMITATION FIDELITY (style_err) — the phi1->phi2 gate metric (mean joint error vs reference). Now computed
-        # in _get_rewards (the r_imitate reward shares the same flat_reference call) and stored on self._style_err,
-        # so it's just read here (no duplicate flat_reference IK).
+        # 模仿精度 style_err：阶段门控使用的相对参考关节误差。
+        # 该值由 _get_rewards 计算并缓存，这里只读取，避免重复 IK。
         self._style_err = getattr(self, "_style_err", 1.0)
 
-        # ── UNIFIED TRAINING PHASE (v3: 0 flat all-dirs -> 1 flat mixed -> 2 +terrain/DR -> 3 envelope) ──
-        # Penalty ramp (budget-controlled) runs from STEP 0: there is no unpenalized bootstrap
-        # phase anymore — the budget controller IS the adaptive bootstrap (a weak early policy has
-        # a high penalty/positive ratio, so the gate self-holds near 0 and rises as the policy can
-        # afford quality). Invariant 4a: |regular penalties| <= penalty_budget_ratio_max × positive
-        # task reward (tier-S excluded); above it the gate steps DOWN, so the ramp can never make
-        # "not walking" the more profitable policy (the v1-v4 stand-still trap).
+        # 统一训练阶段：0 平地全方向，1 平地 mixed，2 地形/DR，3 扩展部署包络。
+        # penalty ramp 从训练开始由预算控制。预算过高时 gate 降低，避免质量惩罚压过任务奖励。
         ramp_step = 1.0 / C.penalty_ramp_intervals
         budget_ratio = float(getattr(self, "_budget_ratio_ema", 0.0))
         budget_max = float(getattr(C, "penalty_budget_ratio_max", 0.8))
@@ -701,23 +882,20 @@ class TailiAmpEnv(DirectRLEnv):
             self._penalty_gate = max(0.0, self._penalty_gate - ramp_step)
         else:
             self._penalty_gate = min(1.0, self._penalty_gate + ramp_step)
-        # phi2 terrain clearance ramp: -1.5->-8 / base 0.07->0.09 so a WALKER lifts feet high enough to break the
-        # terrain~5 ceiling (light clearance -> drag-shuffle stalls the terrain curriculum).
+        # 地形阶段的 clearance 渐入：让已有行走策略逐步提高抬脚要求，避免拖脚卡住地形课程。
         terrain_phase = self._phase >= getattr(self, "_terrain_start_phase", 5)
         if terrain_phase:
             self._clearance_gate = min(1.0, self._clearance_gate + 1.0 / C.clearance_ramp_intervals)
         terrain_slip_thr = float(getattr(C, "terrain_gate_slip_high", 0.22))
         terrain_health_ok = getattr(self, "_slip_high_fraction", 0.0) <= terrain_slip_thr
         self._terrain_health_ok = terrain_health_ok
-        # Regression guard (phase 2): pause terrain/speed advance on capability regress.
-        # Terrain advance keeps low persistent slip as the shared contact constraint, but
-        # does not force the flat diagonal/duty template onto high stairs or boxes.
+        # 回退保护：能力退化时暂停地形/速度推进。
+        # 地形推进保留低持续滑移约束，但不把平地对角/duty 模板强加到高楼梯或 boxes。
         self._advance_ok = not (fall_rate > C.regress_fall or min_prog < C.regress_prog) and (
             not terrain_phase or terrain_health_ok
         )
-        # Phase advance gate (sustained over phase_intervals). Thresholds are per-phase with
-        # walk-down (phase_gate_<name>_<p> for the highest p <= current phase): early flat phases
-        # can use reachable quality bars while later phases re-tighten toward the spec bars.
+        # 阶段推进门控：需要连续 phase_intervals 个日志间隔满足。
+        # 阈值按阶段查找，早期使用可达质量条，后期再收紧。
         def _phase_thr(name: str, default: float) -> float:
             for p in range(int(self._phase), -1, -1):
                 v = getattr(C, f"phase_gate_{name}_{p}", None)
@@ -730,8 +908,7 @@ class TailiAmpEnv(DirectRLEnv):
         diag_thr = _phase_thr("diag", 0.80)
         duty_thr = _phase_thr("duty", 0.80)
         air_thr = _phase_thr("air", 0.0)
-        # v3: quality gates apply from phase 0 (the _0 keys are the reachable flat bars) —
-        # there is no quality-exempt bootstrap phase anymore.
+        # 质量门控从 phase 0 就生效；_0 阈值是早期可达的平地条。
         flat_quality_ok = (
             self._slip_ema <= slip_thr and diag_contact >= diag_thr and duty_balance >= duty_thr and air >= air_thr
         )
@@ -740,31 +917,28 @@ class TailiAmpEnv(DirectRLEnv):
         phase_spec = phase_command_spec(C, self._phase) if phase_command_spec is not None else {}
         command_mode = str(phase_spec.get("command_mode", ""))
         is_mixed_phase = command_mode == "mixed"
+        terrain_gate_level = real_tlvl if float(terrain_stats.get("terrain_real_frac", 0.0)) > 0.0 else tlvl
+        discrete_gate_thr = float(getattr(C, "phase_gate_discrete_terrain_2", 0.0))
+        discrete_gate_ok = discrete_gate_thr <= 0.0 or disc_tlvl >= discrete_gate_thr
         if terrain_phase:
             gate = (
                 self._penalty_gate >= 1.0
                 and min_prog >= prog_thr
                 and quality_ok
-                and (not is_mixed_phase or (tlvl >= C.phase_gate_terrain_2 and fall_rate < C.phase_gate_fall_2))
+                and (
+                    not is_mixed_phase
+                    or (
+                        terrain_gate_level >= C.phase_gate_terrain_2
+                        and discrete_gate_ok
+                        and fall_rate < C.phase_gate_fall_2
+                    )
+                )
             )
         else:
-            # Flat phases (phi0 command-conditioning + phi1 mixed): tracking in all directions +
-            # gait quality bars + penalty ramp full. Quality gates apply from phi0 (the _0 keys are
-            # the reachable flat bars). The phi0 blocker was never quality — it was YAW progress
-            # stuck in a reward dead zone (fixed via sigma_yaw / yaw_far), not the quality bars.
+            # 平地阶段：要求全方向跟踪、步态质量和 penalty ramp 完整。
             gate = self._penalty_gate >= 1.0 and min_prog >= prog_thr and quality_ok
-        # DEADLOCK SAFEGUARD (0707): yaw progress is the historical phi0 blocker (anti-symmetric, hard to
-        # explore — it plateaued ~0.50 vs prog_thr 0.65). Since progress_gate = MIN over active dirs, a yaw that
-        # can't clear prog_thr makes `gate` permanently False → the phase NEVER advances → a from-scratch run
-        # burns GPU forever. Cap time-in-phase: after phase_max_steps in one phase without advancing, FORCE the
-        # advance with a loud warning. Safe because yaw is active in ALL phases, so forcing phi0->phi1 keeps
-        # training yaw (+ adds mixed commands) rather than abandoning it — it only stops the hardest single
-        # direction from hard-blocking the whole curriculum. Set TAILI_NO_PHASE_TIMEOUT=1 to disable.
-        # Timeout CLOCK starts only AFTER the penalty ramp completes (penalty_gate first hits 1.0 in this
-        # phase). The `gate` requires penalty_gate>=1.0, which on a from-scratch phi0 can't happen until the
-        # ramp finishes (~step 12500). A raw step-in-phase budget of 12000 therefore fired BEFORE the earliest
-        # possible natural advance and force-marched every phi0. Measuring from ramp-completion makes the
-        # safeguard fire on a genuine POST-ramp stall, not the ramp itself. Clock resets on phase advance.
+        # 死锁保护：某一阶段超过 phase_max_steps 仍无法自然推进时，强制进入下一阶段并打印告警。
+        # 计时从 penalty_gate 达到 1.0 后开始，避免把正常 ramp 过程误判为死锁。
         _step_now = int(getattr(self, "_log_step", 0))
         if self._penalty_gate >= 1.0 and getattr(self, "_phase_penalty_full_step", None) is None:
             self._phase_penalty_full_step = _step_now
@@ -780,18 +954,17 @@ class TailiAmpEnv(DirectRLEnv):
             if self._phase_count >= C.phase_intervals or _timed_out:
                 _forced = _timed_out and self._phase_count < C.phase_intervals
                 self._phase += 1; self._phase_count = 0
-                self._phase_penalty_full_step = None   # restart the clock for the new phase
+                self._phase_penalty_full_step = None   # 新阶段重新计时。
                 _tag = " FORCED(deadlock-safeguard: min_prog<prog_thr for phase_max_steps post-ramp)" if _forced else ""
                 print(f"[PHASE] -> {self._phase} at step {self._log_step}{_tag} "
                       f"(prog={min_prog:.2f} gait={gm:.2f} slip={self._slip_ema:.2f} terrain={tlvl:.2f})", flush=True)
-        # SYMMETRY is a refinement (like the penalties): off during phase-0 bootstrap, on from phase 1.
+        # 对称增强属于细化项：phase 0 关闭，phase 1 起打开。
         if getattr(self.cfg, "sym_augment", False):
             from . import symmetry
             symmetry.set_active(self._phase >= 1)
 
-        # VELOCITY curriculum runs from phase 0. Command maxima are still bounded by the
-        # active phase ranges, so this only raises the per-direction ceiling when the
-        # policy already tracks the current envelope.
+        # 速度课程从 phase 0 开始；命令上限仍受当前阶段范围限制。
+        # 只有当前包络跟踪成功时才提高分方向速度上限。
         step = C.vel_cur_step
         if self._vel_curriculum_enable and self._advance_ok:
             if self._fwd_prog  >= C.vel_cur_up:  self._vel_max_fwd  = min(self._vel_max_fwd  + step, C.cmd_fwd_max)
@@ -800,27 +973,18 @@ class TailiAmpEnv(DirectRLEnv):
             elif self._back_prog <= C.vel_cur_down: self._vel_max_back = max(self._vel_max_back - step, self._vel_floor_back)
             if self._lat_prog  >= C.vel_cur_up:  self._vel_max_lat  = min(self._vel_max_lat  + step, C.cmd_lat_max)
             elif self._lat_prog <= C.vel_cur_down: self._vel_max_lat = max(self._vel_max_lat - step, self._vel_floor_lat)
-            # YAW uses a REACHABLE grow threshold (yaw_vel_cur_up, default 0.40) — the shared vel_cur_up=0.85
-            # is never reached by yaw (plateaus ~0.50), so the ceiling could only shrink, never grow. A 0.40
-            # bar lets moderate yaw competence EXPAND the practiced range toward cmd_yaw_max (0.9→1.5).
+            # yaw 使用专用增长阈值，避免共享 vel_cur_up 对 yaw 过高导致只能缩小不能扩大。
             _yaw_up = float(getattr(C, "yaw_vel_cur_up", 0.40))
             if self._yaw_prog  >= _yaw_up:  self._vel_max_yaw  = min(self._vel_max_yaw  + step, C.cmd_yaw_max)
             elif self._yaw_prog <= C.vel_cur_down: self._vel_max_yaw = max(self._vel_max_yaw - step, self._vel_floor_yaw)
 
-        # DR curriculum: runs in phase >= 2, IN PARALLEL with the terrain curriculum (DECOUPLED from terrain level).
-        # Rationale: DR (sim2real dynamics robustness: mass->10kg, friction, CoM, IMU bias) and terrain (external
-        # difficulty) are INDEPENDENT axes — a policy can be robust to mass/friction on flat ground. The old design
-        # gated DR behind phase 3 (= terrain>=6), making DR a HOSTAGE of the terrain milestone: if terrain plateaus
-        # below 6 (observed: stuck ~4.8), DR would NEVER activate — yet for a BLIND real 39kg robot, DR matters MORE
-        # than terrain level 6. DR still self-gates on TERRAIN-INDEPENDENT capability (prog/upright/fall, NOT
-        # gait_match which is suppressed on rough terrain), so it only steps up when the policy is stable; terrain
-        # and DR each advance on their own merits, neither blocking the other.
-        # DR-DEFER: don't START stacking DR until the policy has some terrain footing (tlvl >= dr_unlock_terrain).
-        # Reduces the phi2 load (terrain + DR + clearance at once); DR (sim2real robustness) is the LAST axis to add.
+        # DR 课程：与地形课程并行，但不被地形等级硬绑定。
+        # DR 按进展、直立和跌倒率自门控；地形和 DR 各自推进，互不作为唯一前置条件。
+        # dr_unlock_terrain 可推迟 DR，让策略先获得一定地形立足能力。
         if (
             self._phase >= getattr(self, "_dr_start_phase", self._terrain_start_phase)
             and self._dr_level < 3
-            and tlvl >= getattr(C, "dr_unlock_terrain", 0.0)
+            and terrain_gate_level >= getattr(C, "dr_unlock_terrain", 0.0)
         ):
             gate_prog = [C.dr_gate_progress, C.dr_gate_progress_l2, C.dr_gate_progress_l3][self._dr_level]
             if min_prog >= gate_prog and upright >= 0.97 and fall_rate < 0.05:
@@ -836,10 +1000,8 @@ class TailiAmpEnv(DirectRLEnv):
         tctx_str = ""
         if tctx is not None and len(tctx) >= 3:
             tctx_str = f" terrain_ctx_slope={float(tctx[0]):.2f}/{float(tctx[1]):.2f} rough={float(tctx[2]):.3f}"
-        # PER-SUB-TERRAIN-TYPE level breakdown: the MEAN terrain level is capped ~num_rows/2 by the curriculum's
-        # bounce-to-random (maxed envs -> random level), so it HIDES which sub-terrains the policy actually masters
-        # (~rows/2 = mastered+cycling) vs caps below (genuinely stuck). cols map to sub-terrains by cumulative
-        # proportion (same logic as IsaacLab _generate_curriculum_terrains). Read-only diagnostic.
+        # 按子地形拆分课程等级：平均地形等级会掩盖具体卡在哪类地形。
+        # 这里按列映射回子地形，仅用于只读诊断。
         terr_type_str = ""
         if hasattr(self, "_terrain") and hasattr(self._terrain, "terrain_types"):
             if not hasattr(self, "_col_type"):
@@ -856,7 +1018,8 @@ class TailiAmpEnv(DirectRLEnv):
             terr_type_str = "\n          terr_by_type: " + "  ".join(parts)
         d = getattr(self, "_rew_dbg", {})
         d = {k: d.get(k, 0.0) for k in ("lin", "ang", "gait", "imit", "stand", "height", "slip", "clear",
-                                        "hip", "offax", "over", "under", "wrong", "land", "torq", "arate", "vz", "wxy")}
+                                        "hip", "offax", "over", "under", "wrong", "climb", "terr_up", "terr_down",
+                                        "terr_support", "terr_quality", "terr_collapse", "land", "torq", "arate", "vz", "wxy")}
         print(f"[ENV s={self._log_step}] PHASE={self._phase} pen_gate={self._penalty_gate:.2f} "
               f"budget={float(getattr(self, '_budget_ratio_ema', 0.0)):.2f} "
               f"clr_gate={self._clearance_gate:.2f} "
@@ -868,104 +1031,92 @@ class TailiAmpEnv(DirectRLEnv):
               f"/{self._lat_prog:.2f}/{self._yaw_prog:.2f} "
               f"gait_match={gm:.2f} diag={diag_contact:.2f} duty_bal={duty_balance:.2f} "
               f"style_err={self._style_err:.3f} upright={upright:.2f} air={air:.2f} "
-              f"terrain={tlvl:.2f}{tctx_str}{terr_type_str}\n"
+              f"terrain={tlvl:.2f} real={real_tlvl:.2f} discrete={disc_tlvl:.2f}{tctx_str}{terr_type_str}\n"
               f"          rew[task]: lin={d['lin']:+.2f} ang={d['ang']:+.2f} gait={d['gait']:+.2f} imit={d['imit']:+.2f} "
               f"stand={d['stand']:+.2f} height={d['height']:+.2f} slip={d['slip']:+.2f} clear={d['clear']:+.2f} "
               f"hip={d['hip']:+.2f} offax={d['offax']:+.2f} over={d['over']:+.2f} under={d['under']:+.2f} wrong={d['wrong']:+.2f} "
               f"land={d['land']:+.2f} vz={d['vz']:+.2f} "
               f"wxy={d['wxy']:+.2f} torq={d['torq']:+.3f} arate={d['arate']:+.2f}  (+AMP style by skrl)\n"
+              f"          rew[terrain]: climb={d['climb']:+.2f} up={d['terr_up']:+.2f} down={d['terr_down']:+.2f} "
+              f"support={d['terr_support']:+.2f} quality={d['terr_quality']:+.2f} collapse={d['terr_collapse']:+.2f}\n"
               f"          GATE phi{self._phase}: min_prog={min_prog:.2f}(need>={prog_thr:.2f}) "
+              f"terrain_gate={terrain_gate_level:.2f}/{C.phase_gate_terrain_2:.2f} "
+              f"disc_gate={disc_tlvl:.2f}/{discrete_gate_thr:.2f} "
               f"quality={int(quality_ok)}(slip<={slip_thr:.2f},diag>={diag_thr:.2f},duty>={duty_thr:.2f},air>={air_thr:.2f}) "
               f"pen_gate={self._penalty_gate:.2f}/1.0 count={self._phase_count}/{C.phase_intervals} | "
               f"act_std={act_std:.3f} cmd_frac={fwd:.2f}/{bwd:.2f}/{lat:.2f}/{yaw:.2f}", flush=True)
 
     def _get_rewards(self) -> torch.Tensor:
-        # TWO-SIDED velocity tracking (A1/A2/A3 — speed's SOLE owner). exp(-||achieved-command||^2/sigma):
-        # peaks at exact match, falls off for BOTH under- AND over-speed. The old capped-progress left overshoot
-        # UNPENALIZED -> physeval measured +30~67% overspeed and "can't go slow". Unified for moving AND standing:
-        # cmd=0 -> rewards zero residual = clean stop (A3). The 2D linear error also pins lateral drift (vy->0 when
-        # commanded fwd). Speed is now owned HERE only; AMP/reference judge style, not speed.
+        # 双侧速度跟踪：速度由这里统一负责，欠速和超速都会降低奖励。
+        # cmd=0 时奖励零残差，形成干净停步；AMP/参考只判断风格，不负责速度语义。
         vel_lin = self.robot.data.root_lin_vel_b[:, :2]
         wz = self.robot.data.root_ang_vel_b[:, 2]
         cmd_lin = self.commands[:, :2]
         cmd_ang = self.commands[:, 2]
-        cmd_lin_m2 = torch.sum(cmd_lin * cmd_lin, dim=1)            # ||cmd_lin||^2 (used by gates below)
+        cmd_lin_m2 = torch.sum(cmd_lin * cmd_lin, dim=1)            # ||cmd_lin||^2，供下方门控使用。
         cmd_ang_2 = cmd_ang * cmd_ang
-        thr = 0.0025                                               # (|cmd|>0.05)^2 — moving vs standing split
+        thr = 0.0025                                               # (|cmd|>0.05)^2，区分运动/站立。
         mv_l = cmd_lin_m2 > thr
         mv_a = cmd_ang_2 > thr
-        # CAPPED directional progress (0..1) — the PROVEN bootstrap reward: a strong "move that way from any speed"
-        # gradient, and ZERO reward for standing when commanded to move (forces locomotion). The exp two-sided form
-        # (P4) OVER-rewarded standing (cmd0.5,v0 -> 0.37*w) -> phi0 bootstrap STALLED at min_prog~0.18. Overspeed is
-        # braked SEPARATELY by r_overshoot below -> the two-sided effect WITHOUT the bootstrap-killing stand reward.
-        # lin_prog/ang_prog also feed the phi gate (min_prog) + velocity curriculum.
+        # 截断方向进展：bootstrap 时提供“朝命令方向移动”的强梯度。
+        # 站着不动在运动命令下没有进展奖励；超速由 r_overshoot 单独刹车。
+        # lin_prog / ang_prog 同时用于阶段门控和速度课程。
         lin_prog = torch.clamp(torch.sum(vel_lin * cmd_lin, dim=1) / cmd_lin_m2.clamp(min=thr), 0.0, 1.0)
         ang_prog = torch.clamp(wz * cmd_ang / cmd_ang_2.clamp(min=thr), 0.0, 1.0)
         lin_stand = torch.exp(-torch.sum(vel_lin * vel_lin, dim=1) / self.cfg.stand_sigma)
         ang_stand = torch.exp(-wz * wz / self.cfg.stand_sigma)
-        lin_stand_w = torch.where(mv_a & ~mv_l, 0.25, 1.0)   # don't pay full standing on a non-commanded axis
+        lin_stand_w = torch.where(mv_a & ~mv_l, 0.25, 1.0)   # 纯 yaw 时不对非命令线速度轴给满额站立奖励。
         ang_stand_w = torch.where(mv_l & ~mv_a, 0.25, 1.0)
         r_lin = self.cfg.rew_track_lin * torch.where(mv_l, lin_prog, lin_stand * lin_stand_w)
         r_ang = self.cfg.rew_track_ang * torch.where(mv_a, ang_prog, ang_stand * ang_stand_w)
         r_alive = self.cfg.rew_alive * (~self.reset_terminated).float()
         r_arate = self.cfg.rew_action_rate * torch.sum(torch.square(self.actions - self.last_actions), dim=1)
         r_jacc = self.cfg.rew_joint_acc * torch.sum(torch.square(self.robot.data.joint_acc), dim=1)
-        # MOTOR PROTECTION: penalize torque ONLY in the stress zone (|tau| above torque_limit_frac of the per-joint
-        # effort limit). Normal-gait torque -> 0 penalty (gait untouched); near-saturation/violent torque -> grows
-        # quadratically -> discourages motor-damaging commands. effort_limit is per-joint in the correct DOF order.
+        # 电机保护：只在力矩接近关节 effort_limit 的压力区惩罚。
+        # 正常步态力矩不受影响，接近饱和时二次增长。
         try:
             tau = self.robot.data.applied_torque                                      # (N, 12)
-            eff_lim = self.robot.actuators["legs"].effort_limit                        # (N, 12) per-joint Nm
+            eff_lim = self.robot.actuators["legs"].effort_limit                        # (N,12)，每关节 Nm。
             tau_over = torch.clamp(tau.abs() - self.cfg.torque_limit_frac * eff_lim, min=0.0)
             r_torque = self.cfg.rew_torque * torch.sum(tau_over * tau_over, dim=1)
-        except Exception as _e:                                                       # never let it kill the reward
+        except Exception as _e:                                                       # 不允许该分支中断奖励计算。
             r_torque = torch.zeros(self.num_envs, device=self.device)
             if "torque" not in self._dr_warned:
                 print(f"[REW] torque penalty unavailable ({type(_e).__name__}); skipping", flush=True)
                 self._dr_warned.add("torque")
         r_vz = self.cfg.rew_lin_vel_z * torch.square(self.robot.data.root_lin_vel_b[:, 2])
         r_wxy = self.cfg.rew_ang_vel_xy * torch.sum(torch.square(self.robot.data.root_ang_vel_b[:, :2]), dim=1)
-        # feet_air_time: reward each foot for being airborne ~air_time_target, credited on landing.
-        # BOUND TO EFFECTIVE DISPLACEMENT (principle 4): only credited when the robot is actually making
-        # progress on its command (linear velocity ALONG the commanded direction, OR turning the right
-        # way). Marching/flailing in place (high air_time, zero displacement) earns NOTHING -> the gait
-        # reward cannot be gamed without real locomotion.
+        # 足端滞空时间：在落脚时结算，目标是接近 air_time_target。
+        # 只有机器人沿命令方向产生有效位移或正确转向时才给滞空奖励，避免原地乱抬腿刷分。
         first_contact = self._contact_sensor.compute_first_contact(self.step_dt)[:, self._feet_contact_ids]
         air_time = self._contact_sensor.data.current_air_time[:, self._feet_contact_ids]
         cmd_lin = self.commands[:, :2]
         cmd_lin_mag = torch.norm(cmd_lin, dim=1)
         vb2 = self.robot.data.root_lin_vel_b[:, :2]
-        vel_along = (vb2 * cmd_lin).sum(-1) / cmd_lin_mag.clamp(min=0.1)         # speed along commanded dir
-        yaw_match = self.commands[:, 2] * self.robot.data.root_ang_vel_b[:, 2]   # >0 if turning the right way
+        vel_along = (vb2 * cmd_lin).sum(-1) / cmd_lin_mag.clamp(min=0.1)         # 沿命令方向速度。
+        yaw_match = self.commands[:, 2] * self.robot.data.root_ang_vel_b[:, 2]   # 大于 0 表示转向方向正确。
         effective = ((vel_along > 0.1) | (yaw_match > 0.05)).float()
         air_credit = torch.clamp(air_time - self.cfg.air_time_min, min=0.0,
                                  max=self.cfg.air_time_target - self.cfg.air_time_min)
         r_air = self.cfg.rew_feet_air_time * torch.sum(air_credit * first_contact.float(), dim=1) * effective
         mv_any = mv_l | mv_a
 
-        # GAIT-PHASE TROT CONTACT reward (HARD contact-timing imitation; AMP is blind to contact -> couldn't
-        # do this). The diagonal trot clock says which legs should be in stance (phase<duty) vs swing; reward
-        # the fraction of legs whose ACTUAL contact matches. A dragging leg (loaded during its swing phase)
-        # mismatches -> penalized. Gated to moving commands (no rhythm imposed while standing).
-        in_contact = self._in_contact                                                    # cached from _get_observations
+        # 步态相位接触奖励：对角小跑时钟给出每条腿应处于支撑还是摆动。
+        # 实际接触越匹配奖励越高；站立命令下不强加节律。
+        in_contact = self._in_contact                                                    # 由 _get_observations 缓存。
         leg_phase = self._leg_phases()
-        desired_stance = (leg_phase < self.cfg.gait_duty).float()                       # 1 = should be planted
+        desired_stance = (leg_phase < self.cfg.gait_duty).float()                       # 1 表示应处于支撑相。
         gait_match = (desired_stance * in_contact + (1.0 - desired_stance) * (1.0 - in_contact)).mean(dim=1)
-        # RAW gait_match (NO dead-zone): this is V1's proven formula (rew*gait_match), which reached gait_match
-        # 0.93. The dead-zone clamp((gait_match-0.5)/0.5) gave ZERO gradient at the bootstrap point (gait_match
-        # ~0.5) -> the trot rhythm never established. Raw gait_match gives a strong gradient (rew) everywhere.
-        # TERRAIN RELAXATION kept: scale DOWN on rough terrain so the policy can break the clock to climb
-        # (gait_match dropping on hard terrain is CORRECT; flat keeps the full reward).
+        # 原始 gait_match 不加 dead-zone，使 bootstrap 时也有接触节律梯度。
+        # 粗糙地形上降低固定节律权重，允许策略打破平地小跑节律去跨越地形。
         if self.cfg.terrain_ctx_dim >= 3:
             rough_gate = torch.clamp(self._terrain_ctx[:, 2] / self.cfg.gait_rough_scale, 0.0, 1.0)
         else:
             rough_gate = torch.zeros(self.num_envs, device=self.device)
         r_gait = self.cfg.rew_gait_phase * gait_match * mv_any.float() * (1.0 - rough_gate)
 
-        # (A) IMITATION reward (trajectory-level): directly track the reference JOINTS at each env's current command
-        # + gait phase. AMP is a weak 2-frame distributional prior; this forces the ACTUAL gait toward the reference
-        # (gait_match only checks contact timing). exp(-||Δjoint||²/sigma)*weight, moving-only, rough-gated like
-        # r_gait so the policy can still deviate to climb. Also sets self._style_err (the phi1->phi2 gate metric).
+        # 轨迹级 imitation：按当前命令和 gait phase 直接跟踪参考关节。
+        # AMP 只是分布先验，imitation 用于把实际步态拉向参考轨迹；粗糙地形上同样放松。
         if self.cfg.rew_imitate != 0.0:
             spd_im = torch.norm(self.commands[:, :2], dim=1)
             T_im = torch.clamp(self.cfg.gait_period - self.cfg.gait_period_slope * spd_im,
@@ -975,23 +1126,16 @@ class TailiAmpEnv(DirectRLEnv):
                                     gait_period_slope=self.cfg.gait_period_slope, gait_period_min=self.cfg.gait_period_min,
                                     clearance_base=self.cfg.base_clearance, roughness=rough_im,
                                     clearance_rough_gain=self.cfg.ref_clearance_rough_gain, stance_dx=self.cfg.stance_dx,
-                                    jp_only=True, iters=12)            # FAST PATH: jp only, 12 IK iters (~6x cheaper)
+                                    jp_only=True, iters=12)            # 快路径：只生成关节位置，12 次 IK。
             jp_ref = jp_ref[:, self.motion_dof_indexes]
             jdiff = self.robot.data.joint_pos - jp_ref                                    # (N,12)
-            # TURN-GATE (0706 D3s): weight imitation by how much the command is a turn/strafe, so it anchors
-            # foot placement exactly where AMP's forward-dense style field is blind, and stays ~0 for pure
-            # forward (where AMP already covers it and the old global tracker over-constrained). yaw scaled by
-            # ~foot radius (0.30) to compare with linear m/s. Pure fwd→0, pure yaw/lat→1.
+            # turn/strafe 门控：转向和横移更依赖 imitation 锚定足端位置；
+            # yaw 按足端半径近似缩放到线速度量级。
             _turn_mag = self.commands[:, 1].abs() + 0.30 * self.commands[:, 2].abs()
             _fwd_mag = self.commands[:, 0].abs()
             turn_frac = _turn_mag / (_turn_mag + _fwd_mag + 1e-3)
-            # RANK-2A (0707): a MODEST forward imitation FLOOR so pure-forward buckets get a trajectory anchor
-            # for gait SHAPE (B1 touchdown vz / B2 slip / B4 duty symmetry) — the exact forward gait-quality
-            # gates that fail when turn_frac→0 leaves forward unanchored (the mechanism behind the yaw-lesson:
-            # the turn-gated anchor fixed TURNING placement but left FORWARD's foot fine-dynamics ungoverned).
-            # The reference is speed-COVARIANT (period/stride scale with |cmd|), so it constrains gait shape,
-            # NOT net speed → A1-forward (passing) is protected. Config-driven, default 0.0 = off (backward
-            # compatible); set imitate_fwd_floor≈0.3 to enable. Kept modest to bound the A4 tradeoff risk.
+            # 前进 imitation floor：纯前进样本也给少量轨迹锚点，用于约束落脚、滑移和对称。
+            # 参考轨迹随速度缩放，只约束步态形状，不替代速度跟踪。
             _imit_fwd_floor = float(getattr(self.cfg, "imitate_fwd_floor", 0.0))
             if _imit_fwd_floor > 0.0:
                 turn_frac = torch.clamp(turn_frac, min=_imit_fwd_floor)
@@ -1003,44 +1147,31 @@ class TailiAmpEnv(DirectRLEnv):
         else:
             r_imitate = torch.zeros(self.num_envs, device=self.device)
 
-        # SWING-DRAG penalty (framework hardening for heavier robots): a foot loaded (in contact) during its
-        # commanded SWING phase = dragging/skating instead of stepping. physdiag swing_z: 39 kg Taili lifts
-        # 9-19 cm, 75 kg B2 slides with feet on the ground (swing_z≈0). Dimensionless per-leg fraction [0,1];
-        # default weight 0.0 → exact no-op for robots that already lift. A nonzero (negative) weight forces
-        # every leg to actually leave the ground during its swing window. Gated to moving commands.
-        # TERRAIN-GATED: swing_drag (collision-triggered lift) is OFF on flat (rough_gate=0) — else it penalizes
-        # flat-gait timing imperfections and pushes a wasteful OVER-LIFT (physeval: 7cm vs the 4cm reference). It
-        # engages only on rough/stairs (rough_gate->1), where hitting a riser SHOULD trigger a higher, adaptive lift.
+        # 摆动相拖脚惩罚：摆动窗口内仍承重表示拖脚/滑行。
+        # 该项默认关闭；非零时只在运动命令和粗糙地形上生效，避免平地过度抬脚。
         r_swing_drag = (self.cfg.rew_swing_drag * ((1.0 - desired_stance) * in_contact).mean(dim=1)
                         * mv_any.float() * rough_gate)
 
-        # GAIT ENFORCEMENT (hard, both directions): penalize a foot OFF its commanded contact schedule —
-        # loaded during swing (drag) OR airborne during stance (premature lift). r_gait reward is SOFT
-        # (rew*gait_match) and asymptotes ~0.89-0.93; this hard penalty pushes gait_match toward 0.95 by
-        # punishing every off-clock leg. Dimensionless per-leg [0,1]; default 0 = no-op. Relaxed on rough
-        # terrain (like gait_match) so the policy can break the clock to climb.
+        # 硬步态约束：惩罚任意腿偏离命令接触时序。
+        # 默认关闭；粗糙地形上放松，让策略可以打破平地节律跨越地形。
         off_sched = (1.0 - desired_stance) * in_contact + desired_stance * (1.0 - in_contact)   # (N,4)
         _ge_relax = (1.0 - rough_gate) if (self.cfg.terrain_ctx_dim >= 3) else 1.0
         r_gait_enforce = self.cfg.rew_gait_enforce * off_sched.mean(dim=1) * mv_any.float() * _ge_relax
 
-        # OFF-AXIS penalty: velocity PERPENDICULAR to the commanded direction (physdiag: fwd cmd -> vy 0.53).
+        # 非命令轴惩罚：惩罚与命令方向垂直的线速度。
         cmd_lin_norm = cmd_lin_mag.clamp(min=1e-4)
         cmd_hat = cmd_lin / cmd_lin_norm[:, None]
         v_along_s = (vel_lin * cmd_hat).sum(-1)                                          # signed speed along cmd
         v_perp = vel_lin - v_along_s[:, None] * cmd_hat
         r_offaxis = self.cfg.rew_offaxis_vel * torch.sum(v_perp * v_perp, dim=1) * mv_l.float()
 
-        # OVERSHOOT penalty: speed BEYOND the commanded magnitude (physdiag: back cmd 0.4 -> vx 1.10). The
-        # capped-progress reward gives no bonus past cmd but also no penalty; this is the missing brake.
+        # 超速惩罚：超过命令速度的部分直接给刹车梯度。
         lin_over = torch.clamp(v_along_s - cmd_lin_mag, min=0.0)
         ang_over = torch.clamp(wz * torch.sign(cmd_ang) - cmd_ang.abs(), min=0.0)
         r_overshoot = self.cfg.rew_overshoot * (lin_over * lin_over * mv_l.float()
                                                 + ang_over * ang_over * mv_a.float())
-        # BANDED UNDERSPEED penalty: only punish falling below the A1 tolerance band, not every
-        # sample below the command. The previous raw underspeed term pushed forward commands past
-        # the target while trying to fix backward. Keeping the no-penalty band aligned with the
-        # acceptance definition gives backward a gradient when it is truly too slow, while avoiding
-        # an always-on "go faster" bias once tracking is already acceptable.
+        # 带容差的欠速惩罚：只惩罚低于验收带的速度，不对所有低于命令的样本施压。
+        # 这样后退过慢时有梯度，但跟踪已合格时不会持续推高速度。
         lin_tol = torch.maximum(
             torch.full_like(cmd_lin_mag, self.cfg.speed_tol_abs),
             self.cfg.speed_tol_rel * cmd_lin_mag,
@@ -1055,9 +1186,7 @@ class TailiAmpEnv(DirectRLEnv):
             & (self.commands[:, 1].abs() < 0.05)
             & (self.commands[:, 2].abs() < 0.05)
         )
-        # BACKWARD-ONLY auxiliary shaping: diagnostics showed generic underspeed can collapse forward
-        # locomotion into a cautious standing solution. Backward is the weak axis; apply extra gradient
-        # only to negative-vx commands and leave forward retention owned by capped progress + overshoot.
+        # 后退专用辅助 shaping：只给负 vx 命令额外梯度，避免通用欠速项伤害前进能力。
         back_speed_deficit = torch.clamp((self.commands[:, 0].abs() - lin_tol) - (-vel_lin[:, 0]), min=0.0)
         back_wrong = torch.clamp(vel_lin[:, 0], min=0.0)
         r_backward_aux = (
@@ -1072,71 +1201,56 @@ class TailiAmpEnv(DirectRLEnv):
         lat_signed_speed = vel_lin[:, 1] * torch.sign(self.commands[:, 1])
         lat_speed_deficit = torch.clamp((self.commands[:, 1].abs() - lin_tol) - lat_signed_speed, min=0.0)
         r_lateral_aux = self.cfg.rew_lateral_underspeed * lat_speed_deficit * lat_speed_deficit * lat_cmd.float()
-        # WRONG-DIRECTION penalty: a backward command solved by standing still or moving forward keeps
-        # capped progress near zero, but previously had little explicit cost. Penalize signed velocity
-        # opposite the requested axis so backward/yaw commands get a usable gradient away from shortcuts.
+        # 反向惩罚：对与命令方向相反的速度直接加成本，减少站住或反向移动的捷径。
         lin_wrong = torch.clamp(-v_along_s, min=0.0)
         ang_wrong = torch.clamp(-(wz * torch.sign(cmd_ang)), min=0.0)
         r_wrong_dir = self.cfg.rew_wrong_dir * (lin_wrong * lin_wrong * mv_l.float()
                                                 + ang_wrong * ang_wrong * mv_a.float())
 
-        # STAND-POSTURE reward (only when commanded ~0): hold an upright, nominal-height, default-joint,
-        # ALL-4-FEET-DOWN stance so it ACTIVELY returns to standing (physdiag: was balancing on 3 legs, FR up,
-        # and recovering slowly). Four terms in [0,1]: uprightness, joints-near-default, height, feet-down.
-        # body height — hoisted here so r_height (always-on) and r_stand both use it
+        # 站立姿态奖励：零命令下保持直立、名义高度、默认关节和四足接触。
+        # 机身高度提前计算，供 r_height 和 r_stand 共用。
         hgt = self.robot.data.root_pos_w[:, 2] - self._terrain.env_origins[:, 2]
 
-        # ALWAYS-ON BASE HEIGHT: during movement r_stand is fully gated off, so the policy has no incentive to
-        # keep the body up -> rear legs collapse ("后腿卧前腿直立"). Linear penalty fires any time body drops
-        # below stand_height regardless of command, preventing the degenerate rear-leg-lying strategy.
+        # 常开 base height：运动时 r_stand 关闭，因此需要独立高度项防止后腿塌低。
         r_height = self.cfg.rew_base_height * torch.clamp(self.cfg.stand_height - hgt, min=0.0)
 
-        # STAND-POSTURE reward (only when commanded ~0): hold an upright, nominal-height, default-joint,
-        # ALL-4-FEET-DOWN stance so it ACTIVELY returns to standing (physdiag: was balancing on 3 legs, FR up,
-        # and recovering slowly). Four terms in [0,1]: uprightness, joints-near-default, height, feet-down.
+        # 站立项由直立、默认关节、高度和四足接触四部分组成。
         standing = (~mv_l) & (~mv_a)
-        up = torch.clamp(-self.robot.data.projected_gravity_b[:, 2], 0.0, 1.0)                  # 1 = upright
-        # jdev: WIDE Gaussian (sigma=4.0 instead of 0.5) so even a prone robot (large joint deviation) gets
-        # nonzero gradient toward the default pose; exp(-sum/0.5) -> ~0 in prone = no recovery gradient.
+        up = torch.clamp(-self.robot.data.projected_gravity_b[:, 2], 0.0, 1.0)                  # 1 表示直立。
+        # jdev 使用较宽 Gaussian，保证趴下时仍有回到默认姿态的梯度。
         jdev = torch.exp(-torch.sum((self.robot.data.joint_pos - self.action_offset) ** 2, dim=1) / 4.0)
-        # hdev: LINEAR (not sharp Gaussian) so there is always a gradient to rise from prone height to stand_height.
+        # hdev 使用线性项，保证从低高度到站立高度始终有梯度。
         hdev = torch.clamp(hgt / self.cfg.stand_height, 0.0, 1.0)
         feet_down = in_contact.mean(dim=1)                                                      # frac of 4 feet planted
         r_stand = self.cfg.rew_stand_pose * ((up + jdev + hdev + feet_down) / 4.0) * standing.float()
-        # STAND STILLNESS: when commanded to stand, penalize joint velocity so the robot SETTLES smoothly into the
-        # nominal "立正" stance (esp. on a sudden move->stop) instead of fidgeting. Refinement -> gated to phi>=1.
+        # 站立静止：零命令时惩罚关节速度，使机器人平滑回到立正而不是碎步抖动。
         r_stand_still = self.cfg.rew_stand_still * torch.sum(self.robot.data.joint_vel ** 2, dim=1) * standing.float()
 
-        # ANTI-PIGEON-TOE: hold hips NEUTRAL (wide nominal stance) except when laterally commanded (lateral
-        # legitimately needs abduction). Penalize sum(hip_joint^2), gated off as |vy| rises.
+        # 髋关节中立：非横移命令下压制髋关节外翻/内扣；横移时关闭该约束。
         lat_active = torch.clamp(self.commands[:, 1].abs() / self.cfg.hip_neutral_lat_scale, 0.0, 1.0)
         hip_dev = torch.sum(self.robot.data.joint_pos[:, self._hip_idx] ** 2, dim=1)
         r_hip = self.cfg.rew_hip_neutral * hip_dev * (1.0 - lat_active)
 
-        # GAIT QUALITY REWARDS (directly fix physdiag slip=54-85% issue)
+        # 步态质量奖励：滑移、摆动方向、落脚减速和 clearance。
         foot_vel_w3 = self.robot.data.body_lin_vel_w[:, self.foot_indexes, :]  # (N,4,3)
         q = self.robot.data.root_quat_w[:, None, :].expand(-1, self.n_feet, -1).reshape(-1, 4)
         foot_vel_b = quat_apply_inverse(q, foot_vel_w3.reshape(-1, 3)).reshape(-1, self.n_feet, 3)
         foot_vel_b_xy = foot_vel_b[:, :, :2]                                  # (N,4,2), base frame
 
-        # DESCENT-RELEASE window: clearance + swing-direction shaping apply only during the LIFT/APEX part of
-        # swing, then taper to 0 over the final ~35% (the touchdown descent). Without this, clearance keeps
-        # penalizing the foot for being below target as it descends to land (-> the policy lifts it back up
-        # mid-descent = "略微上升") and swing_dir keeps pushing it sideways (-> "平移") — both stop the foot
-        # from dropping straight to a clean plant. Releasing them lets the foot descend monotonically.
+        # 落脚释放窗口：clearance 和 swing-direction 只在抬腿/最高点阶段强约束，
+        # 落脚后段逐步释放，让脚能单调下降并干净触地。
         s_swing = ((leg_phase - self.cfg.gait_duty) / (1.0 - self.cfg.gait_duty)).clamp(0.0, 1.0)  # (N,4)
         lift_w = torch.clamp((0.65 - s_swing) / 0.20, 0.0, 1.0)            # 1 in lift/apex, 0 by s_swing=0.65
         land_w = torch.clamp((s_swing - 0.70) / 0.30, 0.0, 1.0)           # 0 until touchdown phase, 1 at contact
 
-        # 1. STANCE SLIP: penalize feet sliding horizontally during contact
+        # 1. 支撑滑移：惩罚接触脚的水平滑动。
         slip_speed = foot_vel_b_xy.norm(dim=-1)                            # (N,4), m/s
         r_stance_slip = self.cfg.rew_stance_slip * (in_contact * slip_speed).sum(dim=1) * mv_any.float()
-        # mean stance-slip (m/s) exposed for the phi1->phi2 clean-gait gate
+        # 平均支撑滑移暴露给阶段门控。
         slip_now_env = (in_contact * slip_speed).sum(dim=1) / in_contact.sum(dim=1).clamp(min=1.0)
         self._slip_now = float(slip_now_env.mean())
 
-        # 2. SWING DIRECTION: swing foot should move along the commanded body-frame direction. For yaw-only
-        # commands, use the tangential direction induced by rotating around the base.
+        # 2. 摆动方向：摆动脚应沿命令方向移动；纯 yaw 使用绕 base 旋转产生的切向方向。
         foot_rel_b = self._feet_rel_base(self.robot.data.body_pos_w[:, self.foot_indexes],
                                          self.robot.data.root_pos_w, self.robot.data.root_quat_w, self.n_feet)
         foot_rel_b = foot_rel_b.reshape(-1, self.n_feet, 3)
@@ -1148,20 +1262,15 @@ class TailiAmpEnv(DirectRLEnv):
         swing_active = (mv_l | mv_a).float()[:, None]
         swing_mask = (1.0 - in_contact) * swing_active                    # (N,4)
         vel_along_cmd = (foot_vel_b_xy * desired_hat).sum(dim=-1)         # (N,4)
-        # PHASE-ANCHORED descent-release window. lift_w (descent-release) is a REFINEMENT (fixes the touchdown
-        # "顿挫") that did NOT exist in the fresh-proven 245k. lift_gate fades it in via penalty_gate: in phi0 it is
-        # 1.0 (PLAIN full-swing window == 245k), over phi1 it tapers to lift_w (descent-release active). Applied to
-        # BOTH swing_dir and clearance (the two shaping terms 245k ran un-gated). A fresh policy barely lifts its
-        # feet, so gating these to lift/apex-only (lift_w~0) at bootstrap starves them -> never explores stepping.
+        # 相位锚定的落脚释放窗口：bootstrap 阶段保留完整摆动窗口，
+        # 之后通过 penalty_gate 渐入到 lift/apex-only，避免早期探索被饿死。
         lift_gate = (1.0 - self._penalty_gate) + self._penalty_gate * lift_w
         r_swing_dir = self.cfg.rew_swing_dir * (vel_along_cmd * swing_mask * lift_gate).mean(dim=1)
 
-        # 2b. LANDING DECELERATION: in the touchdown phase (land_w), penalize the foot's HORIZONTAL speed so it
-        # arrests its sideways/forward motion BEFORE planting -> clean plant, no drift ("平移") / landing slip.
-        # Complements lift_w (lift+steer early; brake horizontal late).
+        # 2b. 落脚减速：落脚阶段惩罚足端水平速度，使足端在触地前刹住。
         r_land_decel = self.cfg.rew_land_decel * (slip_speed * swing_mask * land_w).mean(dim=1)
 
-        # 3. CLEARANCE: swing foot should clear the terrain under/near the foot, not just move relative to body.
+        # 3. clearance：摆动脚应相对脚下/附近地形抬起，而不只是相对机身抬起。
         hits = self._height_scanner.data.ray_hits_w                       # (N,P,3), yaw-aligned grid around base
         finite_hits = torch.isfinite(hits[:, :, 2])
         hits_z_valid = torch.where(finite_hits, hits[:, :, 2], torch.zeros_like(hits[:, :, 2]))
@@ -1218,30 +1327,24 @@ class TailiAmpEnv(DirectRLEnv):
         }
         terrain_rise_ahead = torch.where(has_ahead, torch.clamp(ahead_max - support_z, min=0.0), torch.zeros_like(support_z))
         terrain_drop_ahead = torch.where(has_ahead, torch.clamp(support_z - ahead_min, min=0.0), torch.zeros_like(support_z))
-        # ROUGHNESS-GATED phi2 clearance (per-env): engage heavy lift ONLY where the terrain is actually rough
-        # (boxes/stairs/rough tiles); flat stays the efficient 245k base. gate cg = clr_gate(phi2 time fade) x
-        # rough_factor(per-env terrain roughness). In phi0/phi1 clr_gate=0 -> cg=0 -> EXACTLY 245k (-1.5, 7cm).
+        # 粗糙度门控 clearance：只在真实粗糙/离散地形上加重抬脚，平地保持低而高效。
+        # cg = 阶段渐入门控 x 每个 env 的粗糙度因子。
         rough = self._terrain_ctx[:, 2]                                                  # (N,) terrain height std (m)
         rough_factor = torch.clamp((rough - self.cfg.clr_rough_flat) / self.cfg.clr_rough_span, 0.0, 1.0)  # (N,)
-        # (B) DISCRETE OBSTACLES (stairs/boxes): FORCE rough_factor=1 regardless of measured roughness, so the
-        # clearance target/weight ramps to full (target -> base+clr_rough_bonus_max ≈ 0.30m, weight -> -8). This
-        # breaks the catch-22: a stuck-low stair tile reads low roughness -> low lift demand -> can't clear the
-        # step -> never climbs. Demanding ~30cm lift lets the foot clear up to a 25cm step.
+        # 离散障碍：楼梯/boxes 可强制 rough_factor=1，避免低粗糙度读数导致抬脚目标不足。
         if getattr(self.cfg, "discrete_clearance", False):
             self._ensure_gate_mask()
             rough_factor = torch.where(self._discrete_terrain_mask, torch.ones_like(rough_factor), rough_factor)
         cg = self._clearance_gate * rough_factor                                         # (N,) 0 on flat, ->1 on rough
-        # weight: flat -1.5 (efficient) -> -8 on full-rough (forces foot high enough to clear obstacles)
+        # 权重：平地轻约束，粗糙地形逐步加重。
         eff_clearance_w = self.cfg.rew_clearance + (self.cfg.rew_clearance_heavy - self.cfg.rew_clearance) * cg  # (N,)
-        # target: base 0.07 + up to +6cm on full-rough (so it AIMS over the obstacle: 13cm clears L5 boxes/stairs)
+        # 目标：基础抬脚高度加粗糙地形 bonus。
         clearance_target = self.cfg.base_clearance + self.cfg.clr_rough_bonus_max * cg[:, None]  # (N,1)
         clr_deficit = torch.clamp(clearance_target - foot_clearance, min=0.0)
-        # lift_gate: phi0 = full swing window (== 245k, plain); phi1+ tapers to lift/apex only (descent-release,
-        # stops penalizing the natural touchdown descent = the "略微上升" hitch).
+        # lift_gate：早期完整摆动窗口，后期渐入 lift/apex-only，释放自然落脚下降段。
         r_clearance = eff_clearance_w * (swing_mask * lift_gate * clr_deficit).mean(dim=1)
 
-        # PER-DIRECTION velocity curriculum progress — TERRAIN-GATED: exclude hard-type envs (slope_inv, boxes)
-        # so they don't drag the prog that gates DR / velocity / phase (those types are a separate, capped axis).
+        # 分方向速度课程进展：排除 hard 类型 env，避免它们拖低阶段/速度/DR 门控。
         self._ensure_gate_mask()
         gm_e = self._gate_mask
         fwd_mask  = mv_l & (self.commands[:, 0] > 0.1) & gm_e
@@ -1253,8 +1356,8 @@ class TailiAmpEnv(DirectRLEnv):
         if bool(lat_mask.any()):  self._lat_prog  = float(lin_prog[lat_mask].mean())
         if bool(yaw_mask.any()):  self._yaw_prog  = float(ang_prog[yaw_mask].mean())
 
-        # Minimal terrain-throughput drive: tracking and clearance alone do not pay for committing upward over
-        # stairs/boxes. Keep this narrow so flat gait is not pulled into wasteful hopping.
+        # 最小地形通过驱动：tracking 和 clearance 不会直接奖励向上越过台阶。
+        # 该项保持窄范围，避免平地步态被拉成无意义跳跃。
         r_climb = torch.zeros(self.num_envs, device=self.device)
         r_terrain_up = torch.zeros(self.num_envs, device=self.device)
         r_terrain_down = torch.zeros(self.num_envs, device=self.device)
@@ -1285,8 +1388,7 @@ class TailiAmpEnv(DirectRLEnv):
             disc = getattr(self, "_discrete_terrain_mask", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device))
             moving_lin_cmd = cmd_lin_mag > 0.10
             upright = (-self.robot.data.projected_gravity_b[:, 2]).clamp(0.0, 1.0) > 0.85
-            # Soft slip weight: a hard cutoff at the target made climb reward disappear exactly when the
-            # policy still needed gradient. Keep full credit below the target and taper to zero over ~0.18 m/s.
+            # 软滑移权重：目标以下保持满额，超过后逐步衰减，避免硬截断丢梯度。
             slip_target = float(getattr(self.cfg, "climb_slip_gate", 0.30))
             slip_span = max(float(getattr(self.cfg, "climb_slip_soft_span", 0.18)), 1e-6)
             slip_weight = torch.clamp(1.0 - torch.clamp(slip_now_env - slip_target, min=0.0) / slip_span, 0.0, 1.0)
@@ -1327,8 +1429,7 @@ class TailiAmpEnv(DirectRLEnv):
             float(r_lin.mean()), float(r_ang.mean()), float(r_air.mean()),
             float(gait_match[mv_any].mean()) if bool(mv_any.any()) else 0.0)
         self._last_gait_match = self._dbg[5]
-        # FULL reward-component breakdown (means) for the [ENV] log — so it's clear WHICH term dominates and
-        # whether any task term is fighting the AMP style. _penalty_gate-scaled refinements shown post-gate.
+        # [ENV] 日志中的奖励分解均值，用于判断主导项以及任务项是否与 AMP 风格冲突。
         pg = self._penalty_gate
         self._rew_dbg = {
             "lin": float(r_lin.mean()), "ang": float(r_ang.mean()), "gait": float(r_gait.mean()),
@@ -1343,43 +1444,30 @@ class TailiAmpEnv(DirectRLEnv):
             "terr_probe_common": float(terrain_probe["common_mean"]),
             "land": float((pg * r_land_decel).mean()), "torq": float(r_torque.mean()),
             "arate": float(r_arate.mean()), "vz": float(r_vz.mean()), "wxy": float(r_wxy.mean()),
-            "stand_still": float(r_stand_still.mean()),   # P5: now ALWAYS-ON (no longer pg-gated) -> log un-gated
+            "stand_still": float(r_stand_still.mean()),   # 常开站立静止项，记录未额外 gate 的值。
         }
-        # 245k-PROVEN BASE penalties (ALWAYS ON from step 0): offaxis/overshoot/hip/slip/clearance(@-1.5) were ALL
-        # ON in the fresh-bootstrapped 245k run -> they ARE the bootstrap gradient field (punish standing-shuffle,
-        # wrong-direction drift, pigeon-toe, foot under-lift), NOT refinements. The phase system WRONGLY gated them
-        # to 0 in phi0 (penalty_gate=0), deleting 245k's proven stack -> the policy got paid to stand perfectly
-        # still (gait_match 0.5, upright 1.0, prog~0.1 for 8k+ steps). The leg-holding degeneration that motivated
-        # the gate came from clearance -8 (HEAVY), not from penalties existing; clearance is back at 245k's -1.5.
+        # 基础惩罚从 step 0 常开：offaxis、overshoot、hip、slip 和轻量 clearance 是 bootstrap 梯度场。
+        # 它们负责压制站立碎步、反向漂移、髋外翻和低抬脚；重 clearance 才是后期渐入项。
         base_penalties = (
             r_offaxis + r_overshoot + r_underspeed + r_backward_aux + r_lateral_aux + r_wrong_dir
             + r_hip + r_stance_slip + r_clearance + r_swing_drag
         )
-        # TRUE post-245k REFINEMENTS (fade in phi1+ on a walking policy): land_decel + gait_enforce.
-        # r_gait_enforce is a REFINEMENT (push gait_match past 0.93 AFTER the gait forms) — pen-gated so it does
-        # NOT fight the phi0 bootstrap (un-gated -2.0 punished the messy early gait → gait_match dropped to 0.61).
-        # r_stand_still MOVED to ALWAYS-ON (P5): clean-stop/立正 is a CORE skill (physeval: 0.19 m/s creep, feet not
-        # planted) → must train from phi0, not be a late refinement. Fires only when commanded ~0, so always-on is safe.
+        # 后期细化项通过 penalty_gate 渐入：land_decel 和 gait_enforce。
+        # stand_still 是核心停步技能，只在零命令下生效，因此保持常开。
         refinement_penalties = r_land_decel + r_gait_enforce
-        # r_torque (motor protection) is ALWAYS ON: it is ~0 in normal gait (only the near-saturation stress zone
-        # is penalized), so it is bootstrap-safe and protects the (sim) motors from the first step.
+        # torque 电机保护常开；正常步态下近似为 0，只惩罚接近饱和压力区。
         reward = (r_lin + r_ang + r_alive + r_arate + r_jacc + r_vz + r_wxy + r_air
                   + r_gait + r_imitate + r_height + r_stand + r_stand_still + r_swing_dir + r_torque
                   + r_climb + r_terrain_up + r_terrain_down
                   + base_penalties
                   + self._penalty_gate * refinement_penalties)
-        return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)   # never let a NaN reward poison PPO
+        return torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)   # 防止 NaN 奖励污染 PPO。
 
     def _get_dones(self):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         if self.cfg.early_termination:
-            # FALL = base too low ABOVE LOCAL TERRAIN, not absolute world z (0706). The old
-            # `root_pos_w[:,2] < termination_height` used raw world height, so on any terrain whose ground
-            # sits below the world origin the robot "died" every step even while perfectly upright: the
-            # inverted-pyramid up-stairs pit (spawn z≈-1.55) terminated+reset on EVERY frame → a frozen
-            # diagnostic + pose_stable=0; descending stairs/slopes hit the same false-fall. Use height above
-            # the ground directly under the base (the canonical reward-side terrain height) so 0.35 means
-            # "0.35 m of clearance", terrain-agnostic.
+            # 跌倒高度使用相对局部地面的 base 高度，而不是世界 z。
+            # 这样楼梯坑、下坡等低世界坐标地形不会被误判为每帧跌倒。
             if hasattr(self, "_terrain_height_under_base"):
                 base_h_local = self.robot.data.root_pos_w[:, 2] - self._terrain_height_under_base()
             else:
@@ -1387,9 +1475,8 @@ class TailiAmpEnv(DirectRLEnv):
             died = base_h_local < self.cfg.termination_height
         else:
             died = torch.zeros_like(time_out)
-        # CRITICAL: terminate any env whose root state went NON-FINITE (physics blowup). The height check
-        # above MISSES these: `NaN < termination_height` evaluates to False, so a blown-up env would NOT be
-        # reset, its NaN state poisons the AMP/PPO update -> silent CUDA deadlock at a learning boundary.
+        # 非有限状态保护：物理爆炸会产生 NaN/Inf，普通高度检查捕捉不到。
+        # 这里直接终止该 env，避免污染 AMP/PPO 更新。
         nonfinite = ~(torch.isfinite(self.robot.data.root_pos_w).all(dim=1)
                       & torch.isfinite(self.robot.data.root_lin_vel_b).all(dim=1)
                       & torch.isfinite(self.robot.data.root_ang_vel_b).all(dim=1))
@@ -1399,8 +1486,7 @@ class TailiAmpEnv(DirectRLEnv):
     def _reset_idx(self, env_ids):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
-        # Terrain curriculum (terrain_levels_vel) — grade by distance walked BEFORE repositioning:
-        # walked > half a terrain tile -> harder; < half the commanded distance -> easier.
+        # 地形课程：reset 重新定位前，按 episode 内前进距离和稳定性决定升/降级。
         if self.cfg.terrain.terrain_type == "generator":
             root_xy = self.robot.data.root_pos_w[env_ids, :2]
             root_z = self.robot.data.root_pos_w[env_ids, 2]
@@ -1412,47 +1498,139 @@ class TailiAmpEnv(DirectRLEnv):
             forward_dist = torch.sum(episode_delta_xy * cmd_dir, dim=1)
             height_delta = root_z - self._episode_start_root_z[env_ids]
             valid_episode = self.episode_length_buf[env_ids] > 0
-            # TERRAIN only advances in phase >= 2 AND while not regressed (the regression guard). Frozen at the
-            # easiest level during bootstrap (phi 0) + gait-cleaning (phi 1) so those happen on near-flat ground.
-            terrain_unlocked = (self._phase >= getattr(self, "_terrain_start_phase", 5)) and self._advance_ok
-            height_gain = float(getattr(self.cfg, "terrain_curriculum_height_gain", 0.08))
-            height_loss = float(getattr(self.cfg, "terrain_curriculum_height_loss", 0.08))
-            controlled_up = (height_delta > height_gain) & (forward_dist > 0.25) & valid_episode
-            controlled_down = (height_delta < -height_loss) & (forward_dist > 0.25) & valid_episode
-            move_up = ((dist > self.cfg.terrain_move_up_dist) | controlled_up | controlled_down) & valid_episode & terrain_unlocked
-            move_down = (
-                (dist < cmd_mag * self.max_episode_length_s * 0.5)
-                & ~controlled_up
-                & ~controlled_down
-                & ~move_up
-                & valid_episode
+            # 地形只在解锁阶段且未触发回退保护时推进；bootstrap 和平地清步态阶段保持低难度。
+            terrain_curriculum_active = self._phase >= getattr(self, "_terrain_start_phase", 5)
+            terrain_unlocked = terrain_curriculum_active and self._advance_ok
+            if hasattr(self, "reset_terminated"):
+                terminal_now = self.reset_terminated[env_ids].bool()
+            else:
+                terminal_now = torch.zeros_like(valid_episode, dtype=torch.bool)
+            try:
+                base_h_local = root_z - self._terrain_height_under_base()[env_ids]
+            except Exception:
+                base_h_local = root_z - self._terrain.env_origins[env_ids, 2]
+            upright_score = (-self.robot.data.projected_gravity_b[env_ids, 2]).clamp(-1.0, 1.0)
+            if hasattr(self, "_in_contact"):
+                contact_count = self._in_contact[env_ids].sum(dim=1)
+            else:
+                contact_count = torch.full_like(root_z, 4.0)
+            body_wxy = torch.linalg.norm(self.robot.data.root_ang_vel_b[env_ids, :2], dim=1)
+            v_along = torch.sum(self.robot.data.root_lin_vel_b[env_ids, :2] * cmd_dir, dim=1)
+            self._ensure_gate_mask()
+            eligible_mask = torch.ones_like(valid_episode, dtype=torch.bool)
+            if bool(getattr(self.cfg, "terrain_curriculum_ignore_flat", True)):
+                eligible_mask = getattr(
+                    self,
+                    "_real_terrain_mask",
+                    torch.ones(self.num_envs, dtype=torch.bool, device=self.device),
+                )[env_ids]
+            if not hasattr(self, "_terrain_level_peak") or self._terrain_level_peak.shape != self._terrain.terrain_levels.shape:
+                self._terrain_level_peak = self._terrain.terrain_levels.clone()
+            if not hasattr(self, "_terrain_move_down_streak") or self._terrain_move_down_streak.shape != self._terrain.terrain_levels.shape:
+                self._terrain_move_down_streak = torch.zeros_like(self._terrain.terrain_levels)
+            if terrain_unlocked:
+                peak_next = torch.maximum(self._terrain_level_peak[env_ids], self._terrain.terrain_levels[env_ids])
+                self._terrain_level_peak[env_ids] = torch.where(
+                    eligible_mask,
+                    peak_next,
+                    self._terrain_level_peak[env_ids],
+                )
+            moves = compute_terrain_curriculum_moves(
+                dist=dist,
+                cmd_mag=cmd_mag,
+                forward_dist=forward_dist,
+                height_delta=height_delta,
+                valid_episode=valid_episode,
+                terrain_curriculum_active=bool(terrain_curriculum_active),
+                terrain_unlocked=bool(terrain_unlocked),
+                terminal_now=terminal_now,
+                base_h_local=base_h_local,
+                upright_score=upright_score,
+                contact_count=contact_count,
+                body_wxy=body_wxy,
+                v_along=v_along,
+                max_episode_length_s=float(self.max_episode_length_s),
+                terrain_move_up_dist=float(self.cfg.terrain_move_up_dist),
+                height_gain=float(getattr(self.cfg, "terrain_curriculum_height_gain", 0.08)),
+                height_loss=float(getattr(self.cfg, "terrain_curriculum_height_loss", 0.08)),
+                forward_min=float(getattr(self.cfg, "terrain_curriculum_forward_min", 0.25)),
+                stable_h=float(getattr(self.cfg, "terrain_curriculum_stable_h", 0.42)),
+                stable_upright=float(getattr(self.cfg, "terrain_curriculum_stable_upright", 0.85)),
+                stable_contact_min=float(getattr(self.cfg, "terrain_curriculum_stable_contact_min", 2.0)),
+                stable_wxy_max=float(getattr(self.cfg, "terrain_curriculum_stable_wxy_max", 1.50)),
+                speed_cap_ratio=float(getattr(self.cfg, "terrain_curriculum_speed_cap_ratio", 1.60)),
+                speed_cap_min=float(getattr(self.cfg, "terrain_curriculum_speed_cap_min", 0.75)),
+                failure_h=float(getattr(self.cfg, "terrain_curriculum_failure_h", 0.42)),
+                failure_upright=float(getattr(self.cfg, "terrain_curriculum_failure_upright", 0.75)),
+                failure_wxy=float(getattr(self.cfg, "terrain_curriculum_failure_wxy", 2.00)),
+                eligible_mask=eligible_mask,
             )
+            controlled_up = moves["controlled_up"]
+            controlled_down = moves["controlled_down"]
+            move_up = moves["move_up"]
+            move_down_low = moves["low_progress_down"]
+            failure_down = moves["failure_down"]
+            patience = max(1, int(getattr(self.cfg, "terrain_curriculum_move_down_patience", 1)))
+            if patience > 1:
+                streak = self._terrain_move_down_streak[env_ids]
+                streak = torch.where(move_down_low, streak + 1, torch.zeros_like(streak))
+                move_down_low = move_down_low & (streak >= patience)
+                streak = torch.where(move_up, torch.zeros_like(streak), streak)
+                streak = torch.where(failure_down, torch.zeros_like(streak), streak)
+                self._terrain_move_down_streak[env_ids] = streak
+            floor_after_peak = int(getattr(self.cfg, "terrain_curriculum_floor_after_peak", 0))
+            if floor_after_peak > 0 and terrain_curriculum_active:
+                level_now = self._terrain.terrain_levels[env_ids]
+                peak_drop = max(0, int(getattr(self.cfg, "terrain_curriculum_peak_drop", 0)))
+                peak_floor = torch.clamp(self._terrain_level_peak[env_ids] - peak_drop, min=floor_after_peak)
+                peaked = self._terrain_level_peak[env_ids] >= floor_after_peak
+                at_floor = level_now <= peak_floor
+                move_down_low = move_down_low & ~(peaked & at_floor)
+            move_down = move_down_low | failure_down
+            with torch.no_grad():
+                eligible_valid = valid_episode.bool() & eligible_mask.bool()
+                n = max(int(eligible_valid.float().sum().item()), 1)
+                self._terrain_curriculum_eligible_frac = float(eligible_mask.float().mean())
+                self._terrain_curriculum_move_up_rate = float(move_up.float().sum() / n)
+                self._terrain_curriculum_move_down_rate = float(move_down.float().sum() / n)
+                self._terrain_curriculum_failure_down_rate = float(failure_down.float().sum() / n)
+                self._terrain_curriculum_stable_end_rate = float(moves["stable_end"].float().sum() / n)
+                self._terrain_curriculum_speed_ok_rate = float(moves["speed_controlled"].float().sum() / n)
+                discrete_mask = getattr(
+                    self,
+                    "_discrete_terrain_mask",
+                    torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+                )[env_ids] & eligible_valid
+                dn = max(int(discrete_mask.float().sum().item()), 1)
+                self._terrain_curriculum_discrete_move_up_rate = float((move_up & discrete_mask).float().sum() / dn)
+                self._terrain_curriculum_discrete_move_down_rate = float((move_down & discrete_mask).float().sum() / dn)
+                self._terrain_curriculum_discrete_failure_down_rate = float((failure_down & discrete_mask).float().sum() / dn)
+                self._terrain_curriculum_discrete_stable_end_rate = float((moves["stable_end"] & discrete_mask).float().sum() / dn)
             self._terrain.update_env_origins(env_ids, move_up, move_down)
         self.robot.reset(env_ids)
         super()._reset_idx(env_ids)
-        # HISTORY: zero out for reset envs (fresh episode, no carryover)
+        # reset 后清空历史，避免 episode 间残留。
         self._obs_history[env_ids] = 0.0
         self._delayed_action[env_ids] = 0.0
         self._in_contact[env_ids] = 0.0
-        # DOMAIN RANDOMIZATION — level-gated. Params selected dynamically by level (supports 1/2/3).
-        # Level 3 additionally randomizes friction, base CoM, and IMU bias (the comprehensive sim2real menu).
+        self._cmd_transition_zero_frac[env_ids] = 0.5
+        self._cmd_transition_strength[env_ids] = 0.0
+        # 域随机化：按等级选择扰动参数。高等级额外扰动摩擦、base CoM 和 IMU 偏置。
         n = len(env_ids)
         lvl = self._dr_level
-        self._imu_bias[env_ids] = 0.0     # cleared here; re-drawn below only at level >= 3
+        self._imu_bias[env_ids] = 0.0     # 先清零；需要时在下方按等级重采样。
         if self.cfg.dr_enable and lvl >= 1:
             mass_range = getattr(self.cfg, f"dr_mass_range_{lvl}")
             k_range    = getattr(self.cfg, f"dr_stiffness_scale_{lvl}")
             d_range    = getattr(self.cfg, f"dr_damping_scale_{lvl}")
             try:
-                # PhysX mass is a CPU-pipeline property -> get_masses() returns a CPU tensor. The old code used a
-                # GPU delta + GPU index on it -> device mismatch -> caught -> silently skipped (mass DR was FAKE).
-                # Also it did "+= delta" on the CURRENT mass -> drift across resets. Fix: all-CPU, reset-to-default.
-                masses = self.robot.root_physx_view.get_masses()                 # (N, n_bodies) CPU
+                # PhysX 质量属性在 CPU 管线；这里全程 CPU，并先恢复默认质量再加扰动，避免跨 reset 漂移。
+                masses = self.robot.root_physx_view.get_masses()                 # (N, n_bodies)，CPU tensor。
                 if self._default_masses is None:
-                    self._default_masses = masses[:, 0].clone()                  # default root mass (CPU), once
+                    self._default_masses = masses[:, 0].clone()                  # 默认 root 质量，只缓存一次。
                 eids = env_ids.detach().cpu()
-                delta = torch.empty(n).uniform_(*mass_range)                     # CPU, matches the CPU mass tensor
-                masses[eids, 0] = self._default_masses[eids] + delta             # reset-to-default + delta (no drift)
+                delta = torch.empty(n).uniform_(*mass_range)                     # CPU，与质量 tensor 同设备。
+                masses[eids, 0] = self._default_masses[eids] + delta             # 恢复默认值后再加扰动。
                 self.robot.root_physx_view.set_masses(masses, eids)
             except Exception as e:
                 if "mass" not in self._dr_warned:
@@ -1467,22 +1645,18 @@ class TailiAmpEnv(DirectRLEnv):
             except Exception:
                 if "gain" not in self._dr_warned:
                     print("[DR] gain API unavailable; skipping stiffness/damping DR", flush=True); self._dr_warned.add("gain")
-            # ROOT-4 FIX (terrain-dr workflow 0707): friction/CoM/IMU are the deploy-critical channels for E3(μ)/E5.
-            # They USED to be gated to lvl>=3 (a rung fresh/stall-restarted runs never reach -> E3/E5 got ZERO gradient,
-            # violating spec §3.5 "DR always-on"). Now gated to a config knob dr_full_start_level (default 1) so they
-            # train from the first DR level, RAMPING the envelope per level (dr_*_range_{lvl}) so a full μ=0.4 is not
-            # dumped on a weak gait at level-1 entry.
+            # 摩擦、CoM 和 IMU 是部署关键 DR 通道；由 dr_full_start_level 控制何时打开，
+            # 并随等级逐步扩大扰动范围。
             _dr_full_lvl = int(getattr(self.cfg, "dr_full_start_level", 1))
             if lvl >= _dr_full_lvl:
-                # FRICTION + CoM: physx-view writes are EXPENSIVE (per-reset was 3.7x slower). Do them ONCE per LEVEL
-                # -- re-fire on level-up (lvl > _dr_mat_level) to WIDEN the envelope, so still only ~3 writes per run.
+                # 摩擦和 CoM 写入较贵，因此每个等级只在升级时批量写一次。
                 if lvl > self._dr_mat_level:
                     Nenv = self.num_envs
                     fr_range = getattr(self.cfg, f"dr_friction_range_{lvl}", self.cfg.dr_friction_range_3)
                     com_off  = float(getattr(self.cfg, f"dr_com_offset_{lvl}", self.cfg.dr_com_offset_3))
                     try:
                         mats = self.robot.root_physx_view.get_material_properties().clone()   # (N, n_shapes, 3)
-                        fr = torch.zeros(Nenv, 1, 1, device=mats.device).uniform_(*fr_range)  # ABSOLUTE set -> no drift
+                        fr = torch.zeros(Nenv, 1, 1, device=mats.device).uniform_(*fr_range)  # 绝对写入，避免漂移。
                         mats[:, :, 0:2] = fr.expand(-1, mats.shape[1], 2)
                         self.robot.root_physx_view.set_material_properties(
                             mats, torch.arange(Nenv, device=mats.device))
@@ -1492,8 +1666,8 @@ class TailiAmpEnv(DirectRLEnv):
                     try:
                         coms = self.robot.root_physx_view.get_coms().clone()                 # (N, n_bodies, ...)
                         if self._default_coms is None:
-                            self._default_coms = coms.clone()                                # capture default ONCE
-                        coms = self._default_coms.clone()                                    # reset-to-default -> no drift on re-fire
+                            self._default_coms = coms.clone()                                # 默认 CoM 只缓存一次。
+                        coms = self._default_coms.clone()                                    # 每次写入前恢复默认，避免漂移。
                         off = torch.zeros(Nenv, 2, device=coms.device).uniform_(-com_off, com_off)
                         coms[:, 0, 0:2] += off
                         self.robot.root_physx_view.set_coms(coms, torch.arange(Nenv, device=coms.device))
@@ -1502,14 +1676,13 @@ class TailiAmpEnv(DirectRLEnv):
                             print("[DR] CoM API unavailable; skipping CoM DR", flush=True); self._dr_warned.add("com")
                     self._dr_mat_level = lvl
                     print(f"[DR] level-{lvl} friction {list(fr_range)} + CoM ±{com_off} randomized (all envs)", flush=True)
-                # IMU BIAS stays per-episode (cheap, obs-level): constant gyro + gravity offset, per-level range
+                # IMU 偏置按 episode 重采样，属于观测层扰动。
                 gb = float(getattr(self.cfg, f"dr_imu_gyro_bias_{lvl}", self.cfg.dr_imu_gyro_bias_3))
                 vb = float(getattr(self.cfg, f"dr_imu_grav_bias_{lvl}", self.cfg.dr_imu_grav_bias_3))
                 self._imu_bias[env_ids, 0:3] = torch.zeros(n, 3, device=self.device).uniform_(-gb, gb)
                 self._imu_bias[env_ids, 3:6] = torch.zeros(n, 3, device=self.device).uniform_(-vb, vb)
         num = len(env_ids)
-        # reorder (user-confirmed): 1) sample command, 2) pick the matching clip (command + terrain),
-        # 3) sample the initial pose FROM that clip -> reset pose is coherent with command + terrain.
+        # reset 顺序：先采样命令，再按命令和地形选择 clip，最后从该 clip 采样初始姿态。
         self._resample_commands(env_ids, snap=True)
         tctx_arg = self._terrain_ctx[env_ids] if self.cfg.terrain_ctx_dim > 0 else None
         clip_ids = self._motion_loader.pick_clips(self.commands[env_ids], tctx_arg)
@@ -1528,48 +1701,46 @@ class TailiAmpEnv(DirectRLEnv):
         self.robot.write_root_com_velocity_to_sim(root[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(jp, jv, None, env_ids)
         self.last_actions[env_ids] = 0.0
-        self._gait_phase[env_ids] = torch.rand(len(env_ids), device=self.device)   # phase diversity across envs
+        self._gait_phase[env_ids] = torch.rand(len(env_ids), device=self.device)   # 打散 env 间步态相位。
         self._episode_start_xy[env_ids] = root[:, 0:2].detach()
         self._episode_start_root_z[env_ids] = root[:, 2].detach()
         self._episode_start_cmd_xy[env_ids] = self.commands[env_ids, :2].detach()
+        self._cmd_heading_ref[env_ids] = _yaw_from_quat_w(root[:, 3:7]).detach()
+        self._heading_error[env_ids] = 0.0
 
     def _push_strided_amp(self, amp):
-        """AMP STRIDE WINDOW policy side: push the newest raw frame into the deep adjacent-frame ring, then
-        export a stride-subsampled window [t, t-stride, t-2*stride, ...] into amp_observation_buffer so the
-        discriminator sees ~one gait period. Called only when _amp_frame_stride > 1."""
+        """策略侧 AMP stride 窗口。
+
+        先把最新原始帧写入深环形缓冲，再按 stride 导出 [t, t-stride, ...]，
+        让判别器看到约一个步态周期。仅在 _amp_frame_stride > 1 时调用。
+        """
         r = self._amp_raw_ring
-        r[:, 1:] = r[:, :-1].clone()      # FIFO shift oldest-out (clone avoids in-place aliasing)
+        r[:, 1:] = r[:, :-1].clone()      # FIFO 移位；clone 避免原地别名问题。
         r[:, 0] = amp
         stride = self._amp_frame_stride
         for j in range(self.cfg.num_amp_observations):
             self.amp_observation_buffer[:, j] = r[:, j * stride]
 
     def collect_reference_motions(self, num_samples, current_times=None):
-        # PARAMETRIC reference: analytic flat trot computed CONTINUOUSLY from each sample's command (step
-        # frequency + stride scale with the command, same speed-adaptive period as the env gait clock) — no
-        # discrete clips, no coverage gaps. Validated to reproduce the clip kinematics to <3e-4 (parametric_ref).
-        # Sampled from the live rollout commands + their terrain_ctx, so the conditional discriminator's
-        # context channels (terrain_ctx, command) match the policy side by construction.
+        # 解析参考：根据当前命令连续生成小跑参考，步频和步幅随命令缩放。
+        # 参考采样使用实时 rollout 命令和 terrain_ctx，使判别器条件与策略侧一致。
         K = self.cfg.num_amp_observations
         env_sel = torch.randint(0, self.num_envs, (num_samples,), device=self.device)
         cmd_s = self.commands[env_sel]                                             # (num_samples, 3)
         if current_times is None:
             current_times = np.random.uniform(0.0, 2.0, num_samples).astype(np.float32)
-        _stride = getattr(self, "_amp_frame_stride", 1)                                       # AMP STRIDE WINDOW: space
-        times = (np.expand_dims(current_times, -1) - (1.0 / 50.0) * _stride * np.arange(K)).flatten()  # ref frames by stride
+        _stride = getattr(self, "_amp_frame_stride", 1)                                       # AMP stride 间隔。
+        times = (np.expand_dims(current_times, -1) - (1.0 / 50.0) * _stride * np.arange(K)).flatten()  # 按 stride 取参考帧。
         times_t = torch.as_tensor(times, dtype=torch.float32, device=self.device)
         cmd_rep = cmd_s.repeat_interleave(K, dim=0)                                # (num_samples*K, 3)
-        # TERRAIN-AWARE reference: pass each sampled env's roughness so the reference lifts higher on rough
-        # terrain -> the conditional discriminator rewards a high-lift climbing style (not flat shuffle).
+        # 地形感知参考：传入粗糙度，使粗糙地形参考轨迹抬脚更高。
         rough_rep = None
         if self.cfg.terrain_ctx_dim >= 3:
             rough_rep = self._terrain_ctx[env_sel, 2].repeat_interleave(K, dim=0)  # (num_samples*K,)
         jp_clip, jv_clip, bh, tn, foot_rel = flat_reference(
             cmd_rep, times_t, gait_period=self.cfg.gait_period,
             gait_period_slope=self.cfg.gait_period_slope, gait_period_min=self.cfg.gait_period_min,
-            clearance_base=self.cfg.base_clearance,        # 0.07 (was default 0.09): lower FLAT foot lift -> the
-                                                           # flat gait is less "high"/wasteful (user feedback); the
-                                                           # roughness term still raises the lift on rough terrain.
+            clearance_base=self.cfg.base_clearance,        # 平地保持较低摆腿，粗糙度项仍会提高地形抬脚。
             roughness=rough_rep, clearance_rough_gain=self.cfg.ref_clearance_rough_gain,
             stance_dx=self.cfg.stance_dx)                  # wider fore-aft stance (blind config 0.05); base 0.0
         jp = jp_clip[:, self.motion_dof_indexes]                                   # clip dof order -> robot order

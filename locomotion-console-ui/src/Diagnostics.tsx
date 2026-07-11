@@ -29,7 +29,8 @@ const DEFAULT_LOG_FIELDS = [
   "command.actual_vx",
   "command.lin_err",
   "command.stance_slip_high_fraction",
-  "curriculum.terrain_mean",
+  "curriculum.terrain_real_mean",
+  "curriculum.terrain_discrete_mean",
   "curriculum.progress_gate",
   "health.fall_rate",
 ];
@@ -407,10 +408,11 @@ function PlanControls({
   const updateTerrainType = (index: number, type: string) => {
     const terrain = terrains[index];
     const params = terrain?.params ?? {};
+    const stepHeight = numberParam(params.step_height, 0.18);
     if (type === "stairs_up") {
-      updateTerrain(index, { type, params: { ...params, direction: "up" } });
+      updateTerrain(index, { type, params: { ...params, direction: "up", step_height: stepHeight } });
     } else if (type === "stairs_down") {
-      updateTerrain(index, { type, params: { ...params, direction: "down" } });
+      updateTerrain(index, { type, params: { ...params, direction: "down", step_height: stepHeight } });
     } else {
       updateTerrain(index, { type });
     }
@@ -435,6 +437,11 @@ function PlanControls({
           <span>环境数量</span>
           <input type="number" min={1} max={64} step={1} value={plan.num_envs ?? 1}
                  onChange={(event) => updatePlan({ num_envs: clampIntInput(event.currentTarget.value, 1, 64, 1) })} />
+        </label>
+        <label>
+          <span>课程 phase</span>
+          <input type="number" min={0} max={9} step={1} value={plan.init_phase ?? 0}
+                 onChange={(event) => updatePlan({ init_phase: clampIntInput(event.currentTarget.value, 0, 9, 0) })} />
         </label>
         <label>
           <span>记录频率 Hz</span>
@@ -640,12 +647,16 @@ function normalizeDraft(plan: Partial<DiagnosticPlan> | null | undefined): Parti
   const cloned = JSON.parse(JSON.stringify(plan)) as Partial<DiagnosticPlan>;
   if (Array.isArray(cloned.terrains)) {
     cloned.terrains = cloned.terrains.map((terrain) => {
-      if (terrain.type !== "stairs") return terrain;
+      if (terrain.type !== "stairs" && terrain.type !== "stairs_up" && terrain.type !== "stairs_down") return terrain;
       const direction = stringParam(terrain.params?.direction, "up");
       return {
         ...terrain,
-        type: direction === "down" ? "stairs_down" : "stairs_up",
-        params: { ...(terrain.params ?? {}), direction: direction === "down" ? "down" : "up" },
+        type: direction === "down" || terrain.type === "stairs_down" ? "stairs_down" : "stairs_up",
+        params: {
+          ...(terrain.params ?? {}),
+          direction: direction === "down" || terrain.type === "stairs_down" ? "down" : "up",
+          step_height: numberParam(terrain.params?.step_height, 0.18),
+        },
       };
     });
   }
@@ -670,6 +681,7 @@ function summarizePlan(plan: Partial<DiagnosticPlan> | null): Array<[string, str
   return [
     ["模板", String(plan.template || "无")],
     ["环境数量", String(plan.num_envs ?? 1)],
+    ["课程 phase", `phi${String(plan.init_phase ?? 0)}`],
     ["命令数", String(plan.commands?.length ?? 0)],
     ["地形", (plan.terrains ?? []).map((item) => `${item.type}:${item.level}`).join(", ") || "无"],
     ["DR", (plan.dr_cases ?? []).map((item) => item.label || `DR${item.level}`).join(", ") || "无"],
@@ -819,7 +831,7 @@ function buildLogOptions(telemetry: TrainingTelemetry | null): ChartOption[] {
     }
   }
   return options
-    .filter((item) => countNumbers(item.values) > 1 && hasSignal(item.values))
+    .filter((item) => countNumbers(item.values) > 1)
     .sort((a, b) => rankField(a.key) - rankField(b.key) || a.label.localeCompare(b.label));
 }
 
@@ -863,6 +875,27 @@ function labelForField(key: string, fallbackGroup: string) {
     "curriculum.progress_gate": "课程推进 gate",
     "curriculum.terrain_mean": "平均地形等级",
     "curriculum.terrain_max": "最高地形等级",
+    "curriculum.terrain_real_mean": "真实地形均值",
+    "curriculum.terrain_real_max": "真实地形最高",
+    "curriculum.terrain_discrete_mean": "离散地形均值",
+    "curriculum.terrain_discrete_max": "离散地形最高",
+    "curriculum.terrain_discrete_move_up_rate": "离散地形升级率",
+    "curriculum.terrain_discrete_move_down_rate": "离散地形降级率",
+    "curriculum.terrain_discrete_failure_down_rate": "离散地形失败降级率",
+    "curriculum.terrain_discrete_stable_end_rate": "离散地形稳定结束率",
+    "reward.terrain_probe_contact_event_mean": "地形接触事件",
+    "reward.terrain_probe_contact_latch_mean": "地形接触锁存",
+    "reward.terrain_probe_event_scope_mean": "地形事件范围",
+    "reward.terrain_probe_up_active_mean": "上行激活",
+    "reward.terrain_probe_down_active_mean": "下行激活",
+    "reward.terrain_support_transfer": "地形支撑转移",
+    "reward.terrain_contact_quality": "地形接触质量",
+    "reward.terrain_event_collapse": "地形碰撞塌陷",
+    "reward.base_wxy": "机身横滚/俯仰角速度",
+    "reward.landing_impact": "落地冲击",
+    "reward.touchdown_slip": "触地滑移",
+    "command.transition_active_frac": "过渡占比",
+    "command.transition_strength": "过渡强度",
     "health.fall_rate": "摔倒率",
     "health.base_h": "机身高度",
     "health.tilt_deg": "倾角",
@@ -916,13 +949,6 @@ function normalizeSeries(values: Array<number | null>) {
   const span = max - min;
   if (!Number.isFinite(span) || span < 1e-12) return values.map((value) => value == null ? null : 0.5);
   return values.map((value) => value == null ? null : (value - min) / span);
-}
-
-function hasSignal(values: Array<number | null>) {
-  const numbers = values.filter(isNumber);
-  if (numbers.length < 2) return false;
-  const first = numbers[0];
-  return numbers.some((value) => Math.abs(value - first) > 1e-9);
 }
 
 function countNumbers(values: Array<number | null>) {

@@ -1,0 +1,54 @@
+{
+  "_note": "Agent evaluation cases. A-class = factual, gold answer derived from code (cited). B-class = no known gold answer, but a recognizable-wrong pattern is asserted. Scoring is substring-based and deliberately lenient; it is a tripwire, not a grader.",
+  "cases": [
+    {
+      "id": "A1_gate_values",
+      "class": "A",
+      "question": "当前课程各阶段门控的具体阈值是多少？",
+      "source": "autotuner/blind_locomotion/taili_amp_env_cfg.py:226-233 ; taili_amp_env.py:939",
+      "gold_summary": "phi0→phi1 方向progress最小值≥0.60；phi1→phi2≥0.70；phi2→phi3 progress≥0.50、平均地形等级≥6.0、摔倒率≤0.05；且都要求 penalty_gate 已到 1.0 并连续 phase_intervals 次满足。slip_1=0.20 为历史字段已不作门控。",
+      "gold_facts": ["0.60", "0.70", "0.50", "6.0", "0.05"]
+    },
+    {
+      "id": "A2_penalty_ramp",
+      "class": "A",
+      "question": "惩罚渐入（penalty_gate）是怎么算的？",
+      "source": "autotuner/blind_locomotion/taili_amp_env.py:214,878-884 ; taili_amp_env_cfg.py:225",
+      "gold_summary": "penalty_gate 是 0→1 的线性渐入：每次课程更新 step = 1/penalty_ramp_intervals（配置里 penalty_ramp_intervals=25，即每步+0.04），达标继续加、回退则减，封顶 1.0；phase≥1 时直接自举为 1.0。它按比例混合质量惩罚强度（如 lift_gate=(1-pg)+pg*lift_w），避免早期 critic 冲击。",
+      "gold_facts": ["penalty_ramp_intervals", "1.0", "线性", "渐入"]
+    },
+    {
+      "id": "A3_actual_vx",
+      "class": "A",
+      "question": "actual_vx 是怎么算出来的？",
+      "source": "autotuner/blind_locomotion/blind_tp_env.py:1427",
+      "gold_summary": "actual_vx = 机身坐标系下基座线速度的前向(x)分量，对所有并行环境取均值：float(vb[:,0].mean())。它是实测前进速度，用于和命令速度 cmd_vx 对比。",
+      "gold_facts": ["x", "均值", "机身", "线速度"]
+    },
+    {
+      "id": "A4_terrain_progression",
+      "class": "A",
+      "question": "地形推进（课程升降级）的策略是怎样的？",
+      "source": "autotuner/taili_core/terrain_curriculum.py:13-135",
+      "gold_summary": "逐环境升降级：升级需要一次“稳定通过”——要么走够距离(dist>terrain_move_up_dist)、要么有受控的高度上下变化，且结尾状态稳定（直立、基座高度够、足接触够、机身角速度低）并速度受控。摔倒/终止/失稳=立即降级；走得比预期少也降级。地形仅在 terrain_start_phase 之后启用。单纯高度变化不算成功，冲下楼梯会判为失败。",
+      "gold_facts": ["稳定", "升级", "降级", "terrain_start_phase"]
+    },
+    {
+      "id": "A5_stair_height_level3",
+      "class": "A",
+      "question": "地形等级 3 对应的楼梯台阶高度是多少？",
+      "source": "autotuner/blind_locomotion/taili_amp_env_cfg.py:17-37 (num_rows=10, 两个楼梯子地形 step_height_range=(0.05,0.15) 与 (0.08,0.30))",
+      "gold_summary": "地形共 num_rows=10 个难度等级(0..9)，台阶高度随难度在各自区间内插值。等级3 → 难度 3/9≈0.333：矮楼梯子地形≈0.05+0.333*(0.15-0.05)≈0.083 m；高楼梯子地形≈0.08+0.333*(0.30-0.08)≈0.153 m。不是单一数值，取决于是哪种楼梯子地形。",
+      "gold_facts": ["10", "0.05", "0.15", "0.08", "0.30"]
+    },
+    {
+      "id": "B1_tuning_step_fraction",
+      "class": "B",
+      "question": "现在训练到 15000/1500000 步，接下来的调参策略应该怎么定？",
+      "source": "negative test",
+      "reject_if_any": ["还早", "还很早", "太早", "才刚开始", "0%", "1%", "占比很低", "步数太少"],
+      "expect_any": ["phase", "阶段", "gate", "门控", "progress_gate", "blocked_by", "阻塞", "证据"],
+      "rationale": "用步数占比(15000/1500000)判断“还早”是错位：进度由课程阶段/门控决定，不由绝对步数比例决定。好的回答应落到当前阶段、门控差距或阻塞项上，而不是步数百分比。"
+    }
+  ]
+}

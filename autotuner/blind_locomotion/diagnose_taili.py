@@ -172,6 +172,21 @@ def _clean_push_events(pushes: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _enrich_metrics_with_suite(metrics_path: Path, suite: dict[str, Any]) -> None:
     try:
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -458,6 +473,7 @@ def _build_columns(n_joints: int = 12, legs: list[str] | None = None) -> list[st
         "dr_level_requested", "dr_level",
         "capture_stage", "terminal_state_available", "post_step_state_may_be_after_reset", "transition_done_after_action",
         "terminated", "truncated", "done", "reset_observed",
+        "would_terminate", "would_reset", "diagnostic_reset_suppressed", "termination_height",
         "cmd_target_vx", "cmd_target_vy", "cmd_target_wz", "cmd_target_mode",
         "cmd_vx", "cmd_vy", "cmd_wz", "cmd_mode", "cmd_segment_id", "time_since_command_switch",
         "push_event", "push_vector_x", "push_vector_y", "push_vector_z", "push_equivalent_delta_v",
@@ -523,6 +539,7 @@ def _rows_from_state(
     terrain_level_requested: int = 0,
     dr_case: dict[str, Any] | None = None,
     push_event: dict[str, Any] | None = None,
+    suppress_strict_reset: bool = False,
 ) -> list[dict[str, Any]]:
     import math
     import numpy as np
@@ -595,6 +612,20 @@ def _rows_from_state(
     for env_id in range(base.num_envs):
         terrain_type, terrain_level = _terrain_identity(base, env_id)
         terrain_h, terrain_source = _terrain_height(base, env_id, root_pos[env_id, 0], root_pos[env_id, 1])
+        base_height_local = float(root_pos[env_id, 2]) - terrain_h
+        termination_height = float(getattr(base.cfg, "termination_height", float("nan")))
+        finite_root = bool(
+            np.isfinite(root_pos[env_id]).all()
+            and np.isfinite(root_lin[env_id]).all()
+            and np.isfinite(root_ang[env_id]).all()
+        )
+        would_terminate_height = (
+            np.isfinite(base_height_local)
+            and np.isfinite(termination_height)
+            and base_height_local < termination_height
+        )
+        would_terminate = bool(would_terminate_height or (not finite_root))
+        would_reset = bool(would_terminate or truncated[env_id])
         cmd = command[env_id]
         row: dict[str, Any] = {
             "run_id": f"case_{case_id}",
@@ -623,6 +654,10 @@ def _rows_from_state(
             "truncated": int(truncated[env_id]),
             "done": int(done[env_id]),
             "reset_observed": int(done[env_id]),
+            "would_terminate": int(would_terminate),
+            "would_reset": int(would_reset),
+            "diagnostic_reset_suppressed": int(bool(suppress_strict_reset and would_terminate and not done[env_id])),
+            "termination_height": termination_height,
             "cmd_target_vx": float(target_np[0]),
             "cmd_target_vy": float(target_np[1]),
             "cmd_target_wz": float(target_np[2]),
@@ -642,7 +677,7 @@ def _rows_from_state(
             "base_pos_w_y": float(root_pos[env_id, 1]),
             "base_pos_w_z": float(root_pos[env_id, 2]),
             "base_terrain_height": terrain_h,
-            "base_height_local": float(root_pos[env_id, 2]) - terrain_h,
+            "base_height_local": base_height_local,
             "base_quat_w": float(root_quat[env_id, 0]),
             "base_quat_x": float(root_quat[env_id, 1]),
             "base_quat_y": float(root_quat[env_id, 2]),
@@ -726,6 +761,16 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
     import taili_blind_runtime  # noqa: F401 - register task and skrl policy component
 
     suite = _load_yaml(args.suite)
+    init_phase = int(float(suite.get("init_phase", os.environ.get("TAILI_INIT_PHASE", 0)) or 0))
+    os.environ["TAILI_INIT_PHASE"] = str(max(0, min(9, init_phase)))
+    print(f"[TAILI_DIAG] init_phase={os.environ['TAILI_INIT_PHASE']}", flush=True)
+    strict_reset = _as_bool(
+        suite.get("diagnostic_strict_reset", suite.get("strict_reset", os.environ.get("TAILI_DIAG_STRICT_RESET"))),
+        default=False,
+    )
+    suppress_strict_reset = not strict_reset
+    reset_policy_note = "training_strict_reset" if strict_reset else "observe_past_height_termination"
+    print(f"[TAILI_DIAG] diagnostic_reset_policy={reset_policy_note}", flush=True)
     commands = [_clean_command(cmd) for cmd in (suite.get("commands") or [])]
     if not commands:
         commands = [_clean_command({"mode": "stand", "duration": 1.0})]
@@ -743,7 +788,7 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
 
     total_cases = max(1, len(terrains) * len(dr_cases))
     meta_base = {
-        "schema_version": "ilqd_observation_record_v0.5.1",
+        "schema_version": "ilqd_observation_record_v0.5.2",
         "task": args.task,
         "checkpoint": args.checkpoint,
         "suite_path": args.suite,
@@ -752,6 +797,9 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
             "cases": [],
             "record_capture": "post_step_terminal_safe",
             "reset_initialization": "command_start",
+            "diagnostic_reset_policy": reset_policy_note,
+            "diagnostic_strict_reset": strict_reset,
+            "height_termination_recorded_as": "would_terminate",
             "payload_local": True,
             "terrain_runtime_note": (
                 "Each requested terrain is executed in its own IsaacLab environment so terrain generator settings "
@@ -762,6 +810,11 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
         "recording_notes": [
             "payload-local Taili diagnostic; no robot_lab imports",
             "policy action uses mean_actions when available",
+            (
+                "diagnostic suppresses training height termination and records would_terminate/diagnostic_reset_suppressed"
+                if suppress_strict_reset
+                else "diagnostic uses training-strict reset behavior"
+            ),
         ],
         "semantics": "Observation-only. No pass/fail labels are emitted by the recorder.",
     }
@@ -794,6 +847,8 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
             terrain_level_requested = int(terrain.get("level", 0) or 0)
             env_cfg = parse_env_cfg(args.task, device=args.device, num_envs=num_envs)
             terrain_effective = _configure_terrain(env_cfg, terrain)
+            if suppress_strict_reset and hasattr(env_cfg, "early_termination"):
+                env_cfg.early_termination = False
             if hasattr(env_cfg, "reset_strategy"):
                 env_cfg.reset_strategy = "start"
             _progress(out_dir, stage="gym_make", rows_written=rows_written, active_terrain=terrain_requested)
@@ -802,6 +857,8 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
                 _progress(out_dir, stage="skrl_wrapper", rows_written=rows_written, active_terrain=terrain_requested)
                 env = SkrlVecEnvWrapper(env, ml_framework="torch")
                 base = env.unwrapped
+                if suppress_strict_reset and hasattr(base.cfg, "early_termination"):
+                    base.cfg.early_termination = False
                 if hasattr(base, "use_external_commands"):
                     base.use_external_commands = True
                 _progress(out_dir, stage="build_runner", rows_written=rows_written, active_terrain=terrain_requested)
@@ -923,6 +980,7 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
                                 terrain_level_requested=terrain_level_requested,
                                 dr_case=dr_case,
                                 push_event=active_push,
+                                suppress_strict_reset=suppress_strict_reset,
                             )
                             for row in rows:
                                 writer.writerow(row)

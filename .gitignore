@@ -51,6 +51,7 @@ events.out.tfevents.*
 # ── large immutable training-payload build snapshots ─────────────────────────
 autotuner/training_payloads/**/.build/
 autotuner/training_payloads/**/dist/*.tar.gz
+autotuner/training_payloads/**/archive/
 strategy_backups/**/remote/
 strategy_backups/**/*.tar.gz
 strategy_backups/

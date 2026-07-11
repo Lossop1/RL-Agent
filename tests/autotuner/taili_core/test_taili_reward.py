@@ -12,7 +12,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from autotuner.taili_core.taili_reward import RewardConfig, compute_reward_components
+from autotuner.taili_core.taili_reward import (
+    REWARD_GROUP_NAMES,
+    RewardConfig,
+    compute_reward_components,
+    group_reward_vector,
+)
 
 
 def make_inp(n=2, **over):
@@ -137,6 +142,17 @@ def test_collapse_gate_zeroes_posture_penalties():
     assert float(collapsed["base_vz"].mean()) == 0.0
     assert float(collapsed["base_wxy"].mean()) == 0.0
     assert float(collapsed["hip_deviation"].mean()) == 0.0
+
+
+def test_terrain_event_collapse_routes_to_stability_group():
+    comp = {
+        "terrain_event_collapse": torch.tensor([-1.0, -2.0]),
+        "total": torch.zeros(2),
+    }
+    grouped = group_reward_vector(comp)
+    stab_col = REWARD_GROUP_NAMES.index("stab")
+    assert torch.allclose(grouped[:, stab_col], comp["terrain_event_collapse"])
+    assert torch.allclose(grouped.sum(dim=1), comp["terrain_event_collapse"])
 
 
 # ── A2 yaw is gated on a real yaw command (no standing bonus) ────────────────────────────

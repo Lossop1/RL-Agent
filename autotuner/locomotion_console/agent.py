@@ -14,9 +14,16 @@ training silently.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 from typing import Any, Dict, List
+
+# The ReAct loop is mostly cheap decisions ("which tool next?") that do NOT need the
+# expensive reasoning model. Measured: fast model + the curriculum facts card holds 100%
+# factual accuracy at ~2-4s/call vs 25-100s on the pro model. Route the loop to the fast
+# model; set LOCOMOTION_CONSOLE_LOOP_MODEL="" to fall back to the config model (pro).
+_LOOP_MODEL = os.environ.get("LOCOMOTION_CONSOLE_LOOP_MODEL", "deepseek-v4-flash") or None
 
 # LLM-supplied identifiers that reach a remote shell must match this before use. repr()/f-string
 # interpolation is NOT shell-safe (a value with a single quote makes repr emit a double-quoted
@@ -2102,6 +2109,18 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
         if slash is not None:
             return slash
     transcript: List[Dict[str, Any]] = []
+    # Always-present, code-derived facts card (gate thresholds, penalty ramp, actual_vx, terrain
+    # progression/levels). Lets the agent answer factual questions correctly WITHOUT spending a tool
+    # hop, and steers it off the step-fraction "还早" fallacy. Best-effort; must never break the loop.
+    try:
+        from .curriculum_facts import build_facts_card
+        transcript.append({
+            "tool": "curriculum_facts",
+            "args": {},
+            "result": {"facts_card": build_facts_card()},
+        })
+    except Exception:  # noqa: BLE001
+        pass
     if preload_operator_context:
         try:
             result = _tool_get_evidence_context(
@@ -2125,7 +2144,8 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
     executed_count = 0
     for _ in range(max_steps):
         user_prompt = _render(message, transcript, history or [])
-        resp = call_llm_with_schema(_SYSTEM, user_prompt, schema_name="locomotion_console_agent")
+        resp = call_llm_with_schema(_SYSTEM, user_prompt, schema_name="locomotion_console_agent",
+                                    model=_LOOP_MODEL)
         if not resp or not resp.parsed:
             err = resp.error if resp else "no response"
             return {"reply": f"(LLM unavailable: {err})", "transcript": transcript,
@@ -2147,10 +2167,12 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
             return {"reply": d.get("reply", f"Confirm {pa['name']}?"),
                     "proposed_action": {"name": pa["name"], "args": args_a},
                     "executed_actions": executed_actions,
-                    "transcript": transcript, "steps": len(transcript)}
+                    "transcript": transcript, "steps": len(transcript),
+                    "reasoning": resp.reasoning}
         if d.get("reply"):
             return {"reply": d["reply"], "executed_actions": executed_actions,
-                    "transcript": transcript, "steps": len(transcript)}
+                    "transcript": transcript, "steps": len(transcript),
+                    "reasoning": resp.reasoning}
         tool = d.get("tool")
         args = d.get("args") or {}
         if tool in TOOLS:
@@ -2311,6 +2333,8 @@ def _render(message: str, transcript: List[Dict[str, Any]],
 
 
 def _tool_result_budget(tool: str) -> int:
+    if tool == "curriculum_facts":
+        return 2000
     if tool == "get_evidence_context":
         return 9000
     if tool in {"get_operator_context", "get_diagnostic_report"}:
