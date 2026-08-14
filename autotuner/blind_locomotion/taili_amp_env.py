@@ -1,7 +1,19 @@
-# Taili 四足 AMP 运动环境：任务是速度跟踪，AMP 提供小跑风格约束。
+"""Taili AMP 基础运动环境。
+
+职责边界：
+- 管理 IsaacLab 场景、机器人资产、传感器、地形、动作延迟、扰动和 reset 基础流程。
+- 管理命令采样、命令过渡、gait phase、AMP 观测缓冲和参考动作采样。
+- 管理 phase gate、terrain curriculum、DR curriculum 和训练日志。
+- 提供基础 AMP 奖励路径；盲态运行时由 TailiBlindTPEnv 覆盖观测、奖励和结构化遥测。
+
+注意：不要只看本文件判断盲态训练的最终奖励。当前 payload 的盲态任务入口会使用
+TailiBlindTPEnv，它继承本类并覆盖关键训练语义。
+"""
 from __future__ import annotations
 import math
 import os
+import json
+from pathlib import Path
 import gymnasium as gym
 import numpy as np
 import torch
@@ -21,6 +33,32 @@ except ImportError:
         from autotuner.taili_core.terrain_curriculum import compute_terrain_curriculum_moves
     except ImportError:
         from taili_core.terrain_curriculum import compute_terrain_curriculum_moves
+try:
+    from .taili_core import taili_amp_reference, taili_geometry
+except ImportError:
+    try:
+        from autotuner.taili_core import taili_amp_reference, taili_geometry
+    except ImportError:
+        from taili_core import taili_amp_reference, taili_geometry
+try:
+    from .taili_core.taili_reward import (
+        transition_motion_fault,
+        transition_support_phase_ready,
+        update_transition_failure_ema,
+    )
+except ImportError:
+    try:
+        from autotuner.taili_core.taili_reward import (
+            transition_motion_fault,
+            transition_support_phase_ready,
+            update_transition_failure_ema,
+        )
+    except ImportError:
+        from taili_core.taili_reward import (
+            transition_motion_fault,
+            transition_support_phase_ready,
+            update_transition_failure_ema,
+        )
 try:
     from .taili_blind_config import active_direction_progress, phase_command_spec
 except ImportError:  # 本地源码布局下 env_edit 可能多嵌套一级。
@@ -48,6 +86,123 @@ def _sample_uniform(n: int, lo: float, hi: float, device) -> torch.Tensor:
     lo = float(lo)
     hi = max(float(hi), lo)
     return torch.rand(n, device=device) * (hi - lo) + lo
+
+
+def _sample_range_value(n: int, lo: float, hi, device) -> torch.Tensor:
+    if torch.is_tensor(hi):
+        return torch.rand(n, device=device) * (hi - float(lo)).clamp(min=0.0) + float(lo)
+    return _sample_uniform(n, lo, hi, device)
+
+
+def _sample_core_full_mixture(
+    n: int,
+    full_lo: float,
+    full_hi,
+    core_range,
+    core_fraction: float,
+    device,
+) -> torch.Tensor:
+    """按固定比例混合已验证核心区间和完整区间，不改变最终速度包络。"""
+    full = _sample_range_value(n, full_lo, full_hi, device)
+    fraction = min(max(float(core_fraction), 0.0), 1.0)
+    if fraction <= 0.0:
+        return full
+    try:
+        core_lo, core_hi = (float(core_range[0]), float(core_range[1]))
+    except (TypeError, ValueError, IndexError):
+        return full
+
+    core_lo = max(float(full_lo), core_lo)
+    core_hi = max(core_lo, core_hi)
+    if torch.is_tensor(full_hi):
+        full_hi_t = full_hi.to(device=device)
+        core_lo_t = torch.minimum(torch.full_like(full_hi_t, core_lo), full_hi_t)
+        core_hi_t = torch.minimum(torch.full_like(full_hi_t, core_hi), full_hi_t)
+        core_hi_t = torch.maximum(core_hi_t, core_lo_t)
+        core = torch.rand(n, device=device) * (core_hi_t - core_lo_t) + core_lo_t
+    else:
+        bounded_hi = min(core_hi, max(float(full_hi), float(full_lo)))
+        bounded_lo = min(core_lo, bounded_hi)
+        core = _sample_uniform(n, bounded_lo, bounded_hi, device)
+    return torch.where(torch.rand(n, device=device) < fraction, core, full)
+
+
+def _sample_bucketed_commands(
+    n: int,
+    device,
+    spec: dict,
+    ranges: tuple[tuple[float, object], tuple[float, object], tuple[float, object], tuple[float, object]],
+    sample_value=None,
+) -> torch.Tensor | None:
+    raw = spec.get("bucket_probs") if isinstance(spec, dict) else None
+    if not hasattr(raw, "items"):
+        return None
+
+    names = ("stand", "near_zero", "fwd", "back", "lat", "yaw", "linear_yaw", "lat_yaw", "mixed_linear")
+    weights = torch.tensor([max(0.0, _spec_float(raw, name, 0.0)) for name in names], device=device)
+    if float(weights.sum()) <= 1e-9:
+        return None
+
+    f_range, b_range, l_range, y_range = ranges
+    f_lo, f_hi = f_range
+    b_lo, b_hi = b_range
+    l_lo, l_hi = l_range
+    y_lo, y_hi = y_range
+    target = torch.zeros((n, 3), device=device)
+
+    def _value(name: str, lo: float, hi) -> torch.Tensor:
+        if callable(sample_value):
+            return sample_value(name, lo, hi)
+        return _sample_range_value(n, lo, hi, device)
+
+    u = torch.rand(n, device=device) * weights.sum()
+    masks: dict[str, torch.Tensor] = {}
+    start = torch.zeros((), device=device)
+    for idx, name in enumerate(names):
+        end = start + weights[idx]
+        masks[name] = (u >= start) & (u < end)
+        start = end
+    false = torch.zeros(n, device=device, dtype=torch.bool)
+
+    def _signed_lat() -> torch.Tensor:
+        sign = torch.where(torch.rand(n, device=device) < 0.5, torch.ones(n, device=device), -torch.ones(n, device=device))
+        return sign * _value("lat", l_lo, l_hi)
+
+    def _signed_yaw() -> torch.Tensor:
+        sign = torch.where(torch.rand(n, device=device) < 0.5, torch.ones(n, device=device), -torch.ones(n, device=device))
+        return sign * _value("yaw", y_lo, y_hi)
+
+    def _signed_x() -> torch.Tensor:
+        p_fwd = max(0.0, _spec_float(spec, "prob_fwd", 0.5))
+        p_back = max(0.0, _spec_float(spec, "prob_back", 0.5))
+        is_fwd = torch.rand(n, device=device) < (p_fwd / max(1e-9, p_fwd + p_back))
+        return torch.where(
+            is_fwd,
+            _value("fwd", f_lo, f_hi),
+            -_value("back", b_lo, b_hi),
+        )
+
+    fwd = masks.get("fwd", false)
+    back = masks.get("back", false)
+    lat = masks.get("lat", false)
+    yaw = masks.get("yaw", false)
+    linear_yaw = masks.get("linear_yaw", false)
+    lat_yaw = masks.get("lat_yaw", false)
+    mixed_linear = masks.get("mixed_linear", false)
+    near_zero = masks.get("near_zero", false)
+
+    target[:, 0] = torch.where(fwd, _value("fwd", f_lo, f_hi), target[:, 0])
+    target[:, 0] = torch.where(back, -_value("back", b_lo, b_hi), target[:, 0])
+    target[:, 1] = torch.where(lat, _signed_lat(), target[:, 1])
+    target[:, 2] = torch.where(yaw, _signed_yaw(), target[:, 2])
+
+    target[:, 0] = torch.where(linear_yaw | mixed_linear, _signed_x(), target[:, 0])
+    target[:, 1] = torch.where(lat_yaw | mixed_linear, _signed_lat(), target[:, 1])
+    target[:, 2] = torch.where(linear_yaw | lat_yaw, _signed_yaw(), target[:, 2])
+
+    nz_scale = _spec_float(spec, "near_zero_scale", 0.05)
+    near_noise = (torch.rand((n, 3), device=device) * 2.0 - 1.0) * nz_scale
+    return torch.where(near_zero[:, None], near_noise, target)
 
 
 def _command_xy_world_from_root_yaw(root_quat_w: torch.Tensor, command_xy: torch.Tensor) -> torch.Tensor:
@@ -96,14 +251,20 @@ class TailiAmpEnv(DirectRLEnv):
         self.motion_dof_indexes = self._motion_loader.get_dof_index(self.robot.data.joint_names)
         self.motion_ref_body_index = self._motion_loader.get_body_index([self.cfg.reference_body])[0]
         self.motion_foot_indexes = self._motion_loader.get_body_index(self.cfg.foot_body_names)
+        self._motion_loader.configure_gait_phase_maps(
+            flat_reference,
+            gait_period=self.cfg.gait_period,
+            gait_period_slope=self.cfg.gait_period_slope,
+            gait_period_min=self.cfg.gait_period_min,
+            yaw_speed_equiv=float(getattr(self.cfg, "gait_yaw_speed_equiv", 0.15)),
+            clearance_base=self.cfg.base_clearance,
+            clearance_rough_gain=self.cfg.ref_clearance_rough_gain,
+            stance_dx=self.cfg.stance_dx,
+        )
         self.n_feet = len(self.foot_indexes)
-        # AMP stride 窗口：启用 TAILI_AMP_STRIDE=1 时，让风格窗口覆盖约一个步态周期。
-        # 策略侧和参考侧使用相同 amp_frame_stride 子采样，判别器输入维度随帧数自动扩展。
-        # 未启用时 stride=1，不改变配置和缓冲行为。
-        self._amp_frame_stride = 1
-        if os.environ.get("TAILI_AMP_STRIDE") == "1":
-            self._amp_frame_stride = int(getattr(self.cfg, "amp_frame_stride", 4))
-            self.cfg.num_amp_observations = int(getattr(self.cfg, "amp_stride_frames", 6))
+        # AMP 时间窗口属于策略契约，不再依赖隐藏环境变量。当前实验使用 6 帧、每 4 个控制步
+        # 取一帧，总跨度约 0.4 s；策略侧和参考侧采用完全相同的时间顺序。
+        self._amp_frame_stride = max(1, int(getattr(self.cfg, "amp_frame_stride", 1)))
         self.amp_observation_size = self.cfg.num_amp_observations * self.cfg.amp_observation_space
         self.amp_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.amp_observation_size,))
         self.amp_observation_buffer = torch.zeros(
@@ -113,8 +274,13 @@ class TailiAmpEnv(DirectRLEnv):
             self._amp_raw_depth = (self.cfg.num_amp_observations - 1) * self._amp_frame_stride + 1
             self._amp_raw_ring = torch.zeros(
                 (self.num_envs, self._amp_raw_depth, self.cfg.amp_observation_space), device=self.device)
-        self.commands = torch.zeros((self.num_envs, 3), device=self.device)        # 平滑后的命令，策略实际跟踪它。
-        self._cmd_target = torch.zeros((self.num_envs, 3), device=self.device)      # 原始目标命令，commands 向它低通靠近。
+            self._amp_history_initialized = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+        self.commands = torch.zeros((self.num_envs, 3), device=self.device)        # Actor 实际接收的用户命令。
+        self._cmd_target = torch.zeros((self.num_envs, 3), device=self.device)      # 当前用户目标命令。
+        self._cmd_previous = torch.zeros_like(self.commands)                        # 最近一次切换前的命令。
+        self._cmd_age_s = torch.zeros(self.num_envs, device=self.device)             # 当前命令持续时间。
         self._cmd_motion_target = torch.zeros_like(self.commands)                  # 过渡整形后的目标命令。
         self._cmd_transition_start = torch.zeros_like(self.commands)
         self._cmd_transition_goal = torch.zeros_like(self.commands)
@@ -123,6 +289,71 @@ class TailiAmpEnv(DirectRLEnv):
         self._cmd_transition_via_zero = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._cmd_transition_zero_frac = torch.full((self.num_envs,), 0.5, device=self.device)
         self._cmd_transition_strength = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_wait_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_stable_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_state = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_require_stop = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # 0=无过渡，1=停车，2=反向，3=换轴。分类只用于评价语义，不改写用户命令。
+        self._cmd_transition_kind = torch.zeros(self.num_envs, dtype=torch.int8, device=self.device)
+        self._cmd_transition_old_axis = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_stage_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_elapsed_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_decel_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_accel_steps = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_transition_action_rate = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_strict_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_body_safe = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_motion_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_posture_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_support_phase_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_motion_fault = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_initial_motion_fault = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_motion_target = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_motion_excess = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_transition_support_ema = torch.full((self.num_envs,), 4.0, device=self.device)
+        self._cmd_transition_failed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_failed_event = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_failure_count = 0
+        self._cmd_transition_event_count = 0
+        self._cmd_transition_failure_ema = 0.0
+        self._cmd_transition_failure_ema_valid = False
+        self._cmd_transition_pending_event_count = 0
+        self._cmd_transition_pending_failure_count = 0
+        self._cmd_transition_stop_event_count = 0
+        self._cmd_transition_stop_failure_count = 0
+        self._cmd_transition_switch_event_count = 0
+        self._cmd_transition_switch_failure_count = 0
+        self._cmd_transition_reverse_event_count = 0
+        self._cmd_transition_reverse_failure_count = 0
+        self._cmd_transition_axis_event_count = 0
+        self._cmd_transition_axis_failure_count = 0
+        # 平地过渡单独统计。地形上的命令变化仍会发生，但不参与平地过渡课程门控。
+        self._cmd_transition_flat = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_transition_flat_event_count = 0
+        self._cmd_transition_flat_failure_count = 0
+        self._cmd_transition_flat_failure_ema = 0.0
+        self._cmd_transition_flat_failure_ema_valid = False
+        self._cmd_transition_flat_pending_event_count = 0
+        self._cmd_transition_flat_pending_failure_count = 0
+        self._cmd_transition_flat_kind_event_count = {"stop": 0, "reverse": 0, "axis": 0}
+        self._cmd_transition_flat_kind_failure_count = {"stop": 0, "reverse": 0, "axis": 0}
+        self._cmd_transition_flat_kind_pending_event_count = {"stop": 0, "reverse": 0, "axis": 0}
+        self._cmd_transition_flat_kind_pending_failure_count = {"stop": 0, "reverse": 0, "axis": 0}
+        self._cmd_transition_flat_kind_failure_ema = {"stop": 0.0, "reverse": 0.0, "axis": 0.0}
+        self._cmd_transition_flat_kind_failure_ema_valid = {"stop": False, "reverse": False, "axis": False}
+        # handoff 只评价安全制动后新方向是否及时接管，不改写命令或动作。
+        self._cmd_handoff_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cmd_handoff_timer = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._cmd_handoff_goal = torch.zeros_like(self.commands)
+        self._cmd_handoff_event_count = 0
+        self._cmd_handoff_failure_count = 0
+        self._cmd_handoff_failure_ema = 0.0
+        self._cmd_handoff_failure_ema_valid = False
+        self._cmd_handoff_pending_event_count = 0
+        self._cmd_handoff_pending_failure_count = 0
+        self._command_execution_ema = torch.ones(4, device=self.device)
+        self._command_execution_valid = torch.zeros(4, dtype=torch.bool, device=self.device)
+        self._command_execution_coverage = {"fwd": 1.0, "back": 1.0, "lat": 1.0, "yaw": 1.0}
         self._cmd_heading_ref = torch.zeros(self.num_envs, device=self.device)
         self._heading_error = torch.zeros(self.num_envs, device=self.device)
         self.last_actions = torch.zeros((self.num_envs, 12), device=self.device)
@@ -131,7 +362,17 @@ class TailiAmpEnv(DirectRLEnv):
         self._terrain_ctx = torch.zeros((self.num_envs, self.cfg.terrain_ctx_dim), device=self.device)
         self._episode_start_xy = self.robot.data.root_pos_w[:, :2].detach().clone()
         self._episode_start_root_z = self.robot.data.root_pos_w[:, 2].detach().clone()
+        self._episode_start_support_z = (
+            self._episode_start_root_z
+            - float(getattr(self.cfg, "stand_height", taili_geometry.NOMINAL_BASE_HEIGHT))
+        ).clone()
+        self._episode_support_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self._episode_start_cmd_xy = torch.zeros((self.num_envs, 2), device=self.device)
+        self._curriculum_prev_xy = self._episode_start_xy.clone()
+        self._curriculum_forward_dist = torch.zeros(self.num_envs, device=self.device)
+        self._curriculum_cmd_distance = torch.zeros(self.num_envs, device=self.device)
         # 步态相位时钟：每个 env 一个 [0,1) 相位，只在运动命令下推进。
         # 单腿相位 = 全局相位 + 对角小跑偏置，用于接触节律奖励和策略观测。
         self._gait_phase = torch.zeros(self.num_envs, device=self.device)
@@ -192,6 +433,11 @@ class TailiAmpEnv(DirectRLEnv):
         # yaw floor 设为不高于 yaw_hi 的 0.45，避免退到过低 yaw 练习。
         self._vel_floor_yaw = min(yaw_hi, max(yaw_lo, 0.45))
         self._fwd_prog = 0.0; self._back_prog = 0.0; self._lat_prog = 0.0; self._yaw_prog = 0.0
+        self._progress_ema_initialized = {name: False for name in ("fwd", "back", "lat", "yaw")}
+        for name in self._progress_ema_initialized:
+            setattr(self, f"_{name}_progress_instant", 0.0)
+            setattr(self, f"_{name}_progress_samples", 0)
+            setattr(self, f"_{name}_progress_ema_alpha", 0.0)
         # DR 等级系统：从 0 级开始，按已展示的运动能力逐级打开。
         self._dr_level = int(getattr(self.cfg, "dr_start_level", 0))   # 按门控从 0 升到 3。
         self._dr_gate_count = 0     # 连续满足 DR 升级门槛的日志间隔数。
@@ -211,7 +457,12 @@ class TailiAmpEnv(DirectRLEnv):
         # clearance_gate 仍从 0 开始，避免重约束在 resume 时突然生效。
         self._phase = int(os.environ.get("TAILI_INIT_PHASE", getattr(self.cfg, "init_phase", 0)))
         self._phase_count = 0          # 连续满足当前阶段推进门槛的日志间隔数。
-        self._penalty_gate = 1.0 if self._phase >= 1 else 0.0   # bootstrap 之后质量惩罚已完全打开。
+        self._penalty_budget_controls_quality = bool(getattr(
+            self.cfg, "penalty_budget_controls_quality", True
+        ))
+        self._penalty_gate = (
+            1.0 if self._phase >= 1 or not self._penalty_budget_controls_quality else 0.0
+        )
         self._budget_ratio_ema = 0.0   # 常规惩罚绝对值 / 正向任务奖励。
         self._clearance_gate = 0.0     # 地形 clearance 渐入门控。
         self._terrain_start_phase = int(getattr(self.cfg, "terrain_start_phase", 5))
@@ -280,7 +531,7 @@ class TailiAmpEnv(DirectRLEnv):
         base_period = float(getattr(self.cfg, "gait_period", 0.55))
         cycles = float(getattr(self.cfg, "cmd_transition_cycles", 0.75))
         min_s = float(getattr(self.cfg, "cmd_transition_min_s", 0.25))
-        max_s = float(getattr(self.cfg, "cmd_transition_max_s", 0.80))
+        max_s = float(getattr(self.cfg, "cmd_transition_max_s", 0.35))
         duration = min(max(base_period * cycles, min_s), max_s)
         return max(1, int(round(duration / max(step_dt, 1e-6))))
 
@@ -288,6 +539,8 @@ class TailiAmpEnv(DirectRLEnv):
         if len(env_ids) == 0:
             return
         target = self._cmd_target[env_ids]
+        self._cmd_previous[env_ids] = target if snap else self.commands[env_ids]
+        self._cmd_age_s[env_ids] = float(getattr(self.cfg, "cmd_transition_max_s", 0.35)) if snap else 0.0
         yaw = _yaw_from_quat_w(self.robot.data.root_quat_w[env_ids])
         self._cmd_heading_ref[env_ids] = yaw
         self._heading_error[env_ids] = 0.0
@@ -301,8 +554,20 @@ class TailiAmpEnv(DirectRLEnv):
             self._cmd_transition_via_zero[env_ids] = False
             self._cmd_transition_zero_frac[env_ids] = 0.5
             self._cmd_transition_strength[env_ids] = 0.0
+            self._cmd_transition_wait_steps[env_ids] = 0
+            self._cmd_transition_stable_steps[env_ids] = 0
+            self._cmd_transition_state[env_ids] = 0
+            self._cmd_transition_require_stop[env_ids] = False
+            self._cmd_transition_kind[env_ids] = 0
+            self._cmd_transition_stage_step[env_ids] = 0
+            self._cmd_transition_elapsed_steps[env_ids] = 0
+            self._cmd_transition_action_rate[env_ids] = 0.0
+            self._cmd_transition_failed[env_ids] = False
             return
 
+        interrupted = env_ids[self._cmd_handoff_active[env_ids]]
+        if len(interrupted) > 0:
+            self._record_command_handoff_result(interrupted, failed=True)
         current = self.commands[env_ids]
         v_thr = float(getattr(self.cfg, "cmd_transition_sign_flip_v", 0.08))
         w_thr = float(getattr(self.cfg, "cmd_transition_sign_flip_w", 0.10))
@@ -331,21 +596,36 @@ class TailiAmpEnv(DirectRLEnv):
         target_family = target_axis.argmax(dim=-1)
         family_change = cur_move & tgt_move & (current_family != target_family)
         through_stop = cur_move & (~tgt_move)
-        actual_lin = torch.linalg.norm(self.robot.data.root_lin_vel_b[env_ids, :2], dim=-1)
-        actual_yaw = self.robot.data.root_ang_vel_b[env_ids, 2].abs()
-        contact_min = float(getattr(self.cfg, "cmd_transition_contact_feet", 3.0))
-        contact_count = self._in_contact[env_ids].sum(dim=1) if hasattr(self, "_in_contact") else torch.full_like(cur_lin, 4.0)
+        gravity_b = self.robot.data.projected_gravity_b[env_ids]
+        gyro_b = self.robot.data.root_ang_vel_b[env_ids]
+        joint_speed = self.robot.data.joint_vel[env_ids].abs().amax(dim=-1)
+        upright_ready = torch.linalg.norm(gravity_b[:, :2], dim=-1) <= math.sin(
+            math.radians(float(getattr(self.cfg, "cmd_transition_tilt_deg", 6.0)))
+        )
         low_v = float(getattr(self.cfg, "cmd_transition_low_speed_v", 0.12))
         low_w = float(getattr(self.cfg, "cmd_transition_low_speed_w", 0.16))
+        actual_lin = torch.linalg.norm(self.robot.data.root_lin_vel_b[env_ids, :2], dim=-1)
         low_speed_ready = (
-            (cur_lin <= low_v)
-            & (actual_lin <= low_v)
-            & (current[:, 2].abs() <= low_w)
-            & (actual_yaw <= low_w)
-            & (contact_count >= contact_min)
+            (actual_lin <= low_v)
+            & (gyro_b[:, 2].abs() <= low_w)
+            & (torch.linalg.norm(gyro_b[:, :2], dim=-1) <= float(getattr(self.cfg, "cmd_transition_wxy_max", 0.25)))
+            & (joint_speed <= float(getattr(self.cfg, "cmd_transition_joint_speed_max", 1.5)))
+            & upright_ready
         )
-        abrupt = (sign_flip | family_change | through_stop) & ~low_speed_ready
+        unsafe_restart = tgt_move & (self._cmd_transition_state[env_ids] > 0) & ~low_speed_ready
+        abrupt = ((sign_flip | family_change | through_stop) & ~low_speed_ready) | unsafe_restart
         direct = ~abrupt
+        transition_intent = sign_flip | family_change | through_stop
+        transition_kind = torch.where(
+            through_stop,
+            torch.ones_like(current_family, dtype=torch.int8),
+            torch.where(
+                sign_flip,
+                torch.full_like(current_family, 2, dtype=torch.int8),
+                torch.full_like(current_family, 3, dtype=torch.int8),
+            ),
+        )
+        flat_mask = self._flat_transition_scope_mask()
         if bool(direct.any()):
             ids = env_ids[direct]
             self._cmd_motion_target[ids] = self._cmd_target[ids]
@@ -356,9 +636,32 @@ class TailiAmpEnv(DirectRLEnv):
             self._cmd_transition_via_zero[ids] = False
             self._cmd_transition_zero_frac[ids] = 0.5
             self._cmd_transition_strength[ids] = 0.0
+            self._cmd_transition_wait_steps[ids] = 0
+            self._cmd_transition_stable_steps[ids] = 0
+            self._cmd_transition_state[ids] = 0
+            self._cmd_transition_require_stop[ids] = False
+            self._cmd_transition_kind[ids] = 0
+            self._cmd_transition_stage_step[ids] = 0
+            self._cmd_transition_elapsed_steps[ids] = 0
+            self._cmd_transition_action_rate[ids] = 0.0
+            self._cmd_transition_failed[ids] = False
+            easy_event = direct & transition_intent
+            easy_ids = env_ids[easy_event]
+            if len(easy_ids) > 0:
+                self._cmd_transition_kind[easy_ids] = transition_kind[easy_event]
+                self._cmd_transition_flat[easy_ids] = flat_mask[easy_ids]
+                self._record_command_transition_result(easy_ids, failed=False)
+                flat_easy = easy_ids[self._cmd_transition_flat[easy_ids]]
+                if len(flat_easy) > 0:
+                    self._cmd_handoff_active[flat_easy] = True
+                    self._cmd_handoff_timer[flat_easy] = 0
+                    self._cmd_handoff_goal[flat_easy] = self._cmd_target[flat_easy]
+                self._cmd_transition_kind[easy_ids] = 0
+                self._cmd_transition_flat[easy_ids] = False
         if bool(abrupt.any()):
             ids = env_ids[abrupt]
             idx = abrupt
+            self._cmd_transition_flat[ids] = flat_mask[ids]
             max_v = max(
                 float(getattr(self.cfg, "cmd_fwd_max", 1.0)),
                 float(getattr(self.cfg, "cmd_back_max", 0.8)),
@@ -370,16 +673,16 @@ class TailiAmpEnv(DirectRLEnv):
             delta_w = (target[:, 2] - current[:, 2]).abs() / max(max_w, 1e-6)
             delta_norm = torch.maximum(delta_lin, delta_w)
             speed_norm = torch.maximum(
-                torch.maximum(cur_lin / max(low_v, 1e-6), actual_lin / max(low_v, 1e-6)),
-                torch.maximum(current[:, 2].abs() / max(low_w, 1e-6), actual_yaw / max(low_w, 1e-6)),
+                cur_lin / max(low_v, 1e-6),
+                torch.maximum(current[:, 2].abs(), gyro_b[:, 2].abs()) / max(low_w, 1e-6),
             )
-            airborne = (contact_count < contact_min).float()
-            severity = torch.clamp(0.35 * delta_norm + 0.35 * speed_norm + 0.20 * airborne + 0.10 * sign_flip.float(), 0.0, 1.0)
+            posture_fault = (~upright_ready).float()
+            severity = torch.clamp(0.40 * delta_norm + 0.35 * speed_norm + 0.15 * posture_fault + 0.10 * sign_flip.float(), 0.0, 1.0)
             step_dt = max(float(self.cfg.dt) * float(self.cfg.decimation), 1e-6)
             fast_s = float(getattr(self.cfg, "cmd_transition_fast_s", 0.16))
             fast_steps = max(1, int(round(fast_s / step_dt)))
             base_steps = self._command_transition_steps()
-            max_steps = max(base_steps, int(round(float(getattr(self.cfg, "cmd_transition_max_s", 0.80)) / step_dt)))
+            max_steps = max(base_steps, int(round(float(getattr(self.cfg, "cmd_transition_max_s", 0.35)) / step_dt)))
             steps = torch.round(
                 float(fast_steps) + (float(base_steps) - float(fast_steps)) * severity[idx]
             ).long().clamp(min=fast_steps, max=max_steps)
@@ -395,38 +698,370 @@ class TailiAmpEnv(DirectRLEnv):
             self._cmd_transition_via_zero[ids] = True
             self._cmd_transition_zero_frac[ids] = zero_frac_all[idx]
             self._cmd_transition_strength[ids] = severity[idx]
+            self._cmd_transition_wait_steps[ids] = 0
+            self._cmd_transition_stable_steps[ids] = 0
+            decel_steps = torch.round(steps.float() * zero_frac_all[idx]).long().clamp(min=1)
+            accel_steps = (steps - decel_steps).clamp(min=1)
+            self._cmd_transition_decel_steps[ids] = decel_steps
+            self._cmd_transition_accel_steps[ids] = accel_steps
+            # 用户命令直接交给 Actor；状态机从结果驱动的制动/承重阶段开始，
+            # 不再按固定比例伪造一段旧命令衰减。
+            self._cmd_transition_state[ids] = 2
+            # 反向允许连续穿越零速度；只有真正的停车命令要求全部动量归零。
+            self._cmd_transition_require_stop[ids] = through_stop[idx]
+            self._cmd_transition_kind[ids] = transition_kind[idx]
+            self._cmd_transition_old_axis[ids] = current_family[idx]
+            self._cmd_transition_initial_motion_fault[ids] = transition_motion_fault(
+                self.robot.data.root_lin_vel_b[ids, :2],
+                self.robot.data.root_ang_vel_b[ids, 2],
+                self._cmd_transition_old_axis[ids],
+                self._cmd_transition_require_stop[ids],
+                low_v,
+                low_w,
+                old_command=self._cmd_transition_start[ids],
+            ).detach()
+            self._cmd_transition_motion_fault[ids] = self._cmd_transition_initial_motion_fault[ids]
+            self._cmd_transition_motion_target[ids] = self._cmd_transition_initial_motion_fault[ids]
+            self._cmd_transition_motion_excess[ids] = 0.0
+            self._cmd_transition_stage_step[ids] = 0
+            self._cmd_transition_elapsed_steps[ids] = 0
+            self._cmd_transition_action_rate[ids] = 0.0
+            self._cmd_transition_failed[ids] = False
+            self._cmd_motion_target[ids] = 0.0
+            contact = getattr(self, "_in_contact", None)
+            if contact is not None:
+                self._cmd_transition_support_ema[ids] = (contact[ids] > 0.5).float().sum(dim=-1)
+
+    def _record_command_transition_result(self, env_ids, failed: bool):
+        """只在过渡完成时更新失败率，避免按环境锁存状态污染阶段门控。"""
+        if len(env_ids) == 0:
+            return
+        count = int(len(env_ids))
+        kind = self._cmd_transition_kind[env_ids]
+        stop_count = int((kind == 1).sum().item())
+        reverse_count = int((kind == 2).sum().item())
+        axis_count = int((kind == 3).sum().item())
+        switch_count = reverse_count + axis_count
+        self._cmd_transition_stop_event_count += stop_count
+        self._cmd_transition_switch_event_count += switch_count
+        self._cmd_transition_reverse_event_count += reverse_count
+        self._cmd_transition_axis_event_count += axis_count
+        if failed:
+            self._cmd_transition_stop_failure_count += stop_count
+            self._cmd_transition_switch_failure_count += switch_count
+            self._cmd_transition_reverse_failure_count += reverse_count
+            self._cmd_transition_axis_failure_count += axis_count
+        self._cmd_transition_pending_event_count += count
+        if failed:
+            self._cmd_transition_pending_failure_count += count
+        self._cmd_transition_event_count += count
+
+        flat_ids = env_ids[self._cmd_transition_flat[env_ids]]
+        flat_count = int(len(flat_ids))
+        if flat_count == 0:
+            return
+        if failed:
+            self._cmd_transition_flat_failure_count += flat_count
+            self._cmd_transition_flat_pending_failure_count += flat_count
+        self._cmd_transition_flat_pending_event_count += flat_count
+        self._cmd_transition_flat_event_count += flat_count
+        flat_kind = self._cmd_transition_kind[flat_ids]
+        for name, code in (("stop", 1), ("reverse", 2), ("axis", 3)):
+            kind_count = int((flat_kind == code).sum().item())
+            self._cmd_transition_flat_kind_event_count[name] += kind_count
+            self._cmd_transition_flat_kind_pending_event_count[name] += kind_count
+            if failed:
+                self._cmd_transition_flat_kind_failure_count[name] += kind_count
+                self._cmd_transition_flat_kind_pending_failure_count[name] += kind_count
+
+    def _record_command_handoff_result(self, env_ids, failed: bool):
+        """记录平地过渡后的方向接管结果；该指标不参与动作控制。"""
+        if len(env_ids) == 0:
+            return
+        count = int(len(env_ids))
+        self._cmd_handoff_pending_event_count += count
+        if failed:
+            self._cmd_handoff_pending_failure_count += count
+        self._cmd_handoff_event_count += count
+        if failed:
+            self._cmd_handoff_failure_count += count
+        self._cmd_handoff_active[env_ids] = False
+        self._cmd_handoff_timer[env_ids] = 0
+
+    def _flush_transition_rate_stats(self):
+        """按物理步汇总并行环境结果，避免批次调用顺序扭曲成败 EMA。"""
+        beta = min(max(float(getattr(self.cfg, "cmd_transition_failure_ema_beta", 0.95)), 0.0), 0.999)
+
+        self._cmd_transition_failure_ema, self._cmd_transition_failure_ema_valid = update_transition_failure_ema(
+            self._cmd_transition_pending_event_count,
+            self._cmd_transition_pending_failure_count,
+            self._cmd_transition_failure_ema,
+            self._cmd_transition_failure_ema_valid,
+            beta,
+        )
+        self._cmd_transition_flat_failure_ema, self._cmd_transition_flat_failure_ema_valid = update_transition_failure_ema(
+            self._cmd_transition_flat_pending_event_count,
+            self._cmd_transition_flat_pending_failure_count,
+            self._cmd_transition_flat_failure_ema,
+            self._cmd_transition_flat_failure_ema_valid,
+            beta,
+        )
+        for name in ("stop", "reverse", "axis"):
+            value, valid = update_transition_failure_ema(
+                self._cmd_transition_flat_kind_pending_event_count[name],
+                self._cmd_transition_flat_kind_pending_failure_count[name],
+                self._cmd_transition_flat_kind_failure_ema[name],
+                self._cmd_transition_flat_kind_failure_ema_valid[name],
+                beta,
+            )
+            self._cmd_transition_flat_kind_failure_ema[name] = value
+            self._cmd_transition_flat_kind_failure_ema_valid[name] = valid
+        self._cmd_handoff_failure_ema, self._cmd_handoff_failure_ema_valid = update_transition_failure_ema(
+            self._cmd_handoff_pending_event_count,
+            self._cmd_handoff_pending_failure_count,
+            self._cmd_handoff_failure_ema,
+            self._cmd_handoff_failure_ema_valid,
+            beta,
+        )
+        self._cmd_transition_pending_event_count = 0
+        self._cmd_transition_pending_failure_count = 0
+        self._cmd_transition_flat_pending_event_count = 0
+        self._cmd_transition_flat_pending_failure_count = 0
+        for name in ("stop", "reverse", "axis"):
+            self._cmd_transition_flat_kind_pending_event_count[name] = 0
+            self._cmd_transition_flat_kind_pending_failure_count[name] = 0
+        self._cmd_handoff_pending_event_count = 0
+        self._cmd_handoff_pending_failure_count = 0
+
+    def _update_command_handoff(self):
+        """评价安全制动后新方向能否在有限时间内自然接管。"""
+        active = self._cmd_handoff_active
+        if not bool(active.any()):
+            return
+        ids = active.nonzero(as_tuple=False).squeeze(-1)
+        self._cmd_handoff_timer[ids] += 1
+        goal = self._cmd_handoff_goal[ids]
+        lin_goal = torch.linalg.norm(goal[:, :2], dim=-1)
+        yaw_goal = goal[:, 2].abs()
+        moving_lin = lin_goal > 0.10
+        moving_yaw = yaw_goal > 0.05
+
+        vel = self.robot.data.root_lin_vel_b[ids, :2]
+        lin_along = torch.sum(vel * goal[:, :2], dim=-1) / lin_goal.clamp(min=1e-6)
+        yaw_along = self.robot.data.root_ang_vel_b[ids, 2] * torch.sign(goal[:, 2])
+        lin_ready = (~moving_lin) | (lin_along >= torch.maximum(0.20 * lin_goal, torch.full_like(lin_goal, 0.05)))
+        yaw_ready = (~moving_yaw) | (yaw_along >= torch.maximum(0.20 * yaw_goal, torch.full_like(yaw_goal, 0.04)))
+        stop_ready = (
+            torch.linalg.norm(vel, dim=-1) <= float(getattr(self.cfg, "cmd_transition_low_speed_v", 0.10))
+        ) & (
+            self.robot.data.root_ang_vel_b[ids, 2].abs()
+            <= float(getattr(self.cfg, "cmd_transition_low_speed_w", 0.12))
+        )
+        target_still = (~moving_lin) & (~moving_yaw)
+        body_ready = (
+            torch.linalg.norm(self.robot.data.root_ang_vel_b[ids, :2], dim=-1)
+            <= float(getattr(self.cfg, "cmd_transition_wxy_max", 0.25))
+        ) & (
+            torch.linalg.norm(self.robot.data.projected_gravity_b[ids, :2], dim=-1)
+            <= math.sin(math.radians(float(getattr(self.cfg, "cmd_transition_tilt_deg", 6.0))))
+        )
+        ready = body_ready & torch.where(target_still, stop_ready, lin_ready & yaw_ready)
+        ready_ids = ids[ready]
+        if len(ready_ids) > 0:
+            self._record_command_handoff_result(ready_ids, failed=False)
+
+        step_dt = max(float(self.cfg.dt) * float(self.cfg.decimation), 1e-6)
+        max_steps = max(1, int(round(float(getattr(self.cfg, "cmd_transition_handoff_s", 0.40)) / step_dt)))
+        remaining = self._cmd_handoff_active[ids]
+        failed_ids = ids[remaining & (self._cmd_handoff_timer[ids] >= max_steps)]
+        if len(failed_ids) > 0:
+            self._record_command_handoff_result(failed_ids, failed=True)
 
     def _update_command_transition(self):
-        active = self._cmd_transition_timer > 0
-        if bool(active.any()):
-            total = self._cmd_transition_total[active].float().clamp(min=1.0)
-            timer = self._cmd_transition_timer[active].float()
-            p = ((total - timer + 1.0) / total).clamp(0.0, 1.0)
-            s = p * p * p * (10.0 + p * (-15.0 + 6.0 * p))
-            start = self._cmd_transition_start[active]
-            goal = self._cmd_transition_goal[active]
-            shaped = start + (goal - start) * s[:, None]
-            via_zero = self._cmd_transition_via_zero[active]
-            if bool(via_zero.any()):
-                s_v = s[via_zero]
-                start_v = start[via_zero]
-                goal_v = goal[via_zero]
-                zfrac = self._cmd_transition_zero_frac[active][via_zero].clamp(0.05, 0.95)
-                first = s_v < zfrac
-                shaped_v = torch.empty_like(start_v)
-                s_first = (s_v / zfrac).clamp(0.0, 1.0)
-                s_second = ((s_v - zfrac) / (1.0 - zfrac).clamp(min=1e-6)).clamp(0.0, 1.0)
-                s_first = s_first * s_first * s_first * (10.0 + s_first * (-15.0 + 6.0 * s_first))
-                s_second = s_second * s_second * s_second * (10.0 + s_second * (-15.0 + 6.0 * s_second))
-                shaped_v[first] = start_v[first] * (1.0 - s_first[first, None])
-                shaped_v[~first] = goal_v[~first] * s_second[~first, None]
-                shaped[via_zero] = shaped_v
-            self._cmd_motion_target[active] = shaped
-            self._cmd_transition_timer[active] -= 1
-            done = active & (self._cmd_transition_timer <= 0)
-            if bool(done.any()):
-                self._cmd_motion_target[done] = self._cmd_transition_goal[done]
-                self._cmd_transition_strength[done] = 0.0
+        self._flush_transition_rate_stats()
+        self._cmd_transition_strict_ready.zero_()
+        self._cmd_transition_body_safe.zero_()
+        self._cmd_transition_motion_ready.zero_()
+        self._cmd_transition_posture_ready.zero_()
+        self._cmd_transition_support_phase_ready.zero_()
+        self._cmd_transition_failed_event.zero_()
+        active = self._cmd_transition_state > 0
+        self._cmd_transition_timer[active] = 1
+        self._cmd_transition_timer[~active] = 0
+        if not bool(active.any()):
+            return
+
+        self._cmd_transition_elapsed_steps[active] += 1
+
+        def _smoothstep5(x):
+            return x * x * x * (10.0 + x * (-15.0 + 6.0 * x))
+
+        # DECEL：旧命令和步幅沿五次曲线减到零。
+        decel = self._cmd_transition_state == 1
+        if bool(decel.any()):
+            ids = decel.nonzero(as_tuple=False).squeeze(-1)
+            total = self._cmd_transition_decel_steps[ids].float().clamp(min=1.0)
+            p = ((self._cmd_transition_stage_step[ids].float() + 1.0) / total).clamp(0.0, 1.0)
+            s = _smoothstep5(p)
+            self._cmd_motion_target[ids] = self._cmd_transition_start[ids] * (1.0 - s[:, None])
+            self._cmd_transition_stage_step[ids] += 1
+            done = self._cmd_transition_stage_step[ids] >= self._cmd_transition_decel_steps[ids]
+            settle_ids = ids[done]
+            if len(settle_ids) > 0:
+                self._cmd_motion_target[settle_ids] = 0.0
+                self._cmd_transition_state[settle_ids] = 2
+                self._cmd_transition_stage_step[settle_ids] = 0
+                self._cmd_transition_wait_steps[settle_ids] = 0
+                self._cmd_transition_stable_steps[settle_ids] = 0
+
+        # SETTLE 的物理评价必须发生在 action 执行后的状态上；由
+        # _evaluate_command_transition_post_physics 在奖励计算前完成。
+
+        # RELEASE：保持 gait clock 连续，避免可观测时钟跳变导致空中腿突然改轨迹。
+        reanchor = self._cmd_transition_state == 3
+        if bool(reanchor.any()):
+            ids = reanchor.nonzero(as_tuple=False).squeeze(-1)
+            step_dt = max(float(self.cfg.dt) * float(self.cfg.decimation), 1e-6)
+            release_s = float(getattr(self.cfg, "cmd_transition_release_s", 0.12))
+            self._cmd_transition_accel_steps[ids] = max(1, int(round(release_s / step_dt)))
+            self._cmd_transition_state[ids] = 4
+            self._cmd_transition_stage_step[ids] = 0
+
+        # RELEASE WINDOW：Actor 已直接看到新命令；这里只保留短释放窗口后开始评价接管。
+        accel = self._cmd_transition_state == 4
+        if bool(accel.any()):
+            ids = accel.nonzero(as_tuple=False).squeeze(-1)
+            total = self._cmd_transition_accel_steps[ids].float().clamp(min=1.0)
+            p = ((self._cmd_transition_stage_step[ids].float() + 1.0) / total).clamp(0.0, 1.0)
+            s = _smoothstep5(p)
+            self._cmd_motion_target[ids] = self._cmd_transition_goal[ids] * s[:, None]
+            self._cmd_transition_stage_step[ids] += 1
+            done = self._cmd_transition_stage_step[ids] >= self._cmd_transition_accel_steps[ids]
+            done_ids = ids[done]
+            if len(done_ids) > 0:
+                self._cmd_motion_target[done_ids] = self._cmd_transition_goal[done_ids]
+                self._cmd_transition_state[done_ids] = 0
+                self._cmd_transition_timer[done_ids] = 0
+                self._cmd_transition_strength[done_ids] = 0.0
+                self._cmd_transition_wait_steps[done_ids] = 0
+                self._cmd_transition_stable_steps[done_ids] = 0
+                self._cmd_transition_elapsed_steps[done_ids] = 0
+                self._cmd_transition_action_rate[done_ids] = 0.0
+                self._record_command_transition_result(done_ids, failed=False)
+                flat_done = done_ids[self._cmd_transition_flat[done_ids]]
+                if len(flat_done) > 0:
+                    self._cmd_handoff_active[flat_done] = True
+                    self._cmd_handoff_timer[flat_done] = 0
+                    self._cmd_handoff_goal[flat_done] = self._cmd_transition_goal[flat_done]
+
+    def _evaluate_command_transition_post_physics(self):
+        """用当前 action 执行后的物理状态评价自然过渡。"""
+        settle = self._cmd_transition_state == 2
+        if not bool(settle.any()):
+            return
+
+        ids = settle.nonzero(as_tuple=False).squeeze(-1)
+        self._cmd_motion_target[ids] = 0.0
+        gyro = self.robot.data.root_ang_vel_b[ids]
+        linear_speed = torch.linalg.norm(self.robot.data.root_lin_vel_b[ids, :2], dim=-1)
+        actual_yaw = gyro[:, 2].abs()
+        wxy = torch.linalg.norm(gyro[:, :2], dim=-1)
+        tilt = torch.linalg.norm(self.robot.data.projected_gravity_b[ids, :2], dim=-1)
+        self._cmd_transition_action_rate[ids] = (
+            self.actions[ids] - self.last_actions[ids]
+        ).abs().amax(dim=-1)
+
+        low_v = float(getattr(self.cfg, "cmd_transition_low_speed_v", 0.10))
+        low_w = float(getattr(self.cfg, "cmd_transition_low_speed_w", 0.12))
+        require_stop = self._cmd_transition_require_stop[ids]
+        motion_fault = transition_motion_fault(
+            self.robot.data.root_lin_vel_b[ids, :2],
+            self.robot.data.root_ang_vel_b[ids, 2],
+            self._cmd_transition_old_axis[ids],
+            require_stop,
+            low_v,
+            low_w,
+            old_command=self._cmd_transition_start[ids],
+        )
+        motion_ready = motion_fault <= 1.0
+        step_dt = max(float(self.cfg.dt) * float(self.cfg.decimation), 1e-6)
+        max_total_steps = max(
+            1, int(round(float(getattr(self.cfg, "cmd_transition_max_s", 0.35)) / step_dt))
+        )
+        tau = (self._cmd_transition_elapsed_steps[ids].float() / float(max_total_steps)).clamp(0.0, 1.0)
+        smooth_tau = tau.pow(3) * (10.0 + tau * (-15.0 + 6.0 * tau))
+        motion_target = self._cmd_transition_initial_motion_fault[ids] * (1.0 - smooth_tau)
+        self._cmd_transition_motion_fault[ids] = motion_fault
+        self._cmd_transition_motion_target[ids] = motion_target
+        self._cmd_transition_motion_excess[ids] = torch.clamp(motion_fault - motion_target, min=0.0)
+
+        wxy_limit = float(getattr(self.cfg, "cmd_transition_wxy_max", 0.35))
+        tilt_deg = float(getattr(self.cfg, "cmd_transition_tilt_deg", 8.0))
+        posture_ready = (
+            (wxy <= wxy_limit)
+            & (tilt <= math.sin(math.radians(tilt_deg)))
+        )
+        contact = getattr(
+            self, "_in_contact", torch.ones((self.num_envs, 4), device=self.device)
+        )[ids]
+        support_count = (contact > 0.5).float().sum(dim=-1)
+        self._cmd_transition_support_ema[ids] = (
+            0.80 * self._cmd_transition_support_ema[ids] + 0.20 * support_count
+        )
+        phase_window = float(getattr(self.cfg, "cmd_transition_phase_window", 0.10))
+        support_phase_ready = transition_support_phase_ready(
+            support_count,
+            self._gait_phase[ids],
+            phase_window,
+        )
+        natural_ready = motion_ready & posture_ready
+        body_safe = (
+            (motion_fault <= 2.0)
+            & (wxy <= max(2.0 * wxy_limit, 0.50))
+            & (tilt <= math.sin(math.radians(min(max(2.0 * tilt_deg, 10.0), 16.0))))
+        )
+        # 四足相位点只反映交接质量，不再阻止新命令接管。
+        self._cmd_transition_strict_ready[ids] = natural_ready
+        self._cmd_transition_body_safe[ids] = body_safe
+        self._cmd_transition_motion_ready[ids] = motion_ready
+        self._cmd_transition_posture_ready[ids] = posture_ready
+        self._cmd_transition_support_phase_ready[ids] = support_phase_ready
+
+        stop_stable_steps = max(
+            1, int(round(float(getattr(self.cfg, "cmd_transition_stable_s", 0.12)) / step_dt))
+        )
+        # 反向和换轴只需确认连续、稳定地清除了旧动量，不要求保持完整停车窗口。
+        redirect_stable_steps = max(1, (stop_stable_steps + 1) // 2)
+        required_steps = torch.where(
+            require_stop,
+            torch.full_like(self._cmd_transition_stable_steps[ids], stop_stable_steps),
+            torch.full_like(self._cmd_transition_stable_steps[ids], redirect_stable_steps),
+        )
+        self._cmd_transition_stable_steps[ids] = torch.where(
+            natural_ready,
+            self._cmd_transition_stable_steps[ids] + 1,
+            torch.zeros_like(self._cmd_transition_stable_steps[ids]),
+        )
+        self._cmd_transition_wait_steps[ids] += 1
+        # 动量和姿态连续稳定后即可结束软过渡窗口；四足相位只作诊断和弱奖励。
+        ready = self._cmd_transition_stable_steps[ids] >= required_steps
+        timed_out = self._cmd_transition_elapsed_steps[ids] >= max_total_steps
+
+        ready_ids = ids[ready]
+        if len(ready_ids) > 0:
+            self._cmd_transition_state[ready_ids] = 3
+            self._cmd_transition_stage_step[ready_ids] = 0
+
+        failed_ids = ids[timed_out & ~ready]
+        if len(failed_ids) > 0:
+            self._cmd_motion_target[failed_ids] = self._cmd_transition_goal[failed_ids]
+            self._cmd_transition_state[failed_ids] = 0
+            self._cmd_transition_timer[failed_ids] = 0
+            self._cmd_transition_elapsed_steps[failed_ids] = 0
+            self._cmd_transition_failed[failed_ids] = True
+            self._cmd_transition_failed_event[failed_ids] = True
+            self._cmd_transition_failure_count += int(len(failed_ids))
+            self._record_command_transition_result(failed_ids, failed=True)
 
     def _update_heading_error(self):
         yaw = _yaw_from_quat_w(self.robot.data.root_quat_w)
@@ -434,18 +1069,57 @@ class TailiAmpEnv(DirectRLEnv):
         self._cmd_heading_ref = torch.where(yaw_active, yaw, self._cmd_heading_ref)
         self._heading_error = _wrap_pi(yaw - self._cmd_heading_ref)
 
+    def _update_command_execution_coverage(self):
+        """统计原始目标实际到达策略输入的比例，防止过渡等待掩盖方向失败。"""
+        target = self._cmd_target
+        applied = self.commands
+        transition_clear = self._cmd_transition_state == 0
+        masks = (
+            target[:, 0] > 0.10,
+            target[:, 0] < -0.10,
+            target[:, 1].abs() > 0.10,
+            target[:, 2].abs() > 0.10,
+        )
+        success = (
+            transition_clear & (applied[:, 0] >= 0.80 * target[:, 0].clamp_min(0.0)),
+            transition_clear & (applied[:, 0] <= 0.80 * target[:, 0].clamp_max(0.0)),
+            transition_clear
+            & (applied[:, 1] * target[:, 1] > 0.0)
+            & (applied[:, 1].abs() >= 0.80 * target[:, 1].abs()),
+            transition_clear
+            & (applied[:, 2] * target[:, 2] > 0.0)
+            & (applied[:, 2].abs() >= 0.80 * target[:, 2].abs()),
+        )
+        names = ("fwd", "back", "lat", "yaw")
+        beta = 0.98
+        for index, (name, mask, ok) in enumerate(zip(names, masks, success)):
+            if not bool(mask.any()):
+                continue
+            sample = ok[mask].float().mean()
+            if bool(self._command_execution_valid[index]):
+                self._command_execution_ema[index] = beta * self._command_execution_ema[index] + (1.0 - beta) * sample
+            else:
+                self._command_execution_ema[index] = sample
+                self._command_execution_valid[index] = True
+            self._command_execution_coverage[name] = float(self._command_execution_ema[index])
+
     def _resample_commands(self, env_ids, snap=False):
         # 单轴命令采样：按任务比例写入原始目标命令，self.commands 通过命令缓冲低通靠近它。
         # reset 时 snap=True，直接从新命令开始，避免从旧命令 ramp 过来。
         n = len(env_ids); dev = self.device
         if n == 0:
             return
+        # 系统诊断已经在 reset 前写入目标命令；不能再随机采样，否则 RSI 姿态、
+        # 诊断标签和实际测试命令来自三个不同方向。
+        if bool(getattr(self, "use_external_commands", False)):
+            self._begin_command_transition(env_ids, snap=snap)
+            return
         phase = int(getattr(self, "_phase", getattr(self.cfg, "init_phase", 0)))
         spec = phase_command_spec(self.cfg, phase) if phase_command_spec is not None else {}
         mode = str(spec.get("command_mode") or getattr(self.cfg, "training_command_mode", "normal") or "normal")
         self._last_command_mode = mode
         self._last_command_spec = spec
-        if mode in {"fixed_forward", "forward_range", "stand_only", "single_axis", "mixed"}:
+        if mode in {"fixed_forward", "forward_range", "stand_only", "single_axis", "mixed", "bucketed"}:
             self._cmd_target[env_ids] = 0.0
 
             def _range_with_ceiling(name: str, fallback, ceiling_attr: str, max_attr: str):
@@ -463,10 +1137,15 @@ class TailiAmpEnv(DirectRLEnv):
                 tmax = max(1.0, self.cfg.terrain.terrain_generator.num_rows - 1)
                 terr_frac = (self._terrain.terrain_levels[env_ids].float() / tmax).clamp(0.0, 1.0)
 
-            def _sample_range(lo: float, hi):
-                if torch.is_tensor(hi):
-                    return torch.rand(n, device=dev) * (hi - float(lo)).clamp(min=0.0) + float(lo)
-                return _sample_uniform(n, lo, hi, dev)
+            def _sample_range(name: str, lo: float, hi):
+                return _sample_core_full_mixture(
+                    n,
+                    lo,
+                    hi,
+                    getattr(self.cfg, f"cmd_core_{name}_range", (lo, hi)),
+                    float(getattr(self.cfg, "cmd_core_sample_fraction", 0.0)),
+                    dev,
+                )
 
             f_hi_eff = f_hi
             b_hi_eff = b_hi
@@ -482,30 +1161,57 @@ class TailiAmpEnv(DirectRLEnv):
                 target[:, 0] = _sample_uniform(n, lo_v, hi_v, dev)
             elif mode == "stand_only":
                 target.zero_()
+            elif mode == "bucketed":
+                bucketed = _sample_bucketed_commands(
+                    n, dev, spec,
+                    ((f_lo, f_hi_eff), (b_lo, b_hi_eff), (l_lo, l_hi), (y_lo, y_hi)),
+                    sample_value=_sample_range,
+                )
+                target = bucketed if bucketed is not None else target
             elif mode == "mixed":
-                stand_prob = _spec_float(spec, "stand_prob", float(getattr(self.cfg, "stand_prob", 0.0)))
-                near_zero_prob = _spec_float(spec, "near_zero_prob", 0.0)
-                axis_prob = _spec_float(spec, "mixed_axis_prob", 1.0)
-                active = torch.rand(n, device=dev) >= stand_prob
-                near_zero = active & (torch.rand(n, device=dev) < near_zero_prob)
-                moving = active & ~near_zero
-                p_fwd = max(0.0, _spec_float(spec, "prob_fwd", 0.5))
-                p_back = max(0.0, _spec_float(spec, "prob_back", 0.5))
-                x_is_fwd = torch.rand(n, device=dev) < (p_fwd / max(1e-9, p_fwd + p_back))
-                x_on = torch.rand(n, device=dev) < _spec_float(spec, "x_axis_prob", 1.0)
-                lat_on = torch.rand(n, device=dev) < axis_prob
-                yaw_on = torch.rand(n, device=dev) < axis_prob
-                yaw_on = yaw_on | (~x_on & ~lat_on)
-                lat_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
-                yaw_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
-                target[:, 0] = torch.where(x_is_fwd, _sample_range(f_lo, f_hi_eff), -_sample_range(b_lo, b_hi_eff))
-                target[:, 0] = torch.where(x_on, target[:, 0], torch.zeros(n, device=dev))
-                target[:, 1] = torch.where(lat_on, lat_sign * _sample_uniform(n, l_lo, l_hi, dev), torch.zeros(n, device=dev))
-                target[:, 2] = torch.where(yaw_on, yaw_sign * _sample_uniform(n, y_lo, y_hi, dev), torch.zeros(n, device=dev))
-                target = torch.where(moving[:, None], target, torch.zeros_like(target))
-                nz_scale = _spec_float(spec, "near_zero_scale", 0.05)
-                near_noise = (torch.rand((n, 3), device=dev) * 2.0 - 1.0) * nz_scale
-                target = torch.where(near_zero[:, None], near_noise, target)
+                bucketed = _sample_bucketed_commands(
+                    n, dev, spec,
+                    ((f_lo, f_hi_eff), (b_lo, b_hi_eff), (l_lo, l_hi), (y_lo, y_hi)),
+                    sample_value=_sample_range,
+                )
+                if bucketed is not None:
+                    target = bucketed
+                else:
+                    stand_prob = _spec_float(spec, "stand_prob", float(getattr(self.cfg, "stand_prob", 0.0)))
+                    near_zero_prob = _spec_float(spec, "near_zero_prob", 0.0)
+                    axis_prob = _spec_float(spec, "mixed_axis_prob", 1.0)
+                    active = torch.rand(n, device=dev) >= stand_prob
+                    near_zero = active & (torch.rand(n, device=dev) < near_zero_prob)
+                    moving = active & ~near_zero
+                    p_fwd = max(0.0, _spec_float(spec, "prob_fwd", 0.5))
+                    p_back = max(0.0, _spec_float(spec, "prob_back", 0.5))
+                    x_is_fwd = torch.rand(n, device=dev) < (p_fwd / max(1e-9, p_fwd + p_back))
+                    x_on = torch.rand(n, device=dev) < _spec_float(spec, "x_axis_prob", 1.0)
+                    lat_on = torch.rand(n, device=dev) < axis_prob
+                    yaw_on = torch.rand(n, device=dev) < axis_prob
+                    yaw_on = yaw_on | (~x_on & ~lat_on)
+                    lat_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                    yaw_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
+                    target[:, 0] = torch.where(
+                        x_is_fwd,
+                        _sample_range("fwd", f_lo, f_hi_eff),
+                        -_sample_range("back", b_lo, b_hi_eff),
+                    )
+                    target[:, 0] = torch.where(x_on, target[:, 0], torch.zeros(n, device=dev))
+                    target[:, 1] = torch.where(
+                        lat_on,
+                        lat_sign * _sample_range("lat", l_lo, l_hi),
+                        torch.zeros(n, device=dev),
+                    )
+                    target[:, 2] = torch.where(
+                        yaw_on,
+                        yaw_sign * _sample_range("yaw", y_lo, y_hi),
+                        torch.zeros(n, device=dev),
+                    )
+                    target = torch.where(moving[:, None], target, torch.zeros_like(target))
+                    nz_scale = _spec_float(spec, "near_zero_scale", 0.05)
+                    near_noise = (torch.rand((n, 3), device=dev) * 2.0 - 1.0) * nz_scale
+                    target = torch.where(near_zero[:, None], near_noise, target)
             else:
                 stand_prob = _spec_float(spec, "stand_prob", float(getattr(self.cfg, "stand_prob", 0.0)))
                 active = torch.rand(n, device=dev) >= stand_prob
@@ -527,10 +1233,21 @@ class TailiAmpEnv(DirectRLEnv):
                 yaw = active & (u >= c2)
                 lat_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
                 yaw_sign = torch.where(torch.rand(n, device=dev) < 0.5, torch.ones(n, device=dev), -torch.ones(n, device=dev))
-                target[:, 0] = torch.where(fwd, _sample_range(f_lo, f_hi_eff),
-                                            torch.where(back, -_sample_range(b_lo, b_hi_eff), torch.zeros(n, device=dev)))
-                target[:, 1] = torch.where(lat, lat_sign * _sample_uniform(n, l_lo, l_hi, dev), torch.zeros(n, device=dev))
-                target[:, 2] = torch.where(yaw, yaw_sign * _sample_uniform(n, y_lo, y_hi, dev), torch.zeros(n, device=dev))
+                target[:, 0] = torch.where(
+                    fwd,
+                    _sample_range("fwd", f_lo, f_hi_eff),
+                    torch.where(back, -_sample_range("back", b_lo, b_hi_eff), torch.zeros(n, device=dev)),
+                )
+                target[:, 1] = torch.where(
+                    lat,
+                    lat_sign * _sample_range("lat", l_lo, l_hi),
+                    torch.zeros(n, device=dev),
+                )
+                target[:, 2] = torch.where(
+                    yaw,
+                    yaw_sign * _sample_range("yaw", y_lo, y_hi),
+                    torch.zeros(n, device=dev),
+                )
             self._cmd_target[env_ids] = target
             self._begin_command_transition(env_ids, snap=snap)
             return
@@ -579,23 +1296,36 @@ class TailiAmpEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions.clone()
-        # 命令缓冲：self.commands 平滑靠近 _cmd_target，而不是瞬间跳变。
-        # 这会让停步、反向和转向有自然过渡；稳态仍等于目标命令，不改变速度跟踪语义。
-        # 这是命令接口的一部分，训练和部署都会执行。
+        self._cmd_age_s.add_(float(self.cfg.dt) * float(self.cfg.decimation))
         target_changed = (self._cmd_target - self._cmd_transition_goal).abs().amax(dim=1) > 1e-6
         if bool(target_changed.any()):
             self._begin_command_transition(target_changed.nonzero(as_tuple=False).flatten(), snap=False)
         self._update_command_transition()
-        self.commands += (1.0 - self.cfg.cmd_smooth_alpha) * (self._cmd_motion_target - self.commands)
+        self._update_command_handoff()
+        if bool(getattr(self.cfg, "cmd_transition_policy_managed", False)):
+            # 指令允许突变，Actor直接看到用户目标。状态机仅评价策略是否自然完成过渡。
+            self.commands.copy_(self._cmd_target)
+        else:
+            transition_active = self._cmd_transition_timer > 0
+            if bool(transition_active.any()):
+                self.commands[transition_active] = self._cmd_motion_target[transition_active]
+            steady = ~transition_active
+            if bool(steady.any()):
+                self.commands[steady] += (1.0 - self.cfg.cmd_smooth_alpha) * (
+                    self._cmd_motion_target[steady] - self.commands[steady]
+                )
+        self._update_command_execution_coverage()
         self._update_heading_error()
         # 每个 env step 推进一次步态时钟；零命令时冻结，使策略自然站立。
         # 周期随命令速度缩短，命令越快步频越高。
         step_dt = self.cfg.dt * self.cfg.decimation
-        spd = torch.norm(self.commands[:, :2], dim=1)
-        moving = (spd > 0.1) | (self.commands[:, 2].abs() > 0.05)   # 与奖励侧 yaw_cmd_gate 对齐。
+        phase_command = self.commands
+        spd = torch.norm(phase_command[:, :2], dim=1)
+        moving = (spd > 0.1) | (phase_command[:, 2].abs() > 0.05)   # 与奖励侧 yaw_cmd_gate 对齐。
         # yaw 感知 cadence：观测中的 gait clock、滞空奖励和 AMP 参考都使用同一速度语义。
-        # 转向时把 0.15*|wz| 加入 period_speed，使高 yaw 命令获得更快步频。
-        period_speed = spd + 0.15 * self.commands[:, 2].abs()
+        # yaw 按足端旋转半径折算成等效线速度，和参考步态周期保持同一语义。
+        yaw_speed_equiv = float(getattr(self.cfg, "gait_yaw_speed_equiv", 0.15))
+        period_speed = spd + yaw_speed_equiv * phase_command[:, 2].abs()
         period = torch.clamp(self.cfg.gait_period - self.cfg.gait_period_slope * period_speed,
                              min=self.cfg.gait_period_min, max=self.cfg.gait_period)
         self._gait_phase = (self._gait_phase + (step_dt / period) * moving.float()) % 1.0
@@ -631,6 +1361,9 @@ class TailiAmpEnv(DirectRLEnv):
             self._discrete_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._flat_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._real_terrain_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            self._boxes_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self._stairs_down_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            self._stairs_up_terrain_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             return
         sg = self.cfg.terrain.terrain_generator
         props = np.array([s.proportion for s in sg.sub_terrains.values()], dtype=np.float64)
@@ -653,10 +1386,241 @@ class TailiAmpEnv(DirectRLEnv):
         if "flat" in self._type_names:
             self._flat_terrain_mask = et == self._type_names.index("flat")
         self._real_terrain_mask = ~self._flat_terrain_mask
+        self._boxes_terrain_mask = et == self._type_names.index("boxes") if "boxes" in self._type_names else torch.zeros_like(et, dtype=torch.bool)
+        self._stairs_down_terrain_mask = et == self._type_names.index("stairs") if "stairs" in self._type_names else torch.zeros_like(et, dtype=torch.bool)
+        self._stairs_up_terrain_mask = et == self._type_names.index("stairs_up") if "stairs_up" in self._type_names else torch.zeros_like(et, dtype=torch.bool)
         print(f"[GATE] curriculum gates exclude hard terrain types {[n for n in ('slope_inv','boxes','stairs_up') if n in self._type_names]}"
               f" -> {int(self._gate_mask.sum())}/{self.num_envs} envs gate the curriculum"
               f" | real_nonflat={int(self._real_terrain_mask.sum())}/{self.num_envs}"
               f" | discrete(stairs/boxes/stairs_up)={int(self._discrete_terrain_mask.sum())}/{self.num_envs}", flush=True)
+
+    def _flat_transition_scope_mask(self):
+        """返回平地过渡训练作用域；缺少地形类型的诊断环境退回粗糙度判断。"""
+        self._ensure_gate_mask()
+        terrain = getattr(self, "_terrain", None)
+        if terrain is not None and hasattr(terrain, "terrain_types"):
+            return self._flat_terrain_mask
+        if getattr(self.cfg, "terrain_ctx_dim", 0) >= 3:
+            flat_limit = max(float(getattr(self.cfg, "clr_rough_flat", 0.01)), 0.005)
+            return self._terrain_ctx[:, 2] <= flat_limit
+        return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _sync_terrain_origins_from_levels(self) -> None:
+        """地形等级恢复后，同步每个环境实际使用的出生原点。"""
+        terrain = getattr(self, "_terrain", None)
+        if terrain is None or not hasattr(terrain, "terrain_origins"):
+            return
+        terrain.env_origins[:] = terrain.terrain_origins[
+            terrain.terrain_levels.long(), terrain.terrain_types.long()
+        ]
+
+    def _restore_curriculum_from_telemetry(self, telemetry_path: Path) -> bool:
+        """兼容旧检查点：按最后一条遥测中的各类地形均值近似恢复。"""
+        if not telemetry_path.is_file():
+            return False
+        last = ""
+        with telemetry_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.strip():
+                    last = line
+        if not last:
+            return False
+        curriculum = (json.loads(last).get("curriculum") or {})
+        self._ensure_gate_mask()
+        terrain = self._terrain
+        env_type = self._col_type[terrain.terrain_types]
+        max_level = int(self.cfg.terrain.terrain_generator.num_rows) - 1
+        restored = False
+        for type_index, name in enumerate(self._type_names):
+            value = curriculum.get(f"terrain_{name}_mean")
+            if value is None:
+                continue
+            level = max(0, min(max_level, int(round(float(value)))))
+            terrain.terrain_levels[env_type == type_index] = level
+            restored = True
+        if not restored and curriculum.get("terrain_real_mean") is not None:
+            level = max(0, min(max_level, int(round(float(curriculum["terrain_real_mean"])))))
+            terrain.terrain_levels[self._real_terrain_mask] = level
+            restored = True
+        if restored:
+            self._terrain_level_peak = terrain.terrain_levels.clone()
+            self._terrain_move_down_streak = torch.zeros_like(terrain.terrain_levels)
+            self._sync_terrain_origins_from_levels()
+            print(
+                f"[CURRICULUM] restored legacy terrain means from {telemetry_path}; "
+                f"real_mean={self._terrain_level_stats()['terrain_real_mean']:.3f}",
+                flush=True,
+            )
+        return restored
+
+    def _select_legacy_curriculum_telemetry(self, source_run: Path) -> Path:
+        """沿检查点祖先链选择地形课程最高的旧遥测。"""
+        candidates: list[Path] = []
+        visited: set[Path] = set()
+        run_dir = source_run
+        for _ in range(8):
+            resolved = run_dir.resolve()
+            if resolved in visited:
+                break
+            visited.add(resolved)
+            telemetry = run_dir / "train.telemetry.jsonl"
+            if telemetry.is_file():
+                candidates.append(telemetry)
+            metadata = run_dir / "run.json"
+            if not metadata.is_file():
+                break
+            try:
+                checkpoint = str(json.loads(metadata.read_text(encoding="utf-8")).get("resume_checkpoint", ""))
+            except Exception:
+                break
+            if not checkpoint:
+                break
+            run_dir = Path(checkpoint).expanduser().parent.parent
+
+        def _score(path: Path) -> float:
+            last = ""
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        if line.strip():
+                            last = line
+                curriculum = (json.loads(last).get("curriculum") or {})
+                return float(curriculum.get("terrain_real_mean", curriculum.get("terrain_mean", 0.0)))
+            except Exception:
+                return -1.0
+
+        return max(candidates, key=_score) if candidates else source_run / "train.telemetry.jsonl"
+
+    def _reset_stair_curriculum_levels(self) -> None:
+        """课程语义升级时只重置楼梯等级，保留策略和其他地形能力。"""
+        self._ensure_gate_mask()
+        if not hasattr(self, "_col_type") or not hasattr(self, "_type_names"):
+            return
+        env_type = self._col_type[self._terrain.terrain_types]
+        stair_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for name in ("stairs", "stairs_up"):
+            if name in self._type_names:
+                stair_mask |= env_type == self._type_names.index(name)
+        self._terrain.terrain_levels[stair_mask] = 0
+        if hasattr(self, "_terrain_level_peak"):
+            self._terrain_level_peak[stair_mask] = 0
+        if hasattr(self, "_terrain_move_down_streak"):
+            self._terrain_move_down_streak[stair_mask] = 0
+        for family_name in ("stairs_down", "stairs_up"):
+            setattr(self, f"_terrain_{family_name}_success_ema", 0.0)
+            setattr(self, f"_terrain_{family_name}_collapse_ema", 1.0)
+        self._sync_terrain_origins_from_levels()
+
+    def _restore_curriculum_state(self) -> None:
+        """从恢复检查点所属 run 加载训练课程；该状态不进入策略观测。"""
+        checkpoint = os.environ.get("TAILI_RESUME_CHECKPOINT", "").strip()
+        if not checkpoint:
+            return
+        source_run = Path(checkpoint).expanduser().parent.parent
+        state_path = source_run / "curriculum_state.json"
+        try:
+            if not state_path.is_file():
+                self._restore_curriculum_from_telemetry(self._select_legacy_curriculum_telemetry(source_run))
+                if int(getattr(self.cfg, "terrain_curriculum_state_schema", 1)) >= 2:
+                    self._reset_stair_curriculum_levels()
+                    print("[CURRICULUM] legacy stairs reset for event-complete schema v2", flush=True)
+                return
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            saved_schema = int(state.get("terrain_schema", 1))
+            current_schema = int(getattr(self.cfg, "terrain_curriculum_state_schema", 1))
+            # 全局课程状态与环境数量无关；即使逐环境地形布局需要按均值重建，也应保留。
+            self._phase = max(int(self._phase), int(state.get("phase", self._phase)))
+            self._dr_level = max(int(self._dr_level), int(state.get("dr_level", self._dr_level)))
+            self._dr_gate_count = max(int(self._dr_gate_count), int(state.get("dr_gate_count", 0)))
+            self._penalty_gate = max(float(self._penalty_gate), float(state.get("penalty_gate", 0.0)))
+            self._clearance_gate = max(float(self._clearance_gate), float(state.get("clearance_gate", 0.0)))
+            for family_name in ("boxes", "stairs_down", "stairs_up"):
+                setattr(
+                    self,
+                    f"_terrain_{family_name}_success_ema",
+                    float(state.get(f"terrain_{family_name}_success_ema", 0.0)),
+                )
+                setattr(
+                    self,
+                    f"_terrain_{family_name}_collapse_ema",
+                    float(state.get(f"terrain_{family_name}_collapse_ema", 1.0)),
+                )
+            levels = state.get("terrain_levels")
+            types = state.get("terrain_types")
+            current_types = self._terrain.terrain_types.detach().cpu().tolist()
+            if not isinstance(levels, list) or len(levels) != self.num_envs:
+                raise ValueError(f"terrain_levels length mismatch: {len(levels or [])} != {self.num_envs}")
+            if types != current_types:
+                raise ValueError("terrain type layout differs from the saved run")
+            self._terrain.terrain_levels.copy_(
+                torch.as_tensor(levels, dtype=self._terrain.terrain_levels.dtype, device=self.device)
+            )
+            peak = state.get("terrain_level_peak", levels)
+            streak = state.get("terrain_move_down_streak", [0] * self.num_envs)
+            self._terrain_level_peak = torch.as_tensor(
+                peak, dtype=self._terrain.terrain_levels.dtype, device=self.device
+            )
+            self._terrain_move_down_streak = torch.as_tensor(
+                streak, dtype=self._terrain.terrain_levels.dtype, device=self.device
+            )
+            if saved_schema != current_schema:
+                self._reset_stair_curriculum_levels()
+                print(
+                    f"[CURRICULUM] migrated terrain schema {saved_schema}->{current_schema}; stairs reset to level 0",
+                    flush=True,
+                )
+            else:
+                self._sync_terrain_origins_from_levels()
+            print(
+                f"[CURRICULUM] restored exact state step={state.get('step', 0)} from {state_path}; "
+                f"real_mean={self._terrain_level_stats()['terrain_real_mean']:.3f}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[CURRICULUM] exact restore failed ({type(exc).__name__}: {exc}); trying telemetry", flush=True)
+            # sidecar存在说明该run的课程可信；环境数量变化时只需按该run均值重建。
+            # 仅旧run完全没有sidecar时，才沿祖先链寻找未归零的历史课程。
+            fallback = (
+                source_run / "train.telemetry.jsonl"
+                if state_path.is_file()
+                else self._select_legacy_curriculum_telemetry(source_run)
+            )
+            self._restore_curriculum_from_telemetry(fallback)
+            if int(getattr(self.cfg, "terrain_curriculum_state_schema", 1)) >= 2:
+                self._reset_stair_curriculum_levels()
+
+    def _save_curriculum_state(self, step: int) -> None:
+        """原子保存环境课程，使异常恢复不会重新从零级地形开始。"""
+        run_dir = os.environ.get("TAILI_RUN_DIR", "").strip()
+        if not run_dir or not hasattr(self._terrain, "terrain_levels"):
+            return
+        target = Path(run_dir) / "curriculum_state.json"
+        temporary = target.with_suffix(".json.tmp")
+        levels = self._terrain.terrain_levels.detach().cpu()
+        peak = getattr(self, "_terrain_level_peak", levels).detach().cpu()
+        streak = getattr(self, "_terrain_move_down_streak", torch.zeros_like(levels)).detach().cpu()
+        state = {
+            "version": 1,
+            "terrain_schema": int(getattr(self.cfg, "terrain_curriculum_state_schema", 1)),
+            "step": int(step),
+            "phase": int(self._phase),
+            "dr_level": int(self._dr_level),
+            "dr_gate_count": int(self._dr_gate_count),
+            "penalty_gate": float(self._penalty_gate),
+            "clearance_gate": float(self._clearance_gate),
+            "terrain_levels": levels.tolist(),
+            "terrain_types": self._terrain.terrain_types.detach().cpu().tolist(),
+            "terrain_level_peak": peak.tolist(),
+            "terrain_move_down_streak": streak.tolist(),
+            "terrain_boxes_success_ema": float(getattr(self, "_terrain_boxes_success_ema", 0.0)),
+            "terrain_stairs_down_success_ema": float(getattr(self, "_terrain_stairs_down_success_ema", 0.0)),
+            "terrain_stairs_up_success_ema": float(getattr(self, "_terrain_stairs_up_success_ema", 0.0)),
+            "terrain_boxes_collapse_ema": float(getattr(self, "_terrain_boxes_collapse_ema", 1.0)),
+            "terrain_stairs_down_collapse_ema": float(getattr(self, "_terrain_stairs_down_collapse_ema", 1.0)),
+            "terrain_stairs_up_collapse_ema": float(getattr(self, "_terrain_stairs_up_collapse_ema", 1.0)),
+        }
+        temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        os.replace(temporary, target)
 
     def _terrain_level_stats(self) -> dict[str, float | int]:
         stats: dict[str, float | int] = {
@@ -689,6 +1653,10 @@ class TailiAmpEnv(DirectRLEnv):
         _fill("terrain_flat", getattr(self, "_flat_terrain_mask", torch.zeros_like(lv, dtype=torch.bool)))
         _fill("terrain_real", getattr(self, "_real_terrain_mask", torch.ones_like(lv, dtype=torch.bool)))
         _fill("terrain_discrete", getattr(self, "_discrete_terrain_mask", torch.zeros_like(lv, dtype=torch.bool)))
+        if hasattr(self, "_col_type") and hasattr(self, "_type_names"):
+            env_type = self._col_type[self._terrain.terrain_types]
+            for type_index, name in enumerate(self._type_names):
+                _fill(f"terrain_{name}", env_type == type_index)
         return stats
 
     def _apply_action(self):
@@ -700,6 +1668,25 @@ class TailiAmpEnv(DirectRLEnv):
         rel = foot_pos_w - base_pos_w.unsqueeze(1)                       # (M, n_foot, 3)
         q = base_quat_w.unsqueeze(1).expand(-1, n_foot, -1).reshape(-1, 4)
         return quat_apply_inverse(q, rel.reshape(-1, 3)).reshape(-1, n_foot * 3)
+
+    def _accumulate_curriculum_progress(self):
+        """按当前命令逐步累计真实进展，避免 episode 内命令切换污染课程判定。"""
+        root_xy = self.robot.data.root_pos_w[:, :2].detach()
+        delta_xy = root_xy - self._curriculum_prev_xy
+        cmd_xy = self.commands[:, :2]
+        cmd_mag = torch.linalg.norm(cmd_xy, dim=1)
+        yaw = _yaw_from_quat_w(self.robot.data.root_quat_w)
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        cmd_world = torch.stack([
+            c * cmd_xy[:, 0] - s * cmd_xy[:, 1],
+            s * cmd_xy[:, 0] + c * cmd_xy[:, 1],
+        ], dim=1)
+        cmd_dir_world = cmd_world / cmd_mag.unsqueeze(1).clamp(min=1e-6)
+        moving = cmd_mag > 0.10
+        step_progress = torch.sum(delta_xy * cmd_dir_world, dim=1)
+        self._curriculum_forward_dist += torch.where(moving, step_progress, torch.zeros_like(step_progress))
+        self._curriculum_cmd_distance += cmd_mag * float(self.cfg.dt * self.cfg.decimation)
+        self._curriculum_prev_xy.copy_(root_xy)
 
     def _compute_terrain_ctx(self):
         if self.cfg.terrain_ctx_dim == 0:
@@ -725,6 +1712,29 @@ class TailiAmpEnv(DirectRLEnv):
         ctx = torch.stack([fore.clamp(-0.6, 0.6), lat.clamp(-0.6, 0.6), rough], dim=-1)
         return torch.nan_to_num(ctx, nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _amp_terrain_context(self):
+        """返回与盲态可观测性一致的 AMP 地形条件。
+
+        严格盲态策略在碰障前不能知道扫描器已经看到楼梯，因此 AMP、参考采样和
+        RSI 也不能提前要求地形步态。碰撞或承重换层发生后，环境会写入上一帧的
+        被动地形响应，再连续打开地形条件。
+        """
+        if self.cfg.terrain_ctx_dim == 0:
+            return self._terrain_ctx
+        if not bool(getattr(self.cfg, "strict_blind_terrain_reward", False)):
+            return self._terrain_ctx
+        response = getattr(
+            self,
+            "_blind_amp_terrain_response",
+            torch.zeros(self.num_envs, device=self.device),
+        )
+        response = torch.clamp(
+            torch.as_tensor(response, dtype=self._terrain_ctx.dtype, device=self.device),
+            0.0,
+            1.0,
+        )
+        return self._terrain_ctx * response[:, None]
+
     def _compute_amp_obs(self):
         jp = self.robot.data.joint_pos
         jv = self.robot.data.joint_vel
@@ -735,7 +1745,7 @@ class TailiAmpEnv(DirectRLEnv):
         self._terrain_ctx = self._compute_terrain_ctx()
         # AMP 只表达风格：纯运动学状态 + terrain_ctx。
         # 速度和命令不进入判别器；速度/命令跟踪由双侧 tracking 奖励负责。
-        return torch.cat([jp, jv, bh, tn, rel_b, self._terrain_ctx], dim=-1)
+        return torch.cat([jp, jv, bh, tn, rel_b, self._amp_terrain_context()], dim=-1)
 
     def _get_observations(self) -> dict:
         if not getattr(self, "use_external_commands", False):
@@ -843,6 +1853,15 @@ class TailiAmpEnv(DirectRLEnv):
         tlvl = float(terrain_stats["terrain_mean"])
         real_tlvl = float(terrain_stats["terrain_real_mean"])
         disc_tlvl = float(terrain_stats["terrain_discrete_mean"])
+        boxes_tlvl = float(terrain_stats.get("terrain_boxes_mean", 0.0))
+        stairs_tlvl = float(terrain_stats.get("terrain_stairs_mean", 0.0))
+        stairs_up_tlvl = float(terrain_stats.get("terrain_stairs_up_mean", 0.0))
+        boxes_success = float(getattr(self, "_terrain_boxes_success_ema", 0.0))
+        stairs_down_success = float(getattr(self, "_terrain_stairs_down_success_ema", 0.0))
+        stairs_up_success = float(getattr(self, "_terrain_stairs_up_success_ema", 0.0))
+        boxes_collapse = float(getattr(self, "_terrain_boxes_collapse_ema", 1.0))
+        stairs_down_collapse = float(getattr(self, "_terrain_stairs_down_collapse_ema", 1.0))
+        stairs_up_collapse = float(getattr(self, "_terrain_stairs_up_collapse_ema", 1.0))
         tctx = self._terrain_ctx.abs().mean(0) if self.cfg.terrain_ctx_dim > 0 else None
         with torch.no_grad():
             # last_air_time 是每只脚已完成摆动相的滞空时长，单位与 air_time_target 一致。
@@ -865,6 +1884,36 @@ class TailiAmpEnv(DirectRLEnv):
             "yaw": self._yaw_prog,
         }
         min_prog, active_dirs = active_direction_progress(progress_by_dir, self.cfg, self._phase)
+        command_delivery_values = [
+            float(self._command_execution_coverage.get(name, 0.0))
+            for name in active_dirs
+            if name in self._command_execution_coverage
+        ]
+        self._command_delivery_gate = (
+            min(command_delivery_values) if command_delivery_values else 0.0
+        )
+        direction_audit = getattr(self, "_direction_audit", {})
+        sustained_values = []
+        terminal_values = []
+        for name in active_dirs:
+            audit = direction_audit.get(name, {}) if isinstance(direction_audit, dict) else {}
+            if not audit or float(audit.get("eval_samples", 0.0)) <= 0.0:
+                continue
+            sustained_values.append(min(
+                float(audit.get("posture_gate", 0.0)),
+                float(audit.get("support_gate", 0.0)),
+                float(audit.get("motion_gate", 0.0)),
+            ))
+            terminal_values.append(float(audit.get("terminal_rate", 1.0)))
+        self._sustained_execution_gate = min(sustained_values) if sustained_values else 0.0
+        self._direction_terminal_rate = max(terminal_values) if terminal_values else 1.0
+        # execution 必须同时表示命令送达和动作持续可用，不能再把字段相等误报为能力。
+        self._execution_gate = min(
+            self._command_delivery_gate,
+            self._sustained_execution_gate,
+        )
+        # 课程只读取平地过渡结果；地形命令变化由地形稳定与真实通过指标评价。
+        self._transition_failure_gate = float(self._cmd_transition_flat_failure_ema)
         self._slip_ema = 0.7 * self._slip_ema + 0.3 * getattr(self, "_slip_now", 0.0)
         diag_contact = float(getattr(self, "_diag_contact", 0.0))
         duty_balance = float(getattr(self, "_duty_balance", 0.0))
@@ -874,11 +1923,13 @@ class TailiAmpEnv(DirectRLEnv):
         self._style_err = getattr(self, "_style_err", 1.0)
 
         # 统一训练阶段：0 平地全方向，1 平地 mixed，2 地形/DR，3 扩展部署包络。
-        # penalty ramp 从训练开始由预算控制。预算过高时 gate 降低，避免质量惩罚压过任务奖励。
+        # 旧训练可继续使用预算 ramp；盲态全局策略关闭该反馈，预算只做遥测。
         ramp_step = 1.0 / C.penalty_ramp_intervals
         budget_ratio = float(getattr(self, "_budget_ratio_ema", 0.0))
         budget_max = float(getattr(C, "penalty_budget_ratio_max", 0.8))
-        if budget_ratio > budget_max:
+        if not self._penalty_budget_controls_quality:
+            self._penalty_gate = 1.0
+        elif budget_ratio > budget_max:
             self._penalty_gate = max(0.0, self._penalty_gate - ramp_step)
         else:
             self._penalty_gate = min(1.0, self._penalty_gate + ramp_step)
@@ -891,7 +1942,12 @@ class TailiAmpEnv(DirectRLEnv):
         self._terrain_health_ok = terrain_health_ok
         # 回退保护：能力退化时暂停地形/速度推进。
         # 地形推进保留低持续滑移约束，但不把平地对角/duty 模板强加到高楼梯或 boxes。
-        self._advance_ok = not (fall_rate > C.regress_fall or min_prog < C.regress_prog) and (
+        regress_execution = float(getattr(C, "regress_execution", 0.70))
+        self._advance_ok = not (
+            fall_rate > C.regress_fall
+            or min_prog < C.regress_prog
+            or self._execution_gate < regress_execution
+        ) and (
             not terrain_phase or terrain_health_ok
         )
         # 阶段推进门控：需要连续 phase_intervals 个日志间隔满足。
@@ -907,12 +1963,75 @@ class TailiAmpEnv(DirectRLEnv):
         slip_thr = _phase_thr("slip", 0.20)
         diag_thr = _phase_thr("diag", 0.80)
         duty_thr = _phase_thr("duty", 0.80)
+        duty_target_thr = _phase_thr("duty_target", duty_thr)
+        duty_symmetry_thr = _phase_thr("duty_symmetry", duty_thr)
+        period_thr = _phase_thr("period", 0.55)
+        yaw_gait_thr = _phase_thr("yaw_gait", 0.35)
+        duty_valid_thr = _phase_thr("duty_valid", 0.70)
+        execution_thr = _phase_thr("execution", 0.80)
+        terminal_rate_thr = _phase_thr("terminal_rate", 0.01)
+        transition_fail_thr = _phase_thr("transition_fail", 0.12)
         air_thr = _phase_thr("air", 0.0)
-        # 质量门控从 phase 0 就生效；_0 阈值是早期可达的平地条。
+        duty_target_score = float(getattr(self, "_duty_target_score", 0.0))
+        duty_symmetry_score = float(getattr(self, "_duty_symmetry_score", 0.0))
+        period_score = float(getattr(self, "_gait_period_score", 0.0))
+        yaw_gait_score = float(getattr(self, "_yaw_gait_gate", 0.0))
+        duty_valid_frac = float(getattr(self, "_duty_cycle_valid_frac", 0.0))
+        yaw_required = "yaw" in active_dirs
+        execution_ok = self._execution_gate >= execution_thr
+        terminal_rate_ok = self._direction_terminal_rate <= terminal_rate_thr
+        transition_min_events = int(getattr(C, "phase_gate_transition_min_events", 128))
+        transition_samples_ok = self._cmd_transition_flat_event_count >= transition_min_events
+        # 过渡是最终动作质量，不参与基础能力课程推进。
+        self._phase_transition_gate_active = False
+        transition_safety_ok = True
+        # 质量门控逐项判断，避免乘积或均值掩盖真实阻塞项。
         flat_quality_ok = (
-            self._slip_ema <= slip_thr and diag_contact >= diag_thr and duty_balance >= duty_thr and air >= air_thr
+            self._slip_ema <= slip_thr
+            and diag_contact >= diag_thr
+            and duty_target_score >= duty_target_thr
+            and duty_symmetry_score >= duty_symmetry_thr
+            and duty_valid_frac >= duty_valid_thr
+            and period_score >= period_thr
+            and (not yaw_required or yaw_gait_score >= yaw_gait_thr)
+            and air >= air_thr
         )
-        terrain_quality_ok = self._slip_ema <= max(slip_thr, terrain_slip_thr)
+        flat_metrics = getattr(self, "_flat_quality_metrics", {})
+        flat_core_checks = {
+            "tilt_p95": float(flat_metrics.get("tilt_p95", 1e9))
+            <= _phase_thr("flat_tilt_p95", 0.16),
+            "wxy": float(flat_metrics.get("wxy_mean", 1e9))
+            <= _phase_thr("flat_wxy", 0.40),
+            "height_error_p95": float(flat_metrics.get("height_error_p95", 1e9))
+            <= _phase_thr("flat_height_error_p95", 0.055),
+            "touchdown_vz_p95": float(flat_metrics.get("touchdown_vz_p95", 1e9))
+            <= _phase_thr("flat_touchdown_vz_p95", 0.60),
+            "slip_high": float(flat_metrics.get("slip_high", 1e9))
+            <= _phase_thr("flat_slip_high", 0.28),
+            "trajectory_p95": float(flat_metrics.get("trajectory_worst_p95", 1e9))
+            <= _phase_thr("flat_trajectory_p95", 3.0),
+            "false_terrain_response": float(flat_metrics.get("false_terrain_response", 1e9))
+            <= _phase_thr("flat_false_terrain_response", 0.01),
+        }
+        flat_gait_checks = {
+            "diagonal": float(flat_metrics.get("diagonal_contact", 0.0)) >= diag_thr,
+            "duty_target": float(flat_metrics.get("duty_target", 0.0)) >= duty_target_thr,
+            "duty_symmetry": float(flat_metrics.get("duty_symmetry", 0.0)) >= duty_symmetry_thr,
+            "duty_valid": float(flat_metrics.get("duty_valid", 0.0)) >= duty_valid_thr,
+            "period": float(flat_metrics.get("period", 0.0)) >= period_thr,
+            "yaw_gait": (not yaw_required or yaw_gait_score >= yaw_gait_thr),
+        }
+        flat_core_ok = all(flat_core_checks.values())
+        flat_gait_ok = all(flat_gait_checks.values())
+        self._flat_core_gate_checks = flat_core_checks
+        self._flat_gait_gate_checks = flat_gait_checks
+        terrain_quality_ok = (
+            self._slip_ema <= max(slip_thr, terrain_slip_thr)
+            and flat_core_ok
+            and flat_gait_ok
+        )
+        self._flat_core_gate_ok = flat_core_ok
+        self._flat_gait_gate_ok = flat_gait_ok
         quality_ok = terrain_quality_ok if terrain_phase else flat_quality_ok
         phase_spec = phase_command_spec(C, self._phase) if phase_command_spec is not None else {}
         command_mode = str(phase_spec.get("command_mode", ""))
@@ -920,32 +2039,129 @@ class TailiAmpEnv(DirectRLEnv):
         terrain_gate_level = real_tlvl if float(terrain_stats.get("terrain_real_frac", 0.0)) > 0.0 else tlvl
         discrete_gate_thr = float(getattr(C, "phase_gate_discrete_terrain_2", 0.0))
         discrete_gate_ok = discrete_gate_thr <= 0.0 or disc_tlvl >= discrete_gate_thr
+        boxes_gate_thr = float(getattr(C, "phase_gate_boxes_2", 0.0))
+        stairs_gate_thr = float(getattr(C, "phase_gate_stairs_2", 0.0))
+        stairs_up_gate_thr = float(getattr(C, "phase_gate_stairs_up_2", 0.0))
+        terrain_type_gate_ok = (
+            (boxes_gate_thr <= 0.0 or boxes_tlvl >= boxes_gate_thr)
+            and (stairs_gate_thr <= 0.0 or stairs_tlvl >= stairs_gate_thr)
+            and (stairs_up_gate_thr <= 0.0 or stairs_up_tlvl >= stairs_up_gate_thr)
+        )
+        terrain_capability_gate_ok = (
+            boxes_success >= float(getattr(C, "phase_gate_boxes_success_2", 0.0))
+            and stairs_down_success >= float(getattr(C, "phase_gate_stairs_down_success_2", 0.0))
+            and stairs_up_success >= float(getattr(C, "phase_gate_stairs_up_success_2", 0.0))
+            and boxes_collapse <= float(getattr(C, "phase_gate_boxes_collapse_2", 1.0))
+            and stairs_down_collapse <= float(getattr(C, "phase_gate_stairs_down_collapse_2", 1.0))
+            and stairs_up_collapse <= float(getattr(C, "phase_gate_stairs_up_collapse_2", 1.0))
+        )
         if terrain_phase:
             gate = (
-                self._penalty_gate >= 1.0
-                and min_prog >= prog_thr
+                min_prog >= prog_thr
+                and execution_ok
+                and terminal_rate_ok
                 and quality_ok
                 and (
                     not is_mixed_phase
                     or (
                         terrain_gate_level >= C.phase_gate_terrain_2
                         and discrete_gate_ok
+                        and terrain_type_gate_ok
+                        and terrain_capability_gate_ok
                         and fall_rate < C.phase_gate_fall_2
                     )
                 )
             )
         else:
-            # 平地阶段：要求全方向跟踪、步态质量和 penalty ramp 完整。
-            gate = self._penalty_gate >= 1.0 and min_prog >= prog_thr and quality_ok
-        # 死锁保护：某一阶段超过 phase_max_steps 仍无法自然推进时，强制进入下一阶段并打印告警。
-        # 计时从 penalty_gate 达到 1.0 后开始，避免把正常 ramp 过程误判为死锁。
+            # 早期平地阶段以核心、跟踪和步态质量推进；过渡继续训练和记录，但不独占课程。
+            gate = (
+                min_prog >= prog_thr
+                and execution_ok
+                and terminal_rate_ok
+                and transition_safety_ok
+                and quality_ok
+            )
+        terrain_level_ok = terrain_gate_level >= C.phase_gate_terrain_2
+        terrain_mixed_ok = (
+            terrain_level_ok
+            and discrete_gate_ok
+            and terrain_type_gate_ok
+            and terrain_capability_gate_ok
+            and fall_rate < C.phase_gate_fall_2
+        )
+        self._phase_gate_ok = bool(gate)
+        self._phase_gate_status = {
+            "progress": min_prog >= prog_thr,
+            "execution": execution_ok,
+            "terminal_rate": terminal_rate_ok,
+            "quality": quality_ok,
+            "transition": transition_safety_ok,
+            "terrain_phase_active": terrain_phase,
+            "terrain_mixed_active": terrain_phase and is_mixed_phase,
+            "terrain_level": terrain_level_ok,
+            "terrain_discrete": discrete_gate_ok,
+            "terrain_type": terrain_type_gate_ok,
+            "terrain_capability": terrain_capability_gate_ok,
+            "terrain_fall": fall_rate < C.phase_gate_fall_2,
+            "terrain_mixed": terrain_mixed_ok,
+        }
+        self._phase_gate_values = {
+            "progress": min_prog,
+            "execution": self._execution_gate,
+            "command_delivery": self._command_delivery_gate,
+            "sustained_execution": self._sustained_execution_gate,
+            "terminal_rate": self._direction_terminal_rate,
+            "slip": self._slip_ema,
+            "diagonal": float(flat_metrics.get("diagonal_contact", diag_contact)) if terrain_phase else diag_contact,
+            "duty_target": float(flat_metrics.get("duty_target", duty_target_score)) if terrain_phase else duty_target_score,
+            "duty_symmetry": float(flat_metrics.get("duty_symmetry", duty_symmetry_score)) if terrain_phase else duty_symmetry_score,
+            "duty_valid": float(flat_metrics.get("duty_valid", duty_valid_frac)) if terrain_phase else duty_valid_frac,
+            "period": float(flat_metrics.get("period", period_score)) if terrain_phase else period_score,
+            "yaw_gait": yaw_gait_score,
+            "air": air,
+            "terrain_level": terrain_gate_level,
+            "terrain_discrete": disc_tlvl,
+            "terrain_boxes": boxes_tlvl,
+            "terrain_stairs_down": stairs_tlvl,
+            "terrain_stairs_up": stairs_up_tlvl,
+            "terrain_boxes_success": boxes_success,
+            "terrain_stairs_down_success": stairs_down_success,
+            "terrain_stairs_up_success": stairs_up_success,
+            "terrain_boxes_collapse": boxes_collapse,
+            "terrain_stairs_down_collapse": stairs_down_collapse,
+            "terrain_stairs_up_collapse": stairs_up_collapse,
+            "fall": fall_rate,
+            # 保存本次门控实际读取的平地值。遥测页面不能拿更高频的即时值与上一轮
+            # gate 布尔值拼接，否则会出现“全绿但 count 不增加”的时间错位。
+            "flat_tilt_p95": float(flat_metrics.get("tilt_p95", 1e9)),
+            "flat_wxy": float(flat_metrics.get("wxy_mean", 1e9)),
+            "flat_ang_accel_p95": float(flat_metrics.get("ang_accel_p95", 1e9)),
+            "flat_height_error_p95": float(flat_metrics.get("height_error_p95", 1e9)),
+            "flat_touchdown_vz_p95": float(flat_metrics.get("touchdown_vz_p95", 1e9)),
+            "flat_slip_high": float(flat_metrics.get("slip_high", 1e9)),
+            "flat_trajectory_p95": float(flat_metrics.get("trajectory_worst_p95", 1e9)),
+            "flat_false_terrain_response": float(flat_metrics.get("false_terrain_response", 1e9)),
+            "flat_diagonal": float(flat_metrics.get("diagonal_contact", 0.0)),
+            "flat_duty_target": float(flat_metrics.get("duty_target", 0.0)),
+            "flat_duty_symmetry": float(flat_metrics.get("duty_symmetry", 0.0)),
+            "flat_duty_valid": float(flat_metrics.get("duty_valid", 0.0)),
+            "flat_period": float(flat_metrics.get("period", 0.0)),
+            "flat_yaw_gait": yaw_gait_score,
+        }
+        self._phase_gate_eval_step = int(self._log_step)
+        # 死锁保护仅在显式开启时使用；关闭预算控制的策略从首个日志窗口开始计时。
         _step_now = int(getattr(self, "_log_step", 0))
-        if self._penalty_gate >= 1.0 and getattr(self, "_phase_penalty_full_step", None) is None:
+        if (
+            (self._penalty_gate >= 1.0 or not self._penalty_budget_controls_quality)
+            and getattr(self, "_phase_penalty_full_step", None) is None
+        ):
             self._phase_penalty_full_step = _step_now
         _clock_start = getattr(self, "_phase_penalty_full_step", None)
         _phase_max_steps = int(getattr(C, "phase_max_steps", 25000))
+        _phase_timeout_enable = bool(getattr(C, "phase_timeout_enable", False))
         _timed_out = (
-            os.environ.get("TAILI_NO_PHASE_TIMEOUT") != "1"
+            _phase_timeout_enable
+            and os.environ.get("TAILI_NO_PHASE_TIMEOUT") != "1"
             and _clock_start is not None
             and (_step_now - int(_clock_start)) >= _phase_max_steps
         )
@@ -981,13 +2197,52 @@ class TailiAmpEnv(DirectRLEnv):
         # DR 课程：与地形课程并行，但不被地形等级硬绑定。
         # DR 按进展、直立和跌倒率自门控；地形和 DR 各自推进，互不作为唯一前置条件。
         # dr_unlock_terrain 可推迟 DR，让策略先获得一定地形立足能力。
+        self._dr_gate_terrain_level = float(terrain_gate_level)
+        self._dr_gate_progress_required = float(
+            [C.dr_gate_progress, C.dr_gate_progress_l2, C.dr_gate_progress_l3][min(self._dr_level, 2)]
+        )
+        self._dr_gate_terrain_required = float(getattr(C, "dr_unlock_terrain", 0.0))
+        self._dr_gate_eligible = False
         if (
             self._phase >= getattr(self, "_dr_start_phase", self._terrain_start_phase)
             and self._dr_level < 3
             and terrain_gate_level >= getattr(C, "dr_unlock_terrain", 0.0)
         ):
             gate_prog = [C.dr_gate_progress, C.dr_gate_progress_l2, C.dr_gate_progress_l3][self._dr_level]
-            if min_prog >= gate_prog and upright >= 0.97 and fall_rate < 0.05:
+            dr_execution = float(getattr(C, "dr_gate_execution", 0.82))
+            dr_transition_start_level = int(getattr(C, "dr_gate_transition_start_level", 2))
+            kind_failure = self._cmd_transition_flat_kind_failure_ema
+            kind_valid = self._cmd_transition_flat_kind_failure_ema_valid
+            kind_events = self._cmd_transition_flat_kind_event_count
+            transition_final_thresholds = {
+                "stop": float(getattr(C, "dr_gate_transition_stop_fail_final", 0.35)),
+                "reverse": float(getattr(C, "dr_gate_transition_reverse_fail_final", 0.30)),
+                "axis": float(getattr(C, "dr_gate_transition_axis_fail_final", 0.40)),
+            }
+            transition_kind_ok = all(
+                kind_valid[name]
+                and kind_events[name] >= transition_min_events
+                and kind_failure[name] <= transition_final_thresholds[name]
+                for name in ("stop", "reverse", "axis")
+            )
+            handoff_fail_final = float(getattr(C, "dr_gate_transition_handoff_fail_final", 0.10))
+            transition_handoff_ok = (
+                self._cmd_handoff_failure_ema_valid
+                and self._cmd_handoff_event_count >= transition_min_events
+                and self._cmd_handoff_failure_ema <= handoff_fail_final
+            )
+            # 分类型过渡统计保留给诊断，不能阻塞已经验证的地形和核心能力进入 DR。
+            dr_transition_ok = True
+            self._dr_transition_kind_ok = transition_kind_ok
+            self._dr_transition_handoff_ok = transition_handoff_ok
+            self._dr_gate_eligible = bool(
+                min_prog >= gate_prog
+                and self._execution_gate >= dr_execution
+                and dr_transition_ok
+                and upright >= 0.97
+                and fall_rate < 0.05
+            )
+            if self._dr_gate_eligible:
                 self._dr_gate_count += 1
                 if self._dr_gate_count >= C.dr_gate_intervals:
                     self._dr_level += 1; self._dr_gate_count = 0
@@ -1017,9 +2272,9 @@ class TailiAmpEnv(DirectRLEnv):
                      for ti, nm in enumerate(self._type_names) if bool((env_type == ti).any())]
             terr_type_str = "\n          terr_by_type: " + "  ".join(parts)
         d = getattr(self, "_rew_dbg", {})
-        d = {k: d.get(k, 0.0) for k in ("lin", "ang", "gait", "imit", "stand", "height", "slip", "clear",
-                                        "hip", "offax", "over", "under", "wrong", "climb", "terr_up", "terr_down",
-                                        "terr_support", "terr_quality", "terr_collapse", "land", "torq", "arate", "vz", "wxy")}
+        d = {k: d.get(k, 0.0) for k in ("lin", "ang", "gait", "exchange", "traj", "imit", "stand", "height", "support", "slip", "clear",
+                                        "hip", "offax", "over", "under", "wrong", "dir_progress", "dir_align", "speed_scale", "terr_support",
+                                        "terr_quality", "terr_collapse", "terr_over", "land", "torq", "arate", "vz", "wxy")}
         print(f"[ENV s={self._log_step}] PHASE={self._phase} pen_gate={self._penalty_gate:.2f} "
               f"budget={float(getattr(self, '_budget_ratio_ema', 0.0)):.2f} "
               f"clr_gate={self._clearance_gate:.2f} "
@@ -1032,21 +2287,36 @@ class TailiAmpEnv(DirectRLEnv):
               f"gait_match={gm:.2f} diag={diag_contact:.2f} duty_bal={duty_balance:.2f} "
               f"style_err={self._style_err:.3f} upright={upright:.2f} air={air:.2f} "
               f"terrain={tlvl:.2f} real={real_tlvl:.2f} discrete={disc_tlvl:.2f}{tctx_str}{terr_type_str}\n"
-              f"          rew[task]: lin={d['lin']:+.2f} ang={d['ang']:+.2f} gait={d['gait']:+.2f} imit={d['imit']:+.2f} "
-              f"stand={d['stand']:+.2f} height={d['height']:+.2f} slip={d['slip']:+.2f} clear={d['clear']:+.2f} "
+              f"          rew[task]: lin={d['lin']:+.2f} ang={d['ang']:+.2f} gait={d['gait']:+.2f} exchange={d['exchange']:+.2f} "
+              f"traj={d['traj']:+.2f} imit={d['imit']:+.2f} "
+              f"stand={d['stand']:+.2f} height={d['height']:+.2f} support={d['support']:+.2f} slip={d['slip']:+.2f} clear={d['clear']:+.2f} "
               f"hip={d['hip']:+.2f} offax={d['offax']:+.2f} over={d['over']:+.2f} under={d['under']:+.2f} wrong={d['wrong']:+.2f} "
               f"land={d['land']:+.2f} vz={d['vz']:+.2f} "
               f"wxy={d['wxy']:+.2f} torq={d['torq']:+.3f} arate={d['arate']:+.2f}  (+AMP style by skrl)\n"
-              f"          rew[terrain]: climb={d['climb']:+.2f} up={d['terr_up']:+.2f} down={d['terr_down']:+.2f} "
-              f"support={d['terr_support']:+.2f} quality={d['terr_quality']:+.2f} collapse={d['terr_collapse']:+.2f}\n"
+              f"          rew[terrain]: direction={d['dir_progress']:+.2f} align={d['dir_align']:.2f} "
+              f"speed_scale={d['speed_scale']:.2f} support={d['terr_support']:+.2f} quality={d['terr_quality']:+.2f} "
+              f"collapse={d['terr_collapse']:+.2f} overspeed={d['terr_over']:+.2f}\n"
               f"          GATE phi{self._phase}: min_prog={min_prog:.2f}(need>={prog_thr:.2f}) "
               f"terrain_gate={terrain_gate_level:.2f}/{C.phase_gate_terrain_2:.2f} "
               f"disc_gate={disc_tlvl:.2f}/{discrete_gate_thr:.2f} "
-              f"quality={int(quality_ok)}(slip<={slip_thr:.2f},diag>={diag_thr:.2f},duty>={duty_thr:.2f},air>={air_thr:.2f}) "
+              f"quality={int(quality_ok)}(slip={self._slip_ema:.2f}<={slip_thr:.2f},"
+              f"diag={diag_contact:.2f}>={diag_thr:.2f},duty_range={duty_target_score:.2f}>={duty_target_thr:.2f},"
+              f"duty_sym={duty_symmetry_score:.2f}>={duty_symmetry_thr:.2f},period={period_score:.2f}>={period_thr:.2f},"
+              f"duty_valid={duty_valid_frac:.2f}>={duty_valid_thr:.2f},"
+              f"yaw_gait={yaw_gait_score:.2f}>={yaw_gait_thr:.2f},air={air:.2f}>={air_thr:.2f}) "
+              f"flat_transition="
+              f"{(1.0 - self._transition_failure_gate) if self._cmd_transition_flat_event_count > 0 else 0.0:.2f}"
+              f"/{(1.0 - self._cmd_handoff_failure_ema) if self._cmd_handoff_event_count > 0 else 0.0:.2f} "
+              f"events={self._cmd_transition_flat_event_count}/{transition_min_events} "
               f"pen_gate={self._penalty_gate:.2f}/1.0 count={self._phase_count}/{C.phase_intervals} | "
               f"act_std={act_std:.3f} cmd_frac={fwd:.2f}/{bwd:.2f}/{lat:.2f}/{yaw:.2f}", flush=True)
+        # 终止率已经被本次课程门控消费；下一日志窗口重新累计，避免旧失败永久稀释新能力。
+        if hasattr(self, "_direction_terminal_event_count"):
+            self._direction_terminal_event_count.zero_()
+            self._direction_terminal_target_count.zero_()
 
     def _get_rewards(self) -> torch.Tensor:
+        self._evaluate_command_transition_post_physics()
         # 双侧速度跟踪：速度由这里统一负责，欠速和超速都会降低奖励。
         # cmd=0 时奖励零残差，形成干净停步；AMP/参考只判断风格，不负责速度语义。
         vel_lin = self.robot.data.root_lin_vel_b[:, :2]
@@ -1118,12 +2388,14 @@ class TailiAmpEnv(DirectRLEnv):
         # 轨迹级 imitation：按当前命令和 gait phase 直接跟踪参考关节。
         # AMP 只是分布先验，imitation 用于把实际步态拉向参考轨迹；粗糙地形上同样放松。
         if self.cfg.rew_imitate != 0.0:
-            spd_im = torch.norm(self.commands[:, :2], dim=1)
+            yaw_speed_equiv = float(getattr(self.cfg, "gait_yaw_speed_equiv", 0.15))
+            spd_im = torch.norm(self.commands[:, :2], dim=1) + yaw_speed_equiv * self.commands[:, 2].abs()
             T_im = torch.clamp(self.cfg.gait_period - self.cfg.gait_period_slope * spd_im,
                                min=self.cfg.gait_period_min, max=self.cfg.gait_period)
             rough_im = self._terrain_ctx[:, 2] if self.cfg.terrain_ctx_dim >= 3 else None
             jp_ref = flat_reference(self.commands, self._gait_phase * T_im, gait_period=self.cfg.gait_period,
                                     gait_period_slope=self.cfg.gait_period_slope, gait_period_min=self.cfg.gait_period_min,
+                                    yaw_speed_equiv=yaw_speed_equiv,
                                     clearance_base=self.cfg.base_clearance, roughness=rough_im,
                                     clearance_rough_gain=self.cfg.ref_clearance_rough_gain, stance_dx=self.cfg.stance_dx,
                                     jp_only=True, iters=12)            # 快路径：只生成关节位置，12 次 IK。
@@ -1278,7 +2550,10 @@ class TailiAmpEnv(DirectRLEnv):
         dxy = foot_pos[:, :, None, :2] - hits[:, None, :, :2]              # (N,4,P,2)
         nearest = torch.argmin(torch.sum(dxy * dxy, dim=-1), dim=-1)       # (N,4)
         ground_z = torch.gather(hits[:, :, 2], 1, nearest)                 # (N,4)
-        foot_clearance = torch.clamp(foot_pos[:, :, 2] - ground_z, min=0.0)
+        foot_clearance = torch.clamp(
+            taili_geometry.sole_clearance(foot_pos[:, :, 2], ground_z),
+            min=0.0,
+        )
         contact_w = in_contact.clamp(0.0, 1.0)
         contact_sum = contact_w.sum(dim=1)
         support_z_contact = (ground_z * contact_w).sum(dim=1) / contact_sum.clamp(min=1.0)
@@ -1483,24 +2758,71 @@ class TailiAmpEnv(DirectRLEnv):
         died = died | nonfinite
         return died, time_out
 
+    def _apply_actuator_gain_dr(self, env_ids, level: int):
+        """按 DR 等级随机化执行器增益，并返回本次参与随机化的环境掩码。"""
+        n = len(env_ids)
+        k_range = getattr(self.cfg, f"dr_stiffness_scale_{level}")
+        d_range = getattr(self.cfg, f"dr_damping_scale_{level}")
+        apply_prob = min(max(float(getattr(self.cfg, f"dr_apply_prob_{level}", 1.0)), 0.0), 1.0)
+        apply_mask = torch.rand(n, device=self.device) < apply_prob
+        self._dr_apply_fraction = float(apply_mask.float().mean()) if n > 0 else 0.0
+        try:
+            k_scale = torch.ones(n, 1, device=self.device)
+            d_scale = torch.ones(n, 1, device=self.device)
+            if bool(apply_mask.any()):
+                selected = int(apply_mask.sum())
+                k_scale[apply_mask] = torch.empty(selected, 1, device=self.device).uniform_(*k_range)
+                d_scale[apply_mask] = torch.empty(selected, 1, device=self.device).uniform_(*d_range)
+            base_k = self._actuator_stiffness_base.view(1, -1)
+            base_d = self._actuator_damping_base.view(1, -1)
+            self.robot.actuators["legs"].stiffness[env_ids] = base_k * k_scale
+            self.robot.actuators["legs"].damping[env_ids] = base_d * d_scale
+        except Exception:
+            if "gain" not in self._dr_warned:
+                print("[DR] gain API unavailable; skipping stiffness/damping DR", flush=True)
+                self._dr_warned.add("gain")
+        return apply_mask
+
     def _reset_idx(self, env_ids):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self.robot._ALL_INDICES
+        # 在父类清空 reset 标志之前保存失败语义。真实 terminal 下一回合重试同一
+        # 命令，避免失败方向通过 reset 随机换题；timeout 和首次初始化仍正常重采样。
+        _valid_before_reset = self.episode_length_buf[env_ids] > 0
+        if hasattr(self, "reset_terminated"):
+            _retry_failed_command = (
+                self.reset_terminated[env_ids].bool() & _valid_before_reset
+            ).clone()
+        else:
+            _retry_failed_command = torch.zeros_like(
+                _valid_before_reset, dtype=torch.bool
+            )
+        _previous_command_target = self._cmd_target[env_ids].detach().clone()
         # 地形课程：reset 重新定位前，按 episode 内前进距离和稳定性决定升/降级。
         if self.cfg.terrain.terrain_type == "generator":
             root_xy = self.robot.data.root_pos_w[env_ids, :2]
             root_z = self.robot.data.root_pos_w[env_ids, 2]
-            dist = torch.norm(root_xy - self._terrain.env_origins[env_ids, :2], dim=1)
-            cmd_xy = self._episode_start_cmd_xy[env_ids]
-            cmd_mag = torch.norm(cmd_xy, dim=1)
-            cmd_dir = cmd_xy / cmd_mag.unsqueeze(1).clamp(min=1e-6)
-            episode_delta_xy = root_xy - self._episode_start_xy[env_ids]
-            forward_dist = torch.sum(episode_delta_xy * cmd_dir, dim=1)
-            height_delta = root_z - self._episode_start_root_z[env_ids]
+            elapsed_s = self.episode_length_buf[env_ids].float() * float(self.cfg.dt * self.cfg.decimation)
+            cmd_mag = self._curriculum_cmd_distance[env_ids] / elapsed_s.clamp(min=1e-6)
+            forward_dist = self._curriculum_forward_dist[env_ids]
+            current_cmd_xy = self.commands[env_ids, :2]
+            current_cmd_dir = current_cmd_xy / torch.linalg.norm(current_cmd_xy, dim=1, keepdim=True).clamp(min=1e-6)
+            if hasattr(self, "_loaded_support_z"):
+                current_support_z = self._loaded_support_z[env_ids]
+                support_height_valid = self._loaded_support_valid[env_ids]
+            else:
+                current_support_z = root_z - float(
+                    getattr(self.cfg, "stand_height", taili_geometry.NOMINAL_BASE_HEIGHT)
+                )
+                support_height_valid = torch.zeros_like(root_z, dtype=torch.bool)
+            support_height_valid &= self._episode_support_initialized[env_ids]
+            support_height_delta = current_support_z - self._episode_start_support_z[env_ids]
             valid_episode = self.episode_length_buf[env_ids] > 0
-            # 地形只在解锁阶段且未触发回退保护时推进；bootstrap 和平地清步态阶段保持低难度。
+            # 地形课程从配置阶段开始独立推进。是否升级已经由当前地形 episode 的
+            # 换层事件、稳定支撑、受控速度和终止状态共同决定，不能再被四方向最小
+            # 平地 progress 串行锁住；失败 episode 仍会立即降级或保持最低等级。
             terrain_curriculum_active = self._phase >= getattr(self, "_terrain_start_phase", 5)
-            terrain_unlocked = terrain_curriculum_active and self._advance_ok
+            terrain_unlocked = terrain_curriculum_active
             if hasattr(self, "reset_terminated"):
                 terminal_now = self.reset_terminated[env_ids].bool()
             else:
@@ -1515,7 +2837,7 @@ class TailiAmpEnv(DirectRLEnv):
             else:
                 contact_count = torch.full_like(root_z, 4.0)
             body_wxy = torch.linalg.norm(self.robot.data.root_ang_vel_b[env_ids, :2], dim=1)
-            v_along = torch.sum(self.robot.data.root_lin_vel_b[env_ids, :2] * cmd_dir, dim=1)
+            v_along = torch.sum(self.robot.data.root_lin_vel_b[env_ids, :2] * current_cmd_dir, dim=1)
             self._ensure_gate_mask()
             eligible_mask = torch.ones_like(valid_episode, dtype=torch.bool)
             if bool(getattr(self.cfg, "terrain_curriculum_ignore_flat", True)):
@@ -1524,6 +2846,24 @@ class TailiAmpEnv(DirectRLEnv):
                     "_real_terrain_mask",
                     torch.ones(self.num_envs, dtype=torch.bool, device=self.device),
                 )[env_ids]
+            boxes_mask = torch.zeros_like(valid_episode, dtype=torch.bool)
+            down_mask = torch.zeros_like(valid_episode, dtype=torch.bool)
+            up_mask = torch.zeros_like(valid_episode, dtype=torch.bool)
+            expected_height_direction = torch.zeros_like(root_z)
+            if hasattr(self, "_col_type") and hasattr(self, "_type_names"):
+                env_type = self._col_type[self._terrain.terrain_types[env_ids]]
+                if "boxes" in self._type_names:
+                    boxes_mask = env_type == self._type_names.index("boxes")
+                if "stairs" in self._type_names:
+                    down_mask = env_type == self._type_names.index("stairs")
+                    expected_height_direction = torch.where(
+                        down_mask, -torch.ones_like(expected_height_direction), expected_height_direction
+                    )
+                if "stairs_up" in self._type_names:
+                    up_mask = env_type == self._type_names.index("stairs_up")
+                    expected_height_direction = torch.where(
+                        up_mask, torch.ones_like(expected_height_direction), expected_height_direction
+                    )
             if not hasattr(self, "_terrain_level_peak") or self._terrain_level_peak.shape != self._terrain.terrain_levels.shape:
                 self._terrain_level_peak = self._terrain.terrain_levels.clone()
             if not hasattr(self, "_terrain_move_down_streak") or self._terrain_move_down_streak.shape != self._terrain.terrain_levels.shape:
@@ -1536,10 +2876,11 @@ class TailiAmpEnv(DirectRLEnv):
                     self._terrain_level_peak[env_ids],
                 )
             moves = compute_terrain_curriculum_moves(
-                dist=dist,
                 cmd_mag=cmd_mag,
                 forward_dist=forward_dist,
-                height_delta=height_delta,
+                support_height_delta=support_height_delta,
+                expected_height_direction=expected_height_direction,
+                support_height_valid=support_height_valid,
                 valid_episode=valid_episode,
                 terrain_curriculum_active=bool(terrain_curriculum_active),
                 terrain_unlocked=bool(terrain_unlocked),
@@ -1551,9 +2892,8 @@ class TailiAmpEnv(DirectRLEnv):
                 v_along=v_along,
                 max_episode_length_s=float(self.max_episode_length_s),
                 terrain_move_up_dist=float(self.cfg.terrain_move_up_dist),
-                height_gain=float(getattr(self.cfg, "terrain_curriculum_height_gain", 0.08)),
-                height_loss=float(getattr(self.cfg, "terrain_curriculum_height_loss", 0.08)),
-                forward_min=float(getattr(self.cfg, "terrain_curriculum_forward_min", 0.25)),
+                stair_height_min=float(getattr(self.cfg, "terrain_curriculum_stair_height_min", 0.08)),
+                stair_forward_min=float(getattr(self.cfg, "terrain_curriculum_stair_forward_min", 0.75)),
                 stable_h=float(getattr(self.cfg, "terrain_curriculum_stable_h", 0.42)),
                 stable_upright=float(getattr(self.cfg, "terrain_curriculum_stable_upright", 0.85)),
                 stable_contact_min=float(getattr(self.cfg, "terrain_curriculum_stable_contact_min", 2.0)),
@@ -1588,14 +2928,54 @@ class TailiAmpEnv(DirectRLEnv):
                 move_down_low = move_down_low & ~(peaked & at_floor)
             move_down = move_down_low | failure_down
             with torch.no_grad():
-                eligible_valid = valid_episode.bool() & eligible_mask.bool()
+                evaluation_eligible = moves.get(
+                    "evaluation_eligible",
+                    torch.ones_like(valid_episode, dtype=torch.bool),
+                )
+                effective_eligible = eligible_mask.bool() & evaluation_eligible.bool()
+                eligible_valid = valid_episode.bool() & effective_eligible
                 n = max(int(eligible_valid.float().sum().item()), 1)
-                self._terrain_curriculum_eligible_frac = float(eligible_mask.float().mean())
+                self._terrain_curriculum_eligible_frac = float(effective_eligible.float().mean())
                 self._terrain_curriculum_move_up_rate = float(move_up.float().sum() / n)
                 self._terrain_curriculum_move_down_rate = float(move_down.float().sum() / n)
                 self._terrain_curriculum_failure_down_rate = float(failure_down.float().sum() / n)
-                self._terrain_curriculum_stable_end_rate = float(moves["stable_end"].float().sum() / n)
-                self._terrain_curriculum_speed_ok_rate = float(moves["speed_controlled"].float().sum() / n)
+                self._terrain_curriculum_stable_end_rate = float((moves["stable_end"] & eligible_valid).float().sum() / n)
+                self._terrain_curriculum_speed_ok_rate = float((moves["speed_controlled"] & eligible_valid).float().sum() / n)
+                stair_required = (up_mask | down_mask) & eligible_valid
+                sn = max(int(stair_required.float().sum().item()), 1)
+                self._terrain_curriculum_stair_height_ok_rate = float(
+                    (moves["height_ok"] & stair_required).float().sum() / sn
+                )
+                # Phase 2 验收使用分类型滚动成功率和 collapse 率，类型之间不能互相补偿。
+                # 空批次保持旧值，避免某次 reset 恰好没有该类型时把能力读数清零。
+                family_beta = min(max(float(getattr(self.cfg, "terrain_curriculum_success_ema_beta", 0.90)), 0.0), 0.999)
+                for family_name, family_mask in (
+                    ("boxes", boxes_mask),
+                    ("stairs_down", down_mask),
+                    ("stairs_up", up_mask),
+                ):
+                    family_valid = family_mask & eligible_valid
+                    family_count = int(family_valid.sum().item())
+                    if family_count <= 0:
+                        continue
+                    success_sample = float((move_up & family_valid).float().sum() / family_count)
+                    collapse_sample = float((failure_down & family_valid).float().sum() / family_count)
+                    success_attr = f"_terrain_{family_name}_success_ema"
+                    collapse_attr = f"_terrain_{family_name}_collapse_ema"
+                    if not hasattr(self, success_attr):
+                        setattr(self, success_attr, success_sample)
+                        setattr(self, collapse_attr, collapse_sample)
+                    else:
+                        setattr(
+                            self,
+                            success_attr,
+                            family_beta * float(getattr(self, success_attr)) + (1.0 - family_beta) * success_sample,
+                        )
+                        setattr(
+                            self,
+                            collapse_attr,
+                            family_beta * float(getattr(self, collapse_attr)) + (1.0 - family_beta) * collapse_sample,
+                        )
                 discrete_mask = getattr(
                     self,
                     "_discrete_terrain_mask",
@@ -1613,16 +2993,52 @@ class TailiAmpEnv(DirectRLEnv):
         self._obs_history[env_ids] = 0.0
         self._delayed_action[env_ids] = 0.0
         self._in_contact[env_ids] = 0.0
+        if hasattr(self, "_amp_history_initialized"):
+            self._amp_history_initialized[env_ids] = False
         self._cmd_transition_zero_frac[env_ids] = 0.5
         self._cmd_transition_strength[env_ids] = 0.0
+        self._cmd_transition_wait_steps[env_ids] = 0
+        self._cmd_transition_stable_steps[env_ids] = 0
+        self._cmd_transition_state[env_ids] = 0
+        self._cmd_transition_require_stop[env_ids] = False
+        self._cmd_transition_kind[env_ids] = 0
+        self._cmd_transition_old_axis[env_ids] = 0
+        self._cmd_transition_stage_step[env_ids] = 0
+        self._cmd_transition_elapsed_steps[env_ids] = 0
+        self._cmd_transition_action_rate[env_ids] = 0.0
+        self._cmd_transition_strict_ready[env_ids] = False
+        self._cmd_transition_body_safe[env_ids] = False
+        self._cmd_transition_motion_ready[env_ids] = False
+        self._cmd_transition_posture_ready[env_ids] = False
+        self._cmd_transition_support_phase_ready[env_ids] = False
+        self._cmd_transition_motion_fault[env_ids] = 0.0
+        self._cmd_transition_initial_motion_fault[env_ids] = 0.0
+        self._cmd_transition_motion_target[env_ids] = 0.0
+        self._cmd_transition_motion_excess[env_ids] = 0.0
+        self._cmd_transition_failed[env_ids] = False
+        self._cmd_transition_failed_event[env_ids] = False
+        self._cmd_transition_flat[env_ids] = False
+        self._cmd_handoff_active[env_ids] = False
+        self._cmd_handoff_timer[env_ids] = 0
+        self._cmd_handoff_goal[env_ids] = 0.0
+        self._cmd_previous[env_ids] = self._cmd_target[env_ids]
+        self._cmd_age_s[env_ids] = float(getattr(self.cfg, "cmd_transition_max_s", 0.35))
         # 域随机化：按等级选择扰动参数。高等级额外扰动摩擦、base CoM 和 IMU 偏置。
         n = len(env_ids)
         lvl = self._dr_level
         self._imu_bias[env_ids] = 0.0     # 先清零；需要时在下方按等级重采样。
+        self._dr_apply_fraction = 0.0
+        # DR 起始阶段只加入轻量 Kp/Kd 扰动；质量、推扰、摩擦、CoM 和 IMU
+        # 仍由正式 DR 等级控制。
+        if (
+            self.cfg.dr_enable
+            and lvl == 0
+            and self._phase >= getattr(self, "_dr_start_phase", self._terrain_start_phase)
+        ):
+            self._apply_actuator_gain_dr(env_ids, 1)
         if self.cfg.dr_enable and lvl >= 1:
             mass_range = getattr(self.cfg, f"dr_mass_range_{lvl}")
-            k_range    = getattr(self.cfg, f"dr_stiffness_scale_{lvl}")
-            d_range    = getattr(self.cfg, f"dr_damping_scale_{lvl}")
+            apply_mask = self._apply_actuator_gain_dr(env_ids, lvl)
             try:
                 # PhysX 质量属性在 CPU 管线；这里全程 CPU，并先恢复默认质量再加扰动，避免跨 reset 漂移。
                 masses = self.robot.root_physx_view.get_masses()                 # (N, n_bodies)，CPU tensor。
@@ -1630,21 +3046,12 @@ class TailiAmpEnv(DirectRLEnv):
                     self._default_masses = masses[:, 0].clone()                  # 默认 root 质量，只缓存一次。
                 eids = env_ids.detach().cpu()
                 delta = torch.empty(n).uniform_(*mass_range)                     # CPU，与质量 tensor 同设备。
+                delta[~apply_mask.detach().cpu()] = 0.0
                 masses[eids, 0] = self._default_masses[eids] + delta             # 恢复默认值后再加扰动。
                 self.robot.root_physx_view.set_masses(masses, eids)
             except Exception as e:
                 if "mass" not in self._dr_warned:
                     print(f"[DR] mass DR FAILED: {type(e).__name__}: {e}", flush=True); self._dr_warned.add("mass")
-            try:
-                k_scale = torch.zeros(n, 1, device=self.device).uniform_(*k_range)
-                d_scale = torch.zeros(n, 1, device=self.device).uniform_(*d_range)
-                base_k = self._actuator_stiffness_base.view(1, -1)
-                base_d = self._actuator_damping_base.view(1, -1)
-                self.robot.actuators["legs"].stiffness[env_ids] = base_k * k_scale
-                self.robot.actuators["legs"].damping[env_ids] = base_d * d_scale
-            except Exception:
-                if "gain" not in self._dr_warned:
-                    print("[DR] gain API unavailable; skipping stiffness/damping DR", flush=True); self._dr_warned.add("gain")
             # 摩擦、CoM 和 IMU 是部署关键 DR 通道；由 dr_full_start_level 控制何时打开，
             # 并随等级逐步扩大扰动范围。
             _dr_full_lvl = int(getattr(self.cfg, "dr_full_start_level", 1))
@@ -1684,11 +3091,20 @@ class TailiAmpEnv(DirectRLEnv):
         num = len(env_ids)
         # reset 顺序：先采样命令，再按命令和地形选择 clip，最后从该 clip 采样初始姿态。
         self._resample_commands(env_ids, snap=True)
-        tctx_arg = self._terrain_ctx[env_ids] if self.cfg.terrain_ctx_dim > 0 else None
+        self._cmd_target[env_ids] = taili_amp_reference.preserve_failed_command_targets(
+            self._cmd_target[env_ids],
+            _previous_command_target,
+            _retry_failed_command,
+        )
+        if bool(_retry_failed_command.any()):
+            _retry_ids = env_ids[_retry_failed_command]
+            self._begin_command_transition(_retry_ids, snap=True)
+        tctx_arg = self._amp_terrain_context()[env_ids] if self.cfg.terrain_ctx_dim > 0 else None
         clip_ids = self._motion_loader.pick_clips(self.commands[env_ids], tctx_arg)
         start = "start" in self.cfg.reset_strategy
-        times = np.zeros(num) if start else self._motion_loader.sample_times(num)
+        times = np.zeros(num) if start else self._motion_loader.sample_times(num, clip_ids)
         dp, dv, bp, br, blv, bav = self._motion_loader.sample_frames(clip_ids, times)
+        gait_phase = self._motion_loader.sample_gait_phases(clip_ids, times)
         root = self.robot.data.default_root_state[env_ids].clone()
         root[:, 0:3] = bp[:, self.motion_ref_body_index] + self._terrain.env_origins[env_ids]
         root[:, 2] += 0.03
@@ -1697,14 +3113,55 @@ class TailiAmpEnv(DirectRLEnv):
         root[:, 10:13] = bav[:, self.motion_ref_body_index]
         jp = dp[:, self.motion_dof_indexes]
         jv = dv[:, self.motion_dof_indexes]
+        flat_mask = self._flat_transition_scope_mask()[env_ids]
+        stand_reset_mask = taili_amp_reference.apply_flat_stand_reset(
+            root,
+            jp,
+            jv,
+            self.commands[env_ids],
+            self._terrain.env_origins[env_ids],
+            self.action_offset[env_ids],
+            flat_mask,
+            sole_clearance=float(getattr(self.cfg, "flat_stand_reset_clearance", 0.003)),
+        )
+        # RSI 只提供合法初始姿态，不提供命令匹配的根速度或关节速度。策略必须从
+        # 自己的动作获得全部任务进展，reset 帧不能直接领取跟踪与 AMP 信用。
+        taili_amp_reference.neutralize_reset_velocities(root, jv)
+        gait_phase[stand_reset_mask] = 0.0
+        if bool(getattr(self, "use_external_commands", False)):
+            stand_command_mask = (
+                (torch.linalg.norm(self.commands[env_ids, :2], dim=-1) <= 0.05)
+                & (self.commands[env_ids, 2].abs() <= 0.05)
+            )
+            root_speed = torch.linalg.norm(root[:, 7:13], dim=-1)
+            joint_speed = torch.linalg.norm(jv, dim=-1)
+            print(
+                "[TPRESET] external=1 "
+                f"flat={int(flat_mask.sum())}/{len(env_ids)} "
+                f"stand_command={int(stand_command_mask.sum())}/{len(env_ids)} "
+                f"stand_reset={int(stand_reset_mask.sum())}/{len(env_ids)} "
+                f"root_speed_max={float(root_speed.max()):.6f} "
+                f"joint_speed_max={float(joint_speed.max()):.6f}",
+                flush=True,
+            )
         self.robot.write_root_link_pose_to_sim(root[:, :7], env_ids)
         self.robot.write_root_com_velocity_to_sim(root[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(jp, jv, None, env_ids)
         self.last_actions[env_ids] = 0.0
-        self._gait_phase[env_ids] = torch.rand(len(env_ids), device=self.device)   # 打散 env 间步态相位。
+        # clip 时间仍随机，因此 env 间相位仍然打散；但 gait clock 必须与刚写入的
+        # 物理姿态一致，不能让接触奖励和 live reference 在 reset 后互相冲突。
+        self._gait_phase[env_ids] = gait_phase
         self._episode_start_xy[env_ids] = root[:, 0:2].detach()
         self._episode_start_root_z[env_ids] = root[:, 2].detach()
+        self._episode_start_support_z[env_ids] = (
+            root[:, 2]
+            - float(getattr(self.cfg, "stand_height", taili_geometry.NOMINAL_BASE_HEIGHT))
+        ).detach()
+        self._episode_support_initialized[env_ids] = False
         self._episode_start_cmd_xy[env_ids] = self.commands[env_ids, :2].detach()
+        self._curriculum_prev_xy[env_ids] = root[:, 0:2].detach()
+        self._curriculum_forward_dist[env_ids] = 0.0
+        self._curriculum_cmd_distance[env_ids] = 0.0
         self._cmd_heading_ref[env_ids] = _yaw_from_quat_w(root[:, 3:7]).detach()
         self._heading_error[env_ids] = 0.0
 
@@ -1715,8 +3172,14 @@ class TailiAmpEnv(DirectRLEnv):
         让判别器看到约一个步态周期。仅在 _amp_frame_stride > 1 时调用。
         """
         r = self._amp_raw_ring
+        fresh = ~self._amp_history_initialized
         r[:, 1:] = r[:, :-1].clone()      # FIFO 移位；clone 避免原地别名问题。
         r[:, 0] = amp
+        # reset 后没有真实过去帧。用当前物理帧填充该 env 的窗口，避免判别器从全零
+        # 占位符识别 episode 起点；随后真实时间序列会逐步覆盖这些填充值。
+        if bool(fresh.any()):
+            r[fresh] = amp[fresh, None, :]
+            self._amp_history_initialized[fresh] = True
         stride = self._amp_frame_stride
         for j in range(self.cfg.num_amp_observations):
             self.amp_observation_buffer[:, j] = r[:, j * stride]
@@ -1735,11 +3198,13 @@ class TailiAmpEnv(DirectRLEnv):
         cmd_rep = cmd_s.repeat_interleave(K, dim=0)                                # (num_samples*K, 3)
         # 地形感知参考：传入粗糙度，使粗糙地形参考轨迹抬脚更高。
         rough_rep = None
+        amp_terrain_ctx = self._amp_terrain_context()
         if self.cfg.terrain_ctx_dim >= 3:
-            rough_rep = self._terrain_ctx[env_sel, 2].repeat_interleave(K, dim=0)  # (num_samples*K,)
+            rough_rep = amp_terrain_ctx[env_sel, 2].repeat_interleave(K, dim=0)  # (num_samples*K,)
         jp_clip, jv_clip, bh, tn, foot_rel = flat_reference(
             cmd_rep, times_t, gait_period=self.cfg.gait_period,
             gait_period_slope=self.cfg.gait_period_slope, gait_period_min=self.cfg.gait_period_min,
+            yaw_speed_equiv=float(getattr(self.cfg, "gait_yaw_speed_equiv", 0.15)),
             clearance_base=self.cfg.base_clearance,        # 平地保持较低摆腿，粗糙度项仍会提高地形抬脚。
             roughness=rough_rep, clearance_rough_gain=self.cfg.ref_clearance_rough_gain,
             stance_dx=self.cfg.stance_dx)                  # wider fore-aft stance (blind config 0.05); base 0.0
@@ -1751,7 +3216,7 @@ class TailiAmpEnv(DirectRLEnv):
         # two-sided tracking reward). terrain_ctx kept so the reference style is terrain-conditioned.
         parts = [jp, jv, bh, tn, rel_b]
         if self.cfg.terrain_ctx_dim > 0:
-            tctx_rep = self._terrain_ctx[env_sel].repeat_interleave(K, dim=0)
+            tctx_rep = amp_terrain_ctx[env_sel].repeat_interleave(K, dim=0)
             parts.append(tctx_rep)
         amp = torch.cat(parts, dim=-1)
         return amp.view(-1, self.amp_observation_size)

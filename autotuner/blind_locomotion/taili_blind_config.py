@@ -1,8 +1,8 @@
-"""Single-source Taili blind training configuration.
+"""Taili 盲态训练的单一配置入口。
 
-`taili_blind_config.yaml` is the only editable training configuration. Runtime
-files such as `agent.skrl.yaml` and `effective_config.yaml` are generated from
-it per run; they are evidence artifacts, not independent source configs.
+`taili_blind_config.yaml` 是唯一可编辑训练配置。`agent.skrl.yaml`、
+`effective_config.yaml` 等运行文件由每次 run 生成，只能作为证据，
+不能作为独立策略源。
 """
 from __future__ import annotations
 
@@ -148,10 +148,76 @@ def _obj_value(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
-def phase_command_spec(cfg: Any, phase: int | None = None) -> dict[str, Any]:
-    """Resolve the command recipe active for the current training phase.
+def single_axis_occupancy_deficits(
+    total_envs: int,
+    stand_prob: float,
+    direction_weights: tuple[float, float, float, float] | list[float],
+    surviving_counts: tuple[int, int, int, int, int] | list[int],
+) -> tuple[int, int, int, int, int]:
+    """计算单轴命令重采样时各类别需要补回的环境数。
 
-    The single YAML can describe a phased curriculum:
+    类别顺序为 stand/fwd/back/lat/yaw。这里平衡每个训练步实际存在的
+    环境存量，而不是重采样事件次数；否则容易终止的方向会持续丢失样本，
+    静止但不终止的方向会因存活时间更长而占据大部分 rollout。
+    """
+    total = max(0, int(total_envs))
+    if len(direction_weights) != 4 or len(surviving_counts) != 5:
+        raise ValueError("single-axis occupancy expects four direction weights and five category counts")
+    stand = min(max(float(stand_prob), 0.0), 1.0)
+    weights = [max(0.0, float(value)) for value in direction_weights]
+    weight_sum = sum(weights)
+    if weight_sum <= 1e-12:
+        weights = [1.0, 0.0, 0.0, 0.0]
+        weight_sum = 1.0
+    probabilities = [stand] + [(1.0 - stand) * value / weight_sum for value in weights]
+    raw_targets = [total * probability for probability in probabilities]
+    targets = [int(value) for value in raw_targets]
+    remainder = total - sum(targets)
+    fractional_order = sorted(
+        range(5),
+        key=lambda index: (raw_targets[index] - targets[index], -index),
+        reverse=True,
+    )
+    for index in fractional_order[:remainder]:
+        targets[index] += 1
+    survivors = [max(0, int(value)) for value in surviving_counts]
+    return tuple(max(target - survivor, 0) for target, survivor in zip(targets, survivors))
+
+
+def mixed_command_bucket_probs(
+    stand_prob: float,
+    near_zero_prob: float,
+    single_axis_fraction: float,
+) -> dict[str, float]:
+    """把 mixed 命令的分层语义展开为互斥采样桶。
+
+    stand_prob 先占据全体样本；near_zero_prob 沿用既有语义，只在非站立样本中
+    生效。剩余真实移动样本再按 single_axis_fraction 分成四个等量单轴桶，
+    其余样本等量分给三种双轴混合，避免独立伯努利采样意外丢失某个方向。
+    """
+    stand = min(max(float(stand_prob), 0.0), 1.0)
+    near_zero = (1.0 - stand) * min(max(float(near_zero_prob), 0.0), 1.0)
+    moving = max(0.0, 1.0 - stand - near_zero)
+    single = min(max(float(single_axis_fraction), 0.0), 1.0)
+    per_single = moving * single / 4.0
+    per_mixed = moving * (1.0 - single) / 3.0
+    return {
+        "stand": stand,
+        "near_zero": near_zero,
+        "fwd": per_single,
+        "back": per_single,
+        "lat": per_single,
+        "yaw": per_single,
+        "linear_yaw": per_mixed,
+        "lat_yaw": per_mixed,
+        "mixed_linear": per_mixed,
+    }
+
+
+def phase_command_spec(cfg: Any, phase: int | None = None) -> dict[str, Any]:
+    """解析当前训练阶段实际使用的命令采样规则。
+
+    单一 YAML 可以描述分阶段课程：
 
     training_recipe:
       command_mode: phase_curriculum
@@ -159,9 +225,8 @@ def phase_command_spec(cfg: Any, phase: int | None = None) -> dict[str, Any]:
         0: {command_mode: fixed_forward, fixed_vx: 0.5}
         1: {command_mode: single_axis, prob_fwd: 0.35, ...}
 
-    The env keeps the live phase on ``self._phase``.  This helper is deliberately
-    pure and tolerant of both dict configs and IsaacLab config objects, so tests
-    and runtime use the same code path.
+    环境把当前阶段保存在 ``self._phase``。这个辅助函数保持纯函数形式，
+    并同时兼容 dict 配置和 IsaacLab 配置对象，确保测试和运行时走同一逻辑。
     """
     base_mode = str(_obj_value(cfg, "training_command_mode", "normal") or "normal")
     if base_mode not in {"phase_curriculum", "phased_curriculum", "phased"}:
@@ -190,17 +255,21 @@ def phase_command_spec(cfg: Any, phase: int | None = None) -> dict[str, Any]:
     mode = str(selected.get("command_mode") or selected.get("mode") or "normal")
     out = dict(selected)
     out["command_mode"] = mode
+    if mode == "mixed" and "bucket_probs" not in out and "single_axis_fraction" in out:
+        out["bucket_probs"] = mixed_command_bucket_probs(
+            out.get("stand_prob", 0.0),
+            out.get("near_zero_prob", 0.0),
+            out["single_axis_fraction"],
+        )
     return out
 
 
 def active_command_directions(cfg: Any, phase: int | None = None) -> tuple[str, ...]:
-    """Return the command directions that are actually sampled by this recipe.
+    """返回当前采样规则实际会采样的命令方向。
 
-    Curriculum gates must not take the min over directions that the current
-    recipe never trains. For example, bootstrap_forward fixes all commands to
-    forward velocity, so back/lat/yaw progress staying at zero is not evidence
-    of failure. In normal mixed-command mode, use the configured sampling
-    probabilities.
+    课程门控不能把当前规则根本不训练的方向纳入最小值。例如固定前进阶段
+    只会产生前进命令，此时 back/lat/yaw progress 为 0 不能说明策略失败。
+    普通 mixed-command 阶段则按配置中的采样概率判断活跃方向。
     """
     spec = phase_command_spec(cfg, phase)
     explicit = spec.get("active_dirs")
@@ -214,7 +283,7 @@ def active_command_directions(cfg: Any, phase: int | None = None) -> tuple[str, 
         return ("fwd",)
     if mode == "stand_only":
         return ("stand",)
-    if mode == "mixed":
+    if mode in {"mixed", "bucketed"}:
         return ("fwd", "back", "lat", "yaw")
 
     probs = {
@@ -228,12 +297,11 @@ def active_command_directions(cfg: Any, phase: int | None = None) -> tuple[str, 
 
 
 def phase_progress_directions(cfg: Any, phase: int | None = None) -> tuple[str, ...]:
-    """Directions used by phase/curriculum progress gates.
+    """返回 phase/curriculum progress 门控使用的方向集合。
 
-    Command sampling can still train every direction, including yaw. This helper only
-    controls which directions are allowed to block curriculum progress. It lets terrain
-    unlock depend on traversable linear motion while yaw remains an independently
-    logged and rewarded objective.
+    命令采样仍然可以训练所有方向，包括 yaw。这个辅助函数只决定哪些方向
+    可以阻塞课程推进，使地形解锁主要依赖可通行的线性运动；yaw 仍然独立
+    训练、记录和奖励。
     """
     active = tuple(name for name in active_command_directions(cfg, phase) if name != "stand")
     phase_id = int(phase if phase is not None else _obj_value(cfg, "current_training_phase", _obj_value(cfg, "init_phase", 0)))
@@ -253,9 +321,21 @@ def phase_progress_directions(cfg: Any, phase: int | None = None) -> tuple[str, 
 
 
 def active_direction_progress(progress: Mapping[str, float], cfg: Any, phase: int | None = None) -> tuple[float, tuple[str, ...]]:
-    """Return min progress over phase-gated directions plus that direction list."""
+    """返回参与阶段门控方向的最小 progress，以及这些方向本身。"""
     active = phase_progress_directions(cfg, phase)
+    phase_id = int(phase if phase is not None else _obj_value(cfg, "current_training_phase", _obj_value(cfg, "init_phase", 0)))
+    raw_thresholds = _obj_value(cfg, f"phase_progress_thresholds_{phase_id}", None)
+    if raw_thresholds is None:
+        raw_thresholds = _obj_value(cfg, "phase_progress_thresholds", None)
+    thresholds = _mapping_from_obj(raw_thresholds) if raw_thresholds is not None else {}
+    default_threshold = float(_obj_value(cfg, f"phase_gate_prog_{phase_id}", _obj_value(cfg, "phase_gate_prog", 1.0)) or 1.0)
     values = [float(progress[name]) for name in active if name in progress]
+    if thresholds and default_threshold > 0.0:
+        values = [
+            float(progress[name]) * default_threshold / max(float(thresholds.get(name, default_threshold)), 1e-6)
+            for name in active
+            if name in progress
+        ]
     if not values:
         values = [float(v) for v in progress.values()]
     return (min(values) if values else 0.0), active
@@ -281,6 +361,8 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
     if isinstance(obs, Mapping):
         _set_if_present(env_cfg, "obs_history_len", obs, "history_len")
         _set_if_present(env_cfg, "obs_history_dim", obs, "tick_dim")
+        _set_if_present(env_cfg, "obs_history_stride", obs, "history_stride")
+        _set_if_present(env_cfg, "obs_history_order", obs, "history_order")
         _set_if_present(env_cfg, "observation_space", obs)
         _set_if_present(env_cfg, "amp_observation_space", obs)
         _set_if_present(env_cfg, "num_amp_observations", obs, "amp_frames")
@@ -290,11 +372,14 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
     if isinstance(deployable, Mapping):
         _set_if_present(env_cfg, "obs_history_len", deployable, "history_len")
         _set_if_present(env_cfg, "obs_history_dim", deployable, "tick_dim")
+        _set_if_present(env_cfg, "obs_history_stride", deployable, "history_stride")
+        _set_if_present(env_cfg, "obs_history_order", deployable, "history_order")
     if isinstance(contract, Mapping):
         _set_if_present(env_cfg, "observation_space", contract, "policy_tensor_dim")
     if isinstance(amp, Mapping):
         _set_if_present(env_cfg, "num_amp_observations", amp, "frames")
         _set_if_present(env_cfg, "amp_observation_space", amp, "frame_dim")
+        _set_if_present(env_cfg, "amp_frame_stride", amp, "frame_stride")
 
     control = env.get("control", {})
     if isinstance(control, Mapping):
@@ -317,6 +402,7 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             ("gait_period", "period"),
             ("gait_period_min", "period_min"),
             ("gait_period_slope", "period_slope"),
+            ("gait_yaw_speed_equiv", "yaw_speed_equiv"),
             ("gait_duty", "duty"),
         ):
             _set_if_present(env_cfg, attr, gait, key)
@@ -359,6 +445,7 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "cmd_resample_s_max": "resample_s_max",
             "cmd_smooth_alpha": "smooth_alpha",
             "cmd_transition_enable": "transition_enable",
+            "cmd_transition_policy_managed": "transition_policy_managed",
             "cmd_transition_cycles": "transition_cycles",
             "cmd_transition_min_s": "transition_min_s",
             "cmd_transition_max_s": "transition_max_s",
@@ -367,23 +454,36 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "cmd_transition_sign_flip_w": "transition_sign_flip_w",
             "cmd_transition_low_speed_v": "transition_low_speed_v",
             "cmd_transition_low_speed_w": "transition_low_speed_w",
-            "cmd_transition_contact_feet": "transition_contact_feet",
             "cmd_transition_zero_frac_min": "transition_zero_frac_min",
             "cmd_transition_zero_frac_max": "transition_zero_frac_max",
             "cmd_transition_stop_zero_frac": "transition_stop_zero_frac",
+            "cmd_transition_stable_s": "transition_stable_s",
+            "cmd_transition_release_s": "transition_release_s",
+            "cmd_transition_failure_ema_beta": "transition_failure_ema_beta",
+            "cmd_transition_wxy_max": "transition_wxy_max",
+            "cmd_transition_tilt_deg": "transition_tilt_deg",
+            "cmd_transition_joint_speed_max": "transition_joint_speed_max",
+            "cmd_transition_action_rate_max": "transition_action_rate_max",
+            "cmd_transition_phase_window": "transition_phase_window",
+            "cmd_transition_handoff_s": "transition_handoff_s",
             "cmd_fwd_max": "fwd_max",
             "cmd_back_max": "back_max",
             "cmd_lat_max": "lat_max",
             "cmd_yaw_max": "yaw_max",
+            "cmd_core_sample_fraction": "core_sample_fraction",
+            "cmd_core_fwd_range": "core_fwd_range",
+            "cmd_core_back_range": "core_back_range",
+            "cmd_core_lat_range": "core_lat_range",
+            "cmd_core_yaw_range": "core_yaw_range",
         }
         for attr, key in mapping.items():
             _set_if_present(env_cfg, attr, commands, key)
 
     curriculum = env.get("curriculum", {})
     if isinstance(curriculum, Mapping):
-        # forward EVERY curriculum key onto the env cfg: gate thresholds are per-phase and sparse
-        # (phase_gate_<name>_<p> with walk-down in the env), so a fixed key list silently drops
-        # newly added phase knobs (e.g. penalty_budget_ratio_max, phase_gate_air_2).
+        # 课程字段全部转发到 env cfg：阶段门槛是稀疏配置，
+        # 例如 phase_gate_<name>_<p> 会在环境中向前回退查找。
+        # 如果这里使用固定白名单，新加的阶段旋钮会被静默丢弃。
         for attr in curriculum:
             _set_if_present(env_cfg, str(attr), curriculum)
 
@@ -392,6 +492,7 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
         mapping = {
             "dr_enable": "enable",
             "dr_start_level": "start_level",
+            "dr_full_start_level": "full_start_level",
             "dr_unlock_terrain": "unlock_terrain",
             "dr_push_interval_s_0": "push_interval_s_0",
             "dr_push_vel_0": "push_vel_0",
@@ -400,17 +501,20 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "dr_mass_range_1": "mass_range_1",
             "dr_stiffness_scale_1": "stiffness_scale_1",
             "dr_damping_scale_1": "damping_scale_1",
+            "dr_apply_prob_1": "apply_prob_1",
             "dr_push_interval_s_2": "push_interval_s_2",
             "dr_push_vel_2": "push_vel_2",
             "dr_mass_range_2": "mass_range_2",
             "dr_stiffness_scale_2": "stiffness_scale_2",
             "dr_damping_scale_2": "damping_scale_2",
+            "dr_apply_prob_2": "apply_prob_2",
             "dr_push_interval_s_3": "push_interval_s_3",
             "dr_push_vel_3": "push_vel_3",
             "dr_push_ang_scale": "push_ang_scale",
             "dr_mass_range_3": "mass_range_3",
             "dr_stiffness_scale_3": "stiffness_scale_3",
             "dr_damping_scale_3": "damping_scale_3",
+            "dr_apply_prob_3": "apply_prob_3",
             "dr_friction_range_3": "friction_range_3",
             "dr_com_offset_3": "com_offset_3",
             "dr_imu_gyro_bias_3": "imu_gyro_bias_3",
@@ -440,6 +544,9 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "rew_lateral_underspeed",
             "directional_aux_backward_only",
             "rew_wrong_dir",
+            "w_settle_brake",
+            "w_transition_failure",
+            "flat_stand_reset_clearance",
             "w_imitate_live",
             "imitate_sigma_live",
             "imitate_fwd_floor",
@@ -450,11 +557,11 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "climb_slip_gate",
             "climb_slip_soft_span",
             "climb_vz_cap",
-            "rew_terrain_up",
-            "rew_terrain_down",
-            "rew_terrain_support_transfer",
             "rew_terrain_contact_quality",
-            "rew_terrain_event_collapse",
+            "rew_terrain_support_loss",
+            "rew_terrain_collapse",
+            "rew_terrain_overspeed",
+            "support_reference_alpha",
             "rew_ang_vel_xy",
             "rew_hip_neutral",
             "hip_neutral_lat_scale",
@@ -464,23 +571,31 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "lateral_foot_scale",
             "terrain_transition_eps",
             "terrain_transition_span",
-            "terrain_event_latch_s",
+            "terrain_probe_height",
+            "terrain_response_height_scale",
+            "terrain_response_delta_scale",
+            "terrain_response_height_deadband",
+            "terrain_response_delta_deadband",
+            "terrain_collision_trace_decay_time",
+            "terrain_collision_response_full_scale",
+            "terrain_support_height_alpha",
+            "terrain_collision_ratio_start",
+            "terrain_collision_ratio_span",
+            "terrain_body_collision_force_start",
+            "terrain_body_collision_force_span",
+            "terrain_recovery_termination_height",
+            "terrain_recovery_termination_tilt_deg",
+            "terrain_trajectory_leg_relief",
+            "terrain_progress_full_ratio",
+            "terrain_overspeed_start_ratio",
+            "terrain_overspeed_span_ratio",
             "terrain_up_vz_cap",
             "terrain_down_vz_cap",
             "terrain_down_vz_target",
-            "terrain_event_quality_floor",
-            "terrain_front_duty_margin",
-            "terrain_rear_duty_floor",
-            "terrain_support_scale",
-            "terrain_torque_soft_frac",
-            "terrain_event_collapse_height",
-            "terrain_event_collapse_wxy",
-            "terrain_event_collapse_speed_ratio",
-            "terrain_event_collapse_speed_min",
-            "terrain_event_collapse_speed_scale",
-            "terrain_curriculum_height_gain",
-            "terrain_curriculum_height_loss",
-            "terrain_curriculum_forward_min",
+            "terrain_collapse_height",
+            "terrain_collapse_wxy",
+            "terrain_curriculum_stair_forward_min",
+            "terrain_curriculum_stair_height_min",
             "terrain_curriculum_stable_h",
             "terrain_curriculum_stable_upright",
             "terrain_curriculum_stable_contact_min",
@@ -493,6 +608,7 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             "terrain_curriculum_floor_after_peak",
             "terrain_curriculum_peak_drop",
             "terrain_curriculum_move_down_patience",
+            "terrain_curriculum_success_ema_beta",
             "discrete_clearance",
             "speed_tol_abs",
             "speed_tol_rel",

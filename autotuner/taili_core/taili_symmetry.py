@@ -50,9 +50,13 @@ MODE_P = [0, 1, 2, 3, 4]
 # under y->-y: slope_y flips; foot_h swaps FL<->FR, RL<->RR; rest unchanged
 GEOM_P = [0, 1, 2, 4, 3, 6, 5, 7, 8]
 GEOM_S = [1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-# risk_label2 [impact_score, support_instability]: both unchanged
-RISK_P = [0, 1]
-RISK_S = [1.0, 1.0]
+# risk_label8 [impact, support_instability, event_up, event_down,
+#              lead_FL, lead_FR, lead_RL, lead_RR]
+# 左右镜像保持风险和事件方向，交换左右先导脚。
+RISK_P = [0, 1, 2, 3, 5, 4, 7, 6]
+RISK_S = [1.0] * 8
+BASE_RISK_P = [0, 1]
+BASE_RISK_S = [1.0, 1.0]
 
 
 def _seg(x, perm, sign=None):
@@ -97,7 +101,13 @@ def mirror_geom_label9(g):
 
 
 def mirror_risk_label2(r):
-    return _seg(r, RISK_P, RISK_S)      # aux risk label (impact, support_instability unchanged)
+    """镜像基础风险二元组；保留给只处理 impact/support 的调用方。"""
+    return _seg(r, BASE_RISK_P, BASE_RISK_S)
+
+
+def mirror_risk_label8(r):
+    """镜像完整辅助风险标签，事件先导脚按 FL/FR、RL/RR 交换。"""
+    return _seg(r, RISK_P, RISK_S)
 
 
 def mirror_z_terrain32(z):
@@ -114,22 +124,24 @@ def _mirror_foot_rel12(f):
 
 
 # ── composite layouts ────────────────────────────────────────────────────────
-# body53: angvel3 | grav3 | cmd3 | jpos12 | jvel12 | lastact12 | gait8
-def mirror_actor_body53(b):
+# body57: angvel3 | grav3 | cmd3 | prev_cmd3 | cmd_age1 | jpos12 | jvel12 | lastact12 | gait8
+def mirror_actor_body57(b):
     return torch.cat([
         mirror_gyro3(b[..., 0:3]),
         mirror_projected_gravity3(b[..., 3:6]),
         mirror_command3(b[..., 6:9]),
-        mirror_joint_vec12(b[..., 9:21]),
-        mirror_joint_vec12(b[..., 21:33]),
-        mirror_action12(b[..., 33:45]),
-        mirror_gait_clock8(b[..., 45:53]),
+        mirror_command3(b[..., 9:12]),
+        b[..., 12:13],
+        mirror_joint_vec12(b[..., 13:25]),
+        mirror_joint_vec12(b[..., 25:37]),
+        mirror_action12(b[..., 37:49]),
+        mirror_gait_clock8(b[..., 49:57]),
     ], dim=-1)
 
 
-# actor_input85 = body53 | z_terrain32
-def mirror_actor_input85(x):
-    return torch.cat([mirror_actor_body53(x[..., :53]), mirror_z_terrain32(x[..., 53:85])], dim=-1)
+# actor_input89 = body57 | z_terrain32
+def mirror_actor_input89(x):
+    return torch.cat([mirror_actor_body57(x[..., :57]), mirror_z_terrain32(x[..., 57:89])], dim=-1)
 
 
 # tick54: q_rel12 | dq12 | q_des_rel12 | q_error12 | gyro3 | grav3
@@ -174,8 +186,21 @@ def mirror_amp_frame102(x):
     return torch.cat([mirror_amp_frame51(x[..., 0:51]), mirror_amp_frame51(x[..., 51:102])], dim=-1)
 
 
+def mirror_amp_frames(x):
+    """Mirror any concatenated frame51 AMP window without changing time order."""
+    if x.shape[-1] % 51 != 0:
+        raise ValueError(f"AMP window width must be divisible by 51, got {x.shape[-1]}")
+    shape = x.shape
+    frames = x.reshape(*shape[:-1], shape[-1] // 51, 51)
+    return mirror_amp_frame51(frames).reshape(shape)
+
+
+def mirror_amp_frame306(x):
+    return mirror_amp_frames(x)
+
+
 # ── actor helpers ────────────────────────────────────────────────────────────
-def structural_mean(net, x, mirror_in=mirror_actor_input85, mirror_act=mirror_action12):
+def structural_mean(net, x, mirror_in=mirror_actor_input89, mirror_act=mirror_action12):
     """mean = 0.5 [net(x) + M_act net(M_in x)] — L/R equivariant for ANY net weights."""
     return 0.5 * (net(x) + mirror_act(net(mirror_in(x))))
 

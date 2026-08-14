@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Component, useEffect, useMemo, useState, type ErrorInfo, type ReactNode } from "react";
 import {
   cancelChatProposal,
   executeAction,
@@ -15,13 +15,48 @@ import {
 import Chat, { INITIAL_CHAT_MESSAGES, type ChatMessage } from "./Chat";
 import ConfigWorkspace from "./ConfigWorkspace";
 import Diagnostics from "./Diagnostics";
+import Scoreboard from "./Scoreboard";
 import { formatError } from "./i18n/format";
 import LineChart from "./LineChart";
 
-type ToolView = "agent" | "diagnostics" | "config";
+type ToolView = "agent" | "scoreboard" | "diagnostics" | "config";
 type DirectAction = "deploy-payload" | "start" | "resume" | "kill";
 
 const WORKBENCH_POLL_MS = 5000;
+
+class DiagnosticsErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Diagnostics page rendering failed", error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <section className="primary-panel tool-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">物理诊断</p>
+            <h1>诊断页面暂时无法渲染</h1>
+          </div>
+        </div>
+        <div className="inline-alert">诊断数据仍保存在远端，当前只是页面渲染失败。</div>
+        <button className="secondary-button" onClick={() => this.setState({ error: null })}>
+          重新加载诊断页面
+        </button>
+      </section>
+    );
+  }
+}
+
 const AGENT_TREND_PRESETS = [
   {
     id: "phase",
@@ -104,6 +139,7 @@ export default function App() {
   const [view, setView] = useState<ToolView>("agent");
   const [visitedViews, setVisitedViews] = useState<Record<ToolView, boolean>>({
     agent: true,
+    scoreboard: false,
     diagnostics: false,
     config: false,
   });
@@ -279,6 +315,7 @@ export default function App() {
         </div>
         <nav className="product-nav" aria-label="工作区">
           <button className={view === "agent" ? "active" : ""} onClick={() => openView("agent")}>智能体</button>
+          <button className={view === "scoreboard" ? "active" : ""} onClick={() => openView("scoreboard")}>目标记分牌</button>
           <button className={view === "diagnostics" ? "active" : ""} onClick={() => openView("diagnostics")}>诊断工具</button>
           <button className={view === "config" ? "active" : ""} onClick={() => openView("config")}>配置工具</button>
         </nav>
@@ -310,9 +347,16 @@ export default function App() {
             setChatMessages={setChatMessages}
           />
         </div>
+        {visitedViews.scoreboard && (
+          <main className="tool-host workspace-pane" hidden={view !== "scoreboard"}>
+            <Scoreboard active={view === "scoreboard"} />
+          </main>
+        )}
         {visitedViews.diagnostics && (
           <main className="tool-host workspace-pane" hidden={view !== "diagnostics"}>
-            <Diagnostics active={view === "diagnostics"} />
+            <DiagnosticsErrorBoundary>
+              <Diagnostics active={view === "diagnostics"} />
+            </DiagnosticsErrorBoundary>
           </main>
         )}
         {visitedViews.config && (
@@ -408,7 +452,7 @@ function ObjectivePanel({ workbench }: { workbench: AgentWorkbenchInfo }) {
         <h1>{workbench.objective}</h1>
       </div>
       <dl className="attempt-bar">
-        <div><dt>状态</dt><dd>{attempt.running ? "训练中" : stateLabel(attempt.runtime_state)}</dd></div>
+        <div><dt>状态</dt><dd>{attemptStateLabel(attempt.running, attempt.runtime_state)}</dd></div>
         <div><dt>步数</dt><dd>{attempt.step}{attempt.total_steps ? ` / ${attempt.total_steps}` : ""}</dd></div>
         <div><dt>阶段</dt><dd>{attempt.phase || "未知"}</dd></div>
         <div><dt>阻塞</dt><dd>{attempt.blocked_by || "无"}</dd></div>
@@ -456,6 +500,8 @@ function RunControlPanel({
   const actionsById = new Map(workbench.actions.map((action) => [action.id, action]));
   const remote = workbench.evidence.find((item) => item.id === "remote");
   const telemetry = workbench.evidence.find((item) => item.id === "telemetry");
+  const stateReliable = attempt.remote_ok
+    && !["stale", "remote_unavailable", "unknown"].includes(attempt.runtime_state);
   const controls: Array<{ id: string; action: DirectAction; label: string; tone: "primary" | "secondary" | "danger" }> = [
     { id: "deploy-payload", action: "deploy-payload", label: "部署当前包", tone: "secondary" },
     { id: "start-training", action: "start", label: "启动全新训练", tone: "primary" },
@@ -485,7 +531,7 @@ function RunControlPanel({
             <button
               key={control.id}
               className={className}
-              disabled={Boolean(busy) || info?.enabled === false}
+              disabled={Boolean(busy) || info?.enabled === false || (!stateReliable && control.action !== "kill")}
               title={info?.reason || control.label}
               onClick={() => void onDirectAction(control.action)}
             >
@@ -500,6 +546,11 @@ function RunControlPanel({
         <div><dt>遥测</dt><dd>{telemetry?.detail || evidenceStatusLabel(telemetry?.status || "unknown")}</dd></div>
         <div><dt>检查点</dt><dd title={attempt.latest_checkpoint}>{shortPath(attempt.latest_checkpoint)}</dd></div>
       </dl>
+      {!stateReliable && (
+        <p className="control-safety-note" role="status">
+          当前运行状态不可信，已暂停启动、继续和部署。恢复远端连接并取得新遥测后再操作。
+        </p>
+      )}
       <p className="compact-copy">“启动全新训练”会创建新 run，不带 checkpoint；“从检查点继续”会自动解析最新可用 checkpoint。</p>
     </section>
   );
@@ -593,7 +644,6 @@ function TelemetryPanel({
   const telemetry = workbench.evidence.find((item) => item.id === "telemetry");
   const values = telemetry?.values ?? {};
   const latestPoint = trainingTelemetry?.latest ?? null;
-  const status = trainingTelemetry?.available ? "ok" : (telemetry?.status ?? "unknown");
   const [trendPresetId, setTrendPresetId] = useState<AgentTrendPresetId>("phase");
   const [trendScale, setTrendScale] = useState<TrendScaleMode>("normalized");
   const trendOptions = useMemo(() => buildAgentTrendOptions(trainingTelemetry), [trainingTelemetry]);
@@ -632,24 +682,45 @@ function TelemetryPanel({
   const step = numberOrNull(timeline.step ?? values.step ?? workbench.attempt.step);
   const total = numberOrNull(timeline.total_steps ?? values.total_steps ?? workbench.attempt.total_steps);
   const progressPct = total && step !== null ? Math.max(0, Math.min(100, (step / total) * 100)) : null;
-  const blockedBy = textValue(curriculum.blocked_by ?? values.blocked_by ?? workbench.attempt.blocked_by);
+  const phaseGate = recordValue(curriculum.phase_gate);
+  const runtimeBlockers = Array.isArray(phaseGate.runtime_blockers)
+    ? phaseGate.runtime_blockers.map((item: unknown) => textValue(item)).filter(Boolean).join(",")
+    : "";
+  const blockedBy = textValue(
+    curriculum.phase_gate_blockers
+      ?? curriculum.blocked_by
+      ?? values.blocked_by
+      ?? workbench.attempt.blocked_by,
+  ) || runtimeBlockers;
   const telemetryAge = trainingTelemetry?.telemetry_age_s ?? values.telemetry_age_s ?? workbench.attempt.telemetry_age_s;
   const telemetryStale = trainingTelemetry?.stale ?? values.stale;
+  const status = telemetryStale
+    ? "warning"
+    : trainingTelemetry?.available
+      ? "ok"
+      : (telemetry?.status ?? "unknown");
+  const freshnessNotice = telemetryStale
+    ? `遥测已过期（${formatAge(telemetryAge)}）；以下数值是最后已知快照，不代表当前训练状态。`
+    : status !== "ok"
+      ? "当前没有可用遥测，页面不会用零值代替缺失数据。"
+      : "";
 
   return (
     <section className={`primary-panel telemetry-panel flat-panel ${status}`}>
       <div className="panel-heading telemetry-heading">
         <div>
           <p className="eyebrow">当前遥测</p>
-          <h2>{status === "ok" ? "训练状态快照" : "遥测不可用"}</h2>
+          <h2>{telemetryStale ? "最后已知训练快照" : status === "ok" ? "训练状态快照" : "遥测不可用"}</h2>
         </div>
         <div className="telemetry-state">
           <span className={`run-state ${workbench.attempt.running ? "running" : "idle"}`}>
-            {workbench.attempt.running ? "训练中" : stateLabel(workbench.attempt.runtime_state)}
+            {attemptStateLabel(workbench.attempt.running, workbench.attempt.runtime_state)}
           </span>
           <span className={`evidence-pill ${status}`}>{evidenceStatusLabel(status)}</span>
         </div>
       </div>
+
+      {freshnessNotice && <p className={`telemetry-notice ${status}`} role="status">{freshnessNotice}</p>}
 
       <div className="telemetry-hero">
         <MetricCell label="步数" value={formatStep(step, total)} />
@@ -737,21 +808,42 @@ function PhaseGateDetails({
   const activeDirs = textValue(curriculum.active_dirs).split(",").map((item) => item.trim()).filter(Boolean);
   const progressFormula = progressGateFormula(curriculum, activeDirs);
   const rows = [
-    gateRow("惩罚渐入", "penalty_gate 已完全打开", curriculum.penalty_gate, conditions.penalty_gate_min, "higher", conditionsSource.penalty_gate_min),
-    gateRow("方向推进", progressFormula, curriculum.progress_gate ?? command.progress_ratio, conditions.progress_min, "higher", conditionsSource.progress_min),
+    gateRow("方向推进", progressFormula, curriculum.phase_gate_progress_value ?? curriculum.progress_gate ?? command.progress_ratio, conditions.progress_min, "higher", conditionsSource.progress_min),
+    gateRow("执行覆盖", "当前阶段所有参与方向的最小有效执行覆盖", curriculum.phase_gate_execution_value ?? curriculum.execution_gate, conditions.execution_min, "higher", conditionsSource.execution_min),
     gateRow(
       "支撑滑移",
-      terrainPhase ? "地形阶段只要求滑移不过高" : "平地阶段要求支撑期滑移不过高",
-      gait.stance_slip ?? command.stance_slip ?? curriculum.slip_gate,
+      terrainPhase ? "地形阶段仍要求整体支撑滑移不过高" : "平地阶段要求支撑期滑移不过高",
+      curriculum.phase_gate_slip_value ?? gait.stance_slip ?? command.stance_slip ?? curriculum.slip_gate,
       terrainPhase ? conditions.terrain_slip_max : conditions.slip_max,
       "lower",
       terrainPhase ? conditionsSource.terrain_slip_max : conditionsSource.slip_max,
     ),
   ];
-  if (!terrainPhase) {
+  if (terrainPhase) {
+    rows.push(
+      gateRow("平地对角支撑", "只在平地样本上统计，地形样本不会被强套直线模板", curriculum.phase_gate_flat_diagonal_value ?? command.flat_diagonal_contact, conditions.diagonal_min, "higher", conditionsSource.diagonal_min),
+      gateRow("平地 duty 区间", "四腿 duty 落在允许区间内", curriculum.phase_gate_flat_duty_target_value ?? command.flat_duty_target, conditions.duty_target_min, "higher", conditionsSource.duty_target_min),
+      gateRow("平地 duty 对称", "左右、前后和交叉支撑时间保持对称", curriculum.phase_gate_flat_duty_symmetry_value ?? command.flat_duty_symmetry, conditions.duty_symmetry_min, "higher", conditionsSource.duty_symmetry_min),
+      gateRow("平地 duty 覆盖", "各线性方向都完成足够多的真实接触周期", curriculum.phase_gate_flat_duty_valid_value ?? command.flat_duty_valid, conditions.duty_valid_min, "higher", conditionsSource.duty_valid_min),
+      gateRow("平地实际周期", "各线性方向的真实接触周期与目标周期一致", curriculum.phase_gate_flat_period_value ?? command.flat_period, conditions.period_min, "higher", conditionsSource.period_min),
+      gateRow("Yaw 支撑", "Yaw 使用旋转专属支撑结构，不套用直线对角模板", curriculum.phase_gate_flat_yaw_gait_value ?? command.yaw_gait_gate, conditions.yaw_gait_min, "higher", conditionsSource.yaw_gait_min),
+      gateRow("平地倾斜 p95", "稳态移动时机身倾斜尾部", curriculum.phase_gate_flat_tilt_p95_value ?? command.flat_tilt_p95, conditions.flat_tilt_p95_max, "lower", conditionsSource.flat_tilt_p95_max),
+      gateRow("平地角速度", "稳态移动时 roll/pitch 角速度均值", curriculum.phase_gate_flat_wxy_value ?? command.flat_wxy_mean, conditions.flat_wxy_max, "lower", conditionsSource.flat_wxy_max),
+      gateRow("平地角加速度 p95", "roll/pitch 以及稳态 yaw 的角加速度尾部", curriculum.phase_gate_flat_ang_accel_p95_value ?? command.flat_ang_accel_p95, conditions.flat_ang_accel_p95_max, "lower", conditionsSource.flat_ang_accel_p95_max),
+      gateRow("平地高度误差 p95", "移动机身高度相对目标的尾部误差", curriculum.phase_gate_flat_height_error_p95_value ?? command.flat_height_error_p95, conditions.flat_height_error_p95_max, "lower", conditionsSource.flat_height_error_p95_max),
+      gateRow("平地触地速度 p95", "真实承重触地前一帧的向下足速尾部", curriculum.phase_gate_flat_touchdown_vz_p95_value ?? command.flat_touchdown_vz_p95, conditions.flat_touchdown_vz_p95_max, "lower", conditionsSource.flat_touchdown_vz_p95_max),
+      gateRow("平地滑移尾部", "平地支撑滑移高值比例", curriculum.phase_gate_flat_slip_high_value ?? command.flat_slip_high, conditions.flat_slip_high_max, "lower", conditionsSource.flat_slip_high_max),
+      gateRow("平地轨迹 p95", "四腿中最差足端轨迹误差尾部", curriculum.phase_gate_flat_trajectory_p95_value ?? command.flat_trajectory_worst_p95, conditions.flat_trajectory_p95_max, "lower", conditionsSource.flat_trajectory_p95_max),
+      gateRow("平地误触发", "平地样本错误触发地形响应的比例", curriculum.phase_gate_flat_false_terrain_response_value ?? command.flat_false_terrain_response, conditions.flat_false_terrain_response_max, "lower", conditionsSource.flat_false_terrain_response_max),
+    );
+  } else {
     rows.push(
       gateRow("对角支撑", "平地阶段要求对角支撑一致性达标", gait.diagonal_contact ?? command.diagonal_contact ?? curriculum.diagonal_gate, conditions.diagonal_min, "higher", conditionsSource.diagonal_min),
-      gateRow("占空平衡", "平地阶段要求四腿支撑占空平衡达标", gait.duty_balance ?? command.duty_balance ?? curriculum.duty_balance_gate, conditions.duty_min, "higher", conditionsSource.duty_min),
+      gateRow("duty 区间", "四腿支撑占空比处于允许区间", command.duty_target_score, conditions.duty_target_min, "higher", conditionsSource.duty_target_min),
+      gateRow("duty 对称", "左右、前后和交叉支撑时间保持对称", command.duty_symmetry_score, conditions.duty_symmetry_min, "higher", conditionsSource.duty_symmetry_min),
+      gateRow("duty 有效覆盖", "统计窗口已覆盖足够多的有效步态周期", command.duty_cycle_valid_frac, conditions.duty_valid_min, "higher", conditionsSource.duty_valid_min),
+      gateRow("实际周期", "实际接触周期与目标周期相符", command.gait_period_score, conditions.period_min, "higher", conditionsSource.period_min),
+      gateRow("yaw 支撑", "当前阶段要求 yaw 时使用旋转专属支撑结构", command.yaw_gait_gate, conditions.yaw_gait_min, "higher", conditionsSource.yaw_gait_min),
       gateRow("腾空", "平地阶段要求足端腾空指标达标", command.feet_air_time ?? curriculum.air_gate, conditions.air_min, "higher", conditionsSource.air_min),
     );
   }
@@ -759,14 +851,23 @@ function PhaseGateDetails({
     rows.push(
       gateRow("真实地形", "混合地形阶段要求真实地形均值达到门槛", curriculum.terrain_real_mean ?? curriculum.terrain_mean, conditions.terrain_min, "higher", conditionsSource.terrain_min),
       gateRow("离散地形", "混合地形阶段要求 boxes/stairs 等离散地形达到门槛", curriculum.terrain_discrete_mean, conditions.discrete_terrain_min, "higher", conditionsSource.discrete_terrain_min),
+      gateRow("boxes 等级", "boxes 不能被其他地形均值代偿", curriculum.terrain_boxes_mean, conditions.boxes_min, "higher", conditionsSource.boxes_min),
+      gateRow("下楼等级", "下楼梯不能被其他地形均值代偿", curriculum.terrain_stairs_mean, conditions.stairs_down_min, "higher", conditionsSource.stairs_down_min),
+      gateRow("上楼等级", "上楼梯不能被其他地形均值代偿", curriculum.terrain_stairs_up_mean, conditions.stairs_up_min, "higher", conditionsSource.stairs_up_min),
+      gateRow("boxes 成功", "稳定穿越并升级的滚动成功率", curriculum.terrain_boxes_success_rate, conditions.boxes_success_min, "higher", conditionsSource.boxes_success_min),
+      gateRow("下楼成功", "真实承重换层、方向位移和稳定终点同时满足", curriculum.terrain_stairs_down_success_rate, conditions.stairs_down_success_min, "higher", conditionsSource.stairs_down_success_min),
+      gateRow("上楼成功", "真实承重换层、方向位移和稳定终点同时满足", curriculum.terrain_stairs_up_success_rate, conditions.stairs_up_success_min, "higher", conditionsSource.stairs_up_success_min),
+      gateRow("boxes 崩溃", "boxes 终止、低高度或失稳的滚动比例", curriculum.terrain_boxes_collapse_rate, conditions.boxes_collapse_max, "lower", conditionsSource.boxes_collapse_max),
+      gateRow("下楼崩溃", "下楼终止、低高度或失稳的滚动比例", curriculum.terrain_stairs_down_collapse_rate, conditions.stairs_down_collapse_max, "lower", conditionsSource.stairs_down_collapse_max),
+      gateRow("上楼崩溃", "上楼终止、低高度或失稳的滚动比例", curriculum.terrain_stairs_up_collapse_rate, conditions.stairs_up_collapse_max, "lower", conditionsSource.stairs_up_collapse_max),
       gateRow("摔倒率", "混合地形阶段要求摔倒率低于门槛", health.fall_rate ?? curriculum.fall_gate, conditions.fall_max, "lower", conditionsSource.fall_max),
     );
   }
   const ruleSummary = [
-    `所有行同时满足`,
+    gate.condition_set_complete ? `运行时最终 gate ${gate.runtime_gate_ok ? "通过" : "未通过"}` : "当前包未直接输出最终 gate，按有效配置重建",
     `连续 ${formatNumberLike(conditions.phase_intervals)} 次`,
-    terrainPhase ? "地形阶段" : "平地阶段",
-    mixedPhase ? "mixed 命令会检查地形等级" : "当前命令模式不检查地形等级",
+    terrainPhase ? "地形训练已启用" : "地形训练未启用",
+    mixedPhase ? "当前检查分类型地形能力" : "当前不以地形等级阻塞 count",
   ].join(" · ");
   return (
     <DetailPanel
@@ -774,6 +875,7 @@ function PhaseGateDetails({
       meta={[
         `phase ${textValue(curriculum.phase) || "未知"}`,
         `count ${formatNumberLike(curriculum.phase_count)} / ${formatNumberLike(conditions.phase_intervals)}`,
+        `gate@${formatNumberLike(curriculum.phase_gate_eval_step)}`,
         `mode ${commandMode || "未知"}`,
       ]}
     >
@@ -785,11 +887,11 @@ function PhaseGateDetails({
         <dl>
           <div><dt>阈值出处</dt><dd>门槛列标「默认」表示配置里没读到、用了兜底值；标「定值」表示定义性常量、不随策略调整；无标记表示来自本次训练的实际配置。</dd></div>
           <div><dt>推进公式</dt><dd>{progressFormula}</dd></div>
-          <div><dt>Yaw</dt><dd>{activeDirs.includes("yaw") ? "Yaw 参与当前阶段门控。" : "Yaw 当前只记录，不参与阶段门控。"}</dd></div>
-          <div><dt>质量公式</dt><dd>{terrainPhase ? "地形阶段使用滑移健康约束，不强制平地 diag/duty 模板。" : "平地阶段要求滑移、对角支撑、占空平衡、腾空同时满足。"}</dd></div>
+          <div><dt>偏航</dt><dd>{activeDirs.includes("yaw") ? "偏航参与当前阶段门控。" : "偏航当前只记录，不参与阶段门控。"}</dd></div>
+          <div><dt>质量公式</dt><dd>{terrainPhase ? "使用整体滑移，加上仅由平地样本计算的核心质量与接触步态；地形样本本身不强套平地模板。" : "要求滑移、对角支撑、duty、实际周期、yaw 支撑和腾空同时满足。"}</dd></div>
           <div><dt>连续计数</dt><dd>满足一次门控 phase_count +1，不满足则回退；达到 phase_intervals 后进入下一阶段。</dd></div>
-          <div><dt>超时机制</dt><dd>penalty_gate 到 1 后，超过 phase_max_steps 仍未通过会触发 deadlock safeguard。</dd></div>
-          <div><dt>地形阶段</dt><dd>phase &gt;= terrain_start_phase 后额外检查 terrain、discrete terrain 和 fall。</dd></div>
+          <div><dt>超时机制</dt><dd>{"只有 phase_timeout_enable=true 才会强制放行；当前关闭时等待不会替代能力。"}</dd></div>
+          <div><dt>地形阶段</dt><dd>{"phase >= terrain_start_phase 会启用地形训练；只有 mixed 命令阶段才把分类型地形等级、成功率、崩溃率和摔倒率加入 count 门控。"}</dd></div>
           <div><dt>当前配置</dt><dd>terrain_start_phase={formatNumberLike(conditions.terrain_start_phase)}，phase_max_steps={formatNumberLike(conditions.phase_max_steps)}。</dd></div>
         </dl>
       </details>
@@ -854,7 +956,7 @@ function TerrainDetails({
       ]}
     >
       <table className="compact-metric-table terrain-table">
-        <thead><tr><th>类型</th><th>mean</th><th>max</th></tr></thead>
+        <thead><tr><th>类型</th><th>均值</th><th>最大值</th></tr></thead>
         <tbody>
           {rows.map(([label, mean, max]) => (
             <tr key={String(label)}>
@@ -1111,6 +1213,12 @@ function stateLabel(state: string) {
     unknown: "未知",
   };
   return labels[state] ?? state;
+}
+
+function attemptStateLabel(running: boolean, state: string) {
+  if (state === "live" && running) return "训练中";
+  if (state === "stale" && running) return "训练状态未知（遥测过期）";
+  return stateLabel(state);
 }
 
 function confidenceLabel(value: string) {

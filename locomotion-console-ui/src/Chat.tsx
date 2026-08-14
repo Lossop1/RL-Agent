@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import {
   cancelChatProposal,
-  chat,
+  chatStream,
   executeAction,
   getLLMReadiness,
   resetChat,
   type Grounding,
+  type AgentProgressEvent,
   type ContextEnvelopeInfo,
   type LLMReadinessInfo,
   type ProposedAction,
@@ -13,8 +14,11 @@ import {
 import { formatError } from "./i18n/format";
 
 export interface ChatMessage {
+  id?: string;
   role: "user" | "assistant";
   text: string;
+  progress?: AgentProgressEvent[];
+  streaming?: boolean;
   tools?: string[];
   action?: ProposedAction | null;
   grounding?: Grounding | null;
@@ -44,6 +48,7 @@ export default function Chat({
   const [busy, setBusy] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const busyRef = useRef<string | null>(null);
   const modeRef = useRef(mode);
   const contextRef = useRef(context);
 
@@ -51,6 +56,10 @@ export default function Chat({
     modeRef.current = mode;
     contextRef.current = context;
   }, [mode, context]);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
 
   useEffect(() => {
     void refreshReadiness();
@@ -81,43 +90,69 @@ export default function Chat({
 
   async function send(value = input) {
     const text = value.trim();
-    if (!text || busy) return;
-    setMessages((current) => [...current, { role: "user", text }]);
+    if (!text || busyRef.current) return;
+    busyRef.current = "chat";
+    const requestId = `agent-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setMessages((current) => [
+      ...current,
+      { role: "user", text },
+      { id: requestId, role: "assistant", text: "", progress: [], streaming: true },
+    ]);
     setInput("");
     setBusy("chat");
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      const response = await chat(text, modeRef.current, contextRef.current, controller.signal, {
-        page: modeRef.current,
-        intent: text,
-        focus: focusTermsFor(text, modeRef.current),
-        visible: parseContext(contextRef.current),
-        max_chars: 4200,
-        include_remote_status: true,
-      });
-      setMessages((current) => [
-        ...current,
+      const response = await chatStream(
+        text,
+        modeRef.current,
+        contextRef.current,
+        controller.signal,
         {
-          role: "assistant",
-          text: response.reply,
-          tools: response.transcript.map((item) => item.tool || "").filter(Boolean),
-          action: response.proposed_action,
-          grounding: response.grounding,
-          contextEnvelope: response.context_envelope,
-          elapsed_s: response.elapsed_s,
-          suggestions: response.suggestions,
+          page: modeRef.current,
+          intent: text,
+          focus: focusTermsFor(text, modeRef.current),
+          visible: parseContext(contextRef.current),
+          max_chars: 4200,
+          include_remote_status: true,
         },
-      ]);
+        (event) => {
+          if (event.type === "heartbeat" || event.type === "answer_start" || event.type === "complete") return;
+          setMessages((current) => current.map((message) => {
+            if (message.id !== requestId) return message;
+            if (event.type === "progress") {
+              const progress = [...(message.progress || []), event].slice(-16);
+              return { ...message, progress };
+            }
+            if (event.type === "answer_delta") {
+              return { ...message, text: message.text + event.delta };
+            }
+            return message;
+          }));
+        },
+      );
+      setMessages((current) => current.map((message) => message.id === requestId ? {
+        ...message,
+        text: response.reply,
+        streaming: false,
+        tools: response.transcript.map((item) => item.tool || "").filter(Boolean),
+        action: response.proposed_action,
+        grounding: response.grounding,
+        contextEnvelope: response.context_envelope,
+        elapsed_s: response.elapsed_s,
+        suggestions: response.suggestions,
+      } : message));
       await refreshReadiness();
     } catch (reason) {
       const aborted = reason instanceof Error && reason.name === "AbortError";
-      setMessages((current) => [...current, {
-        role: "assistant",
+      setMessages((current) => current.map((message) => message.id === requestId ? {
+        ...message,
+        streaming: false,
         text: aborted ? "已取消等待。后端如果已经进入模型调用，会在超时边界自然结束。" : `请求失败：${formatError(reason)}`,
-      }]);
+      } : message));
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
+      busyRef.current = null;
       setBusy(null);
     }
   }
@@ -198,7 +233,13 @@ export default function Chat({
       <div className="chat-log" aria-live="polite">
         {messages.map((message, index) => (
           <article className={`chat-message ${message.role}`} key={`${message.role}-${index}`}>
-            <div className="chat-text">{renderText(message.text)}</div>
+            <div className="chat-text">{renderText(message.text || (message.streaming ? "正在处理…" : ""))}</div>
+            {message.progress && message.progress.length > 0 && (
+              <details className="chat-evidence" open={message.streaming || undefined}>
+                <summary>执行进度：{message.progress[message.progress.length - 1].label}</summary>
+                <code>{message.progress.map((event) => event.tool ? `${event.label} (${event.tool})` : event.label).join(" -> ")}</code>
+              </details>
+            )}
             {message.tools && message.tools.length > 0 && (
               <details className="chat-evidence">
                 <summary>读取证据：{compactTools(message.tools)}</summary>

@@ -17,13 +17,16 @@ import json
 import os
 import re
 import shlex
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 # The ReAct loop is mostly cheap decisions ("which tool next?") that do NOT need the
 # expensive reasoning model. Measured: fast model + the curriculum facts card holds 100%
 # factual accuracy at ~2-4s/call vs 25-100s on the pro model. Route the loop to the fast
 # model; set LOCOMOTION_CONSOLE_LOOP_MODEL="" to fall back to the config model (pro).
 _LOOP_MODEL = os.environ.get("LOCOMOTION_CONSOLE_LOOP_MODEL", "deepseek-v4-flash") or None
+# 便宜的循环跳 + 最终综合默认关掉“思考”：审计数据显示 flash 仍每跳深想（reasoning 700–2900 字）、
+# 每跳 5–13s，这是“还是慢”的根。关掉后每跳应降到 1–2s。想恢复思考设 LOCOMOTION_CONSOLE_LOOP_THINK=1。
+_LOOP_THINK: bool = os.environ.get("LOCOMOTION_CONSOLE_LOOP_THINK", "").strip() in ("1", "true", "True")
 
 # LLM-supplied identifiers that reach a remote shell must match this before use. repr()/f-string
 # interpolation is NOT shell-safe (a value with a single quote makes repr emit a double-quoted
@@ -34,7 +37,7 @@ _RUN_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
 from .config import LocomotionConsoleSettings
 from .config_manager import desired_framework_id, llm_profile
 from .config_set import get_active_config_set
-from .datasource import RealDataSource
+from .datasource import RealDataSource, make_source
 from .diagnostic_history import DiagnosticHistoryStore
 from .framework_profile import list_framework_profiles
 
@@ -322,6 +325,71 @@ def _tool_get_signal_map(src: RealDataSource, query: str = "") -> Dict[str, Any]
     from .code_knowledge import build_signal_map
 
     return build_signal_map(query=query)
+
+
+def _tool_get_reward_model(src: RealDataSource, query: str = "", term: str = "") -> Dict[str, Any]:
+    """奖励模型知识库(只读):奖励项结构从 taili_reward.py AST 推导(核类型/权重参数/门控/
+    代码位置/相互拆台),当前权重值从本次 run 的 effective_config 现读、经边拼上。
+
+    答"某奖励怎么算 / 权重现在多少 / 动它牵动哪个"用它——durable 结构不会过时,现值现读带出处,
+    比手抄旧值可靠。term 给项名返一项;否则按 query 排序返若干。附带覆盖自审(库缺/代码漏分组等)。
+    """
+    from .knowledge_model import get_reward_model
+
+    effective_config_text = ""
+    if _question_needs_live_evidence(query):
+        try:
+            import asyncio
+
+            telemetry = asyncio.run(src.training_telemetry())
+            effective_config_text = getattr(telemetry, "effective_config_text", "") or ""
+        except Exception:  # noqa: BLE001 — 拿不到现值就回退代码默认(带标注),不因此失败
+            effective_config_text = ""
+    return get_reward_model(query=query, term=term, effective_config_text=effective_config_text).model_dump()
+
+
+def _tool_get_robot_model(src: RealDataSource) -> Dict[str, Any]:
+    """机器人本体知识库(只读):基座标称高度 / 默认关节角 / 执行器 / 自由度,从**激活机器人**的
+    资产 AST 推导,并核对手写的 robot_profile(抓现有自查抓不到的漂移)。
+
+    答"这机器人几个自由度 / 标称高度 / 关节/执行器是什么"用它——不写死某台机器人,按 robot_id 解析。
+    """
+    from .knowledge_model import get_robot_model
+
+    return get_robot_model().model_dump()
+
+
+def _tool_get_curriculum_model(src: RealDataSource, query: str = "") -> Dict[str, Any]:
+    """阶段门控阈值知识库(只读):各阶段推进门槛(进展/地形/摔倒率)、惩罚渐入、阶段间隔、地形等级数等,
+    代码默认从 taili_amp_env_cfg.py AST 推导,当前 run 真值从 effective_config 现读、配对呈现(带出处)。
+
+    答"现在各阶段门控阈值是多少 / 惩罚怎么渐入"用它——不拿手抄的旧值。
+    """
+    from .knowledge_model import get_curriculum_model
+
+    effective_config_text = ""
+    if _question_needs_live_evidence(query):
+        try:
+            import asyncio
+
+            telemetry = asyncio.run(src.training_telemetry())
+            effective_config_text = getattr(telemetry, "effective_config_text", "") or ""
+        except Exception:  # noqa: BLE001 — 拿不到现值就只给代码默认(带标注),不因此失败
+            effective_config_text = ""
+    return get_curriculum_model(effective_config_text=effective_config_text).model_dump()
+
+
+def _tool_get_code_facts(src: RealDataSource, query: str = "") -> Dict[str, Any]:
+    """通用代码取证(只读):任意问题 → 相关类/函数/常量的定义签名 + docstring + 出处(全部 allowlist
+    代码的 AST 符号索引),并明说哪些词没在代码里找到。
+
+    答"某东西怎么实现 / 什么结构 / 在哪定义 / 观测里有什么 / 网络是什么 / 地形扫描怎么算"等**任意**
+    代码问题用它——不必为每类预建专门工具。一次拿到结构化定义,不用反复抠片段;查不到就据此老实说
+    "这块代码里没有 X"。
+    """
+    from .knowledge_model.code_facts import get_code_facts
+
+    return get_code_facts(query=query)
 
 
 def _tool_get_tuning_ledger(src: RealDataSource, limit: int = 24) -> Dict[str, Any]:
@@ -1780,6 +1848,10 @@ TOOLS = {
     "explain_definition": _tool_explain_definition,
     "get_code_knowledge": _tool_get_code_knowledge,
     "get_signal_map": _tool_get_signal_map,
+    "get_reward_model": _tool_get_reward_model,
+    "get_robot_model": _tool_get_robot_model,
+    "get_curriculum_model": _tool_get_curriculum_model,
+    "get_code_facts": _tool_get_code_facts,
     "get_tuning_ledger": _tool_get_tuning_ledger,
     "get_train_log": _tool_get_train_log,
     "get_eval_result": _tool_get_eval_result,
@@ -1834,6 +1906,28 @@ _TOOLS_DOC = """Available tools (read-only):
                                    or a legacy bundle is explicitly needed.
 - get_training_telemetry()      -> structured live telemetry: step/ETA/fps, reward breakdown,
                                    curriculum/gates, health, checkpoint, JSONL/log provenance
+- get_reward_model(query="", term="") -> reward-model knowledge base. Each reward term's STRUCTURE
+                                   (kernel kind / weight param(s) / gates / code location / trade-offs)
+                                   is DERIVED from taili_reward.py; the current weight VALUE is read LIVE
+                                   from this run's effective_config. Use for "how is reward X computed /
+                                   what is its weight now / what does X trade off against". Durable
+                                   structure cannot go stale, live weight carries provenance, and it
+                                   includes a coverage self-audit. Prefer this over guessing a formula.
+- get_robot_model()             -> robot-body knowledge for the ACTIVE robot (not hardcoded): nominal
+                                   base height, default joint angles, actuator model, and DOF, DERIVED
+                                   from the robot's asset cfg, then cross-checked against the curated
+                                   robot_profile (surfaces drift the profile's own self-check can't).
+                                   Use for "how many DOF / nominal height / joints / actuators".
+- get_curriculum_model(query="") -> phase-gate / curriculum thresholds. Code DEFAULTS derived from
+                                   taili_amp_env_cfg.py AST; the CURRENT run values read live from
+                                   effective_config, paired with provenance (never a hand-copied number).
+                                   Use for "what are the current phase-gate thresholds / penalty ramp".
+- get_code_facts(query="")      -> GENERAL code evidence for ANY question: an AST symbol index over all
+                                   allowlisted source. Returns the class/function/constant DEFINITIONS
+                                   (signature + docstring + file:line) matching the query, plus the words
+                                   it could NOT find. One structured lookup instead of snippet fishing;
+                                   use for observation/network/terrain-scan/"how is X implemented" and any
+                                   concept without a dedicated get_*_model tool.
 - get_remote_status()           -> remote machine health: GPU memory/utilization/temperature,
                                    RAM, disk, tmux sessions, and likely training processes
 - probe_telemetry()             -> read-only wiring probe: current run, exact train.log /
@@ -2004,6 +2098,40 @@ Each turn, reply with STRICT JSON, ONE of:
                                                                   propose an action.
 
 Rules:
+- EVIDENCE COMPLETENESS IS A HARD GATE: a list of visible metrics or configured thresholds is a
+  subset unless the evidence explicitly marks the condition set complete. Never turn "all displayed
+  fields pass" into "all runtime conditions pass". State the scope and missing conditions.
+- ESCALATE CONTRADICTIONS: when the observed state conflicts with the current explanation, do not
+  repeat the same telemetry or close the gap with "possibly / wait longer". Trace the relevant runtime
+  fields through get_code_facts, which can return both AST definitions and allowlisted source windows,
+  then reconcile code, effective config, and live values.
+- CAUSAL CLAIMS REQUIRE MECHANISM EVIDENCE: telemetry can show WHAT happened; it does not by itself
+  prove WHY a state variable changed or did not change. For causal questions, cite the code condition
+  or explicitly say the mechanism is still missing.
+- Treat the intent_router/evidence_gate records as controller requirements, not suggestions. Do not
+  answer until required evidence is present or its failure/gap has been recorded.
+- INVESTIGATE BEFORE GIVING UP (MOST IMPORTANT — do not skip): if what you already have does not
+  FULLY answer the question, you MUST call the read tool that would supply the missing fact BEFORE
+  replying. Only say something is "unavailable / not in the evidence" AFTER a tool that should hold
+  it has actually returned nothing. The always-present curriculum facts card and reward_model_index are
+  only an INDEX of CODE DEFAULTS — the ACTUAL current run values can differ, so a current-value question
+  is NOT answered from them; call the matching purpose-built tool. Question -> tool (these DERIVE the
+  structure from code AND read the current value live, with provenance):
+    * robot body / DOF / joint order / default pose / actuators / nominal base height -> get_robot_model
+    * how a reward/term is computed, its formula, or its current weight -> get_reward_model(term=... or query=...)
+    * current phase-gate / curriculum thresholds / penalty ramp / terrain levels -> get_curriculum_model
+    * any OTHER current raw config value -> get_config(grep=<key>)
+    * ANY other code question (how X is implemented / its structure / where it is defined / what is in the
+      observation / the network architecture / how the terrain scan works / ...) -> get_code_facts(query=...)
+      It returns the actual class/function/constant DEFINITIONS + provenance for any named concept, and
+      lists what it could NOT find. Prefer it over repeatedly calling get_code_knowledge (snippet fishing).
+  It is a FAILURE to answer a robot-config, reward-formula, or gate-threshold question without first
+  calling the matching get_*_model tool above; do not fall back to get_asset / get_config / the facts
+  card for facts those tools already cover.
+- KNOW WHAT YOU DON'T KNOW: if two focused tool calls still do not yield the fact, STOP and answer with
+  what you DID find, explicitly naming the gap (which source you checked and what was missing). Do NOT
+  keep re-querying the same tool to the step limit — a grounded partial answer with a stated gap beats
+  looping until forcibly stopped.
 - Base every number and claim on tool results you actually received. Never invent run names,
   iterations, or reward values. If a tool hasn't given you a fact, call the read tool first.
 - For broad, current-state, root-cause, tuning, "why", "what should we do next", or diagnostic
@@ -2088,11 +2216,313 @@ Rules:
     _TOOLS_DOC, _ACTIONS_DOC)
 
 
+# ── 最终答案综合（BASELINE 计划第2步）───────────────────────────────────────
+# 循环里每一跳都强制 JSON，最终答案被挤成一句话（实质漏进 reasoning）。这里在“要出答案”
+# 那一步，用快模型做一次自由文本综合：把已取到的证据合成完整、只讲事实的回答。
+# 仍用快模型 → 不牺牲速度；去掉 JSON 约束 → 答案不再被榨干。best-effort，失败回退 draft。
+_SYNTHESIS_SYSTEM = """你是 RL 运动训练控制台的助手，现在做最后一步：把已经取到的证据，综合成给操作员的完整回答。
+硬规则：
+- 只讲事实：只依据下面「证据」里的数值/状态作答，带上具体数字及其来源字段；不臆测、不下“好/坏”判断。
+- 证据里没有的，就直说“证据里没有/取不到”，绝不编。
+- 用操作员提问所用的语言（通常是中文），直接、完整地回答；不要只给一句话，也不要空谈——每句都要能在证据里对上。
+- 直接输出自然语言答案，不要输出 JSON、不要复述这些规则。"""
+
+
+def _synthesis_evidence(message: str, transcript: List[Dict[str, Any]],
+                        history: List[Dict[str, str]]) -> str:
+    """把问题 + 已取到的证据整理成干净的综合输入（不含循环的“选工具”指令）。"""
+    import json as _json
+    lines: List[str] = []
+    for h in (history or [])[-4:]:
+        lines.append(f"[对话历史:{h.get('role', '?')}] {str(h.get('content', ''))[:600]}")
+    for t in transcript:
+        try:
+            if "tool" in t:
+                lines.append(f"[证据·{t.get('tool')}] {_json.dumps(t.get('result'), ensure_ascii=False)[:1500]}")
+            elif "action" in t:
+                lines.append(f"[已执行·{t.get('action')}] {_json.dumps(t.get('result'), ensure_ascii=False)[:800]}")
+        except Exception:  # noqa: BLE001
+            continue
+    return "操作员的问题：\n" + message + "\n\n可用证据：\n" + "\n".join(lines)
+
+
+def _synthesize_final_answer(message: str, transcript: List[Dict[str, Any]],
+                             history: List[Dict[str, str]], draft: str) -> Dict[str, str]:
+    """最终自由文本综合：把证据合成完整、只讲事实的回答。失败/空则回退 draft，绝不丢答案。"""
+    try:
+        from autotuner.llm_gateway.client import call_llm_text
+        user_p = (_synthesis_evidence(message, transcript, history)
+                  + "\n\n【草答（循环给出的一句话，可参考，但要以证据为准并补全）】\n" + str(draft)
+                  + "\n\n请据以上证据，给操作员一个完整、只讲事实的回答。")
+        r = call_llm_text(_SYNTHESIS_SYSTEM, user_p, purpose="final_answer", model=_LOOP_MODEL, think=_LOOP_THINK)
+        text = (r.raw_text or "").strip() if r else ""
+        if text:
+            return {"reply": text, "reasoning": r.reasoning}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"reply": draft, "reasoning": ""}
+
+
+def _needs_final_synthesis(draft: str) -> bool:
+    """Use a second model call only when the constrained loop produced a thin draft."""
+    text = str(draft or "").strip()
+    if not text:
+        return True
+    substantive_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return len(text) < 120 and len(substantive_lines) < 3
+
+
+def _live_state_card(src: RealDataSource) -> Dict[str, Any] | None:
+    """Authoritative, always-on LIVE state: the run's CURRENT phase + next gate + staleness, stated
+    ONCE and unambiguously so the agent never has to infer the phase from scattered numbers.
+
+    Measured failure this closes (adversarial probe 2026-07-12): the same run at the same moment was
+    reported as phi0 / phi1 / phi2 across three questions — NOT because the sources disagree (they all
+    say phi0) but because the evidence also exposes the config constants terrain_start_phase=2 and
+    max_training_phase=2 next to phase_index=0, and the model grabbed a constant as the current phase.
+    This card names the authoritative phase and explicitly rules those constants out. Best-effort:
+    returns None on any failure so it can never break the loop."""
+    try:
+        import asyncio
+        tel = asyncio.run(src.training_telemetry()).model_dump()
+    except Exception:  # noqa: BLE001
+        return None
+    snap = tel.get("snapshot") if isinstance(tel.get("snapshot"), dict) else {}
+    latest = tel.get("latest") if isinstance(tel.get("latest"), dict) else {}
+    curric = latest.get("curriculum") if isinstance(latest.get("curriculum"), dict) else {}
+    phase = snap.get("phase") or curric.get("phase")
+    if not phase:
+        return None
+    gate = curric.get("phase_gate") if isinstance(curric.get("phase_gate"), dict) else {}
+    conds = gate.get("conditions") if isinstance(gate.get("conditions"), dict) else {}
+    return {
+        "current_phase": phase,
+        "phase_source": "telemetry snapshot.phase (== curriculum.phase == ops_state.current_phase)",
+        "next_gate": snap.get("next_gate"),
+        "gate_conditions_for_current_phase": conds or None,
+        "gate_conditions_complete": bool(gate.get("condition_set_complete", False)),
+        "gate_completeness_note": gate.get("completeness_note") or "",
+        "training_running": tel.get("running"),
+        "telemetry_stale": tel.get("stale"),
+        "telemetry_age_s": tel.get("telemetry_age_s"),
+        "READ_ME": ("current_phase above IS the run's actual current phase — quote it verbatim for any "
+                    "'which phase / how far to advance' question. Do NOT report terrain_start_phase or "
+                    "max_training_phase as the current phase: those are CONFIG CONSTANTS (the phase at "
+                    "which terrain turns on / the maximum phase index), not live state. If telemetry_stale "
+                    "is true, phrase phase/progress as last-known, not current. Never infer that ALL "
+                    "runtime gate conditions passed from a configured-threshold list unless "
+                    "gate_conditions_complete is true."),
+    }
+
+
+def _cache_training_telemetry_for_request(src: RealDataSource) -> None:
+    """Reuse one telemetry snapshot throughout a single agent turn.
+
+    Several evidence tools need the same remote files. Keeping the cache on this
+    short-lived data-source instance avoids repeated SSH reads and prevents one
+    answer from mixing values sampled at different moments.
+    """
+    original = src.training_telemetry
+    state: Dict[str, Any] = {"loaded": False, "value": None}
+
+    async def cached_training_telemetry():
+        if not state["loaded"]:
+            state["value"] = await original()
+            state["loaded"] = True
+        return state["value"]
+
+    src.training_telemetry = cached_training_telemetry  # type: ignore[method-assign]
+
+
+def _tool_cache_key(tool: str, args: Dict[str, Any]) -> str:
+    return f"{tool}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
+
+
+_STATIC_KNOWLEDGE_TERMS = (
+    "怎么算", "如何计算", "定义", "公式", "实现", "结构", "原理", "什么意思",
+    "多少自由度", "dof", "关节顺序", "执行器", "网络", "观测", "代码在哪",
+)
+_LIVE_EVIDENCE_TERMS = (
+    "当前", "现在", "实时", "最新", "本次", "正在", "运行状态", "训练到", "卡住",
+    "是否生效", "远端", "遥测", "日志", "checkpoint", "检查点", "调参", "下一步",
+    "为什么失败", "为什么不", "建议", "gpu", "显存", "tmux", "step", "phase",
+)
+
+
+def _question_needs_live_evidence(message: str) -> bool:
+    question = _operator_question_from_message(message).lower()
+    if any(term in question for term in _LIVE_EVIDENCE_TERMS):
+        return True
+    return not any(term in question for term in _STATIC_KNOWLEDGE_TERMS)
+
+
+def _intent_tool_hint(message: str) -> Dict[str, Any]:
+    """Route high-confidence knowledge questions before the model chooses a tool."""
+    question = _operator_question_from_message(message).strip()
+    q = question.lower()
+    reward = any(term in q for term in (
+        "奖励", "惩罚", "权重", "reward", "duty", "占空", "slip", "打滑",
+        "impact", "tracking", "步态质量",
+    ))
+    curriculum = any(term in q for term in (
+        "课程", "阶段门", "推进门", "gate", "penalty_gate", "terrain_start_phase",
+    ))
+    robot = any(term in q for term in (
+        "机器人", "自由度", "dof", "关节", "执行器", "actuator", "标称高度",
+    ))
+    definition = any(term in q for term in _STATIC_KNOWLEDGE_TERMS)
+    asks_value = any(term in q for term in ("多少", "是什么", "当前", "现在", "值"))
+    if reward and (definition or asks_value):
+        return {"tool": "get_reward_model", "args": {"query": question}, "reason": "奖励定义或公式问题"}
+    if curriculum and (definition or asks_value):
+        return {"tool": "get_curriculum_model", "args": {"query": question}, "reason": "课程或门控定义问题"}
+    if robot and definition:
+        return {"tool": "get_robot_model", "args": {}, "reason": "机器人本体定义问题"}
+    if definition:
+        return {"tool": "get_code_facts", "args": {"query": question}, "reason": "通用代码定义问题"}
+    return {"tool": "", "args": {}, "reason": "需要结合运行态证据规划"}
+
+
+_CAUSAL_TERMS = (
+    "为什么", "原因", "怎么会", "是什么导致", "哪个条件", "哪一个", "什么没有",
+    "没过", "不增加", "不变化", "不生效", "失败点", "root cause", "why",
+)
+_CONTRADICTION_TERMS = (
+    "明明", "但是", "但", "却", "仍然", "还是", "都满足", "对不上", "矛盾",
+    "不算数", "不一致", "however", "despite", "contradiction",
+)
+
+
+ProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+def _emit_progress(
+    callback: ProgressCallback | None,
+    stage: str,
+    label: str,
+    *,
+    detail: str = "",
+    tool: str = "",
+) -> None:
+    """Publish stable, operator-safe progress without exposing chain-of-thought or raw evidence."""
+    if callback is None:
+        return
+    event = {"stage": stage, "label": label}
+    if detail:
+        event["detail"] = detail
+    if tool:
+        event["tool"] = tool
+    try:
+        callback(event)
+    except Exception:  # noqa: BLE001 - observability must never break the agent loop
+        pass
+
+
+def _build_investigation_profile(
+    message: str,
+    history: List[Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    """Describe evidence needs without encoding domain-specific answers."""
+    question = _operator_question_from_message(message).strip()
+    q = question.lower()
+    recent = "\n".join(str(item.get("content") or "") for item in (history or [])[-4:]).lower()
+    causal = any(term in q for term in _CAUSAL_TERMS)
+    contradiction = any(term in q for term in _CONTRADICTION_TERMS)
+    identifiers = list(dict.fromkeys(
+        token.lower()
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", f"{question}\n{recent}")
+        if token.lower() not in {"the", "and", "for", "with", "from", "this", "that"}
+    ))[:16]
+    requires_code = contradiction or (causal and bool(identifiers)) or (
+        causal and any(term in q for term in ("条件", "字段", "逻辑", "生效", "更新"))
+    )
+    live = _question_needs_live_evidence(message)
+    route = "investigation" if requires_code else ("evidence" if live else "knowledge")
+    required = (["live_runtime"] if live else []) + (["code_logic"] if requires_code else [])
+    return {
+        "route": route,
+        "causal_question": causal,
+        "contradiction_detected": contradiction,
+        "requires_code_evidence": requires_code,
+        "requires_live_evidence": live,
+        "runtime_identifiers": identifiers,
+        "required_evidence": required,
+    }
+
+
+def _code_investigation_query(
+    message: str,
+    history: List[Dict[str, str]] | None = None,
+) -> str:
+    profile = _build_investigation_profile(message, history)
+    question = _operator_question_from_message(message).strip()
+    identifiers = " ".join(profile["runtime_identifiers"])
+    return f"{question}\n{identifiers}".strip()
+
+
+_UNIVERSAL_COMPLETENESS_CLAIMS = (
+    "所有条件都", "全部条件", "所有指标都", "全部指标", "都已满足", "均已满足",
+    "没有哪个条件", "没有任何条件", "all conditions", "every condition",
+)
+
+
+def _reply_claim_gate(reply: str, transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
+    text = str(reply or "").lower()
+    claims_complete = any(term in text for term in _UNIVERSAL_COMPLETENESS_CLAIMS)
+
+    def explicit_complete(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("condition_set_complete") is True:
+                return True
+            if value.get("all_conditions_met") is True:
+                return True
+            return any(explicit_complete(item) for item in value.values())
+        if isinstance(value, list):
+            return any(explicit_complete(item) for item in value)
+        return False
+
+    has_complete_condition_evidence = any(explicit_complete(item.get("result")) for item in transcript)
+    violations: List[str] = []
+    if claims_complete and not has_complete_condition_evidence:
+        violations.append(
+            "回答声称完整条件集全部满足，但证据没有声明 condition_set_complete=true "
+            "或 all_conditions_met=true"
+        )
+    return {
+        "ok": not violations,
+        "violations": violations,
+        "has_complete_condition_evidence": has_complete_condition_evidence,
+    }
+
+
+def _required_evidence_gaps(
+    profile: Dict[str, Any],
+    transcript: List[Dict[str, Any]],
+) -> List[str]:
+    gaps: List[str] = []
+    if profile.get("requires_code_evidence"):
+        code_rows = [item for item in transcript if item.get("tool") == "get_code_facts"]
+        if not any(isinstance(item.get("result"), dict) and item["result"].get("complete") for item in code_rows):
+            gaps.append("代码取证没有找到足以解释机制的定义或源码窗口")
+    if profile.get("requires_live_evidence"):
+        live = any(item.get("tool") == "live_state" for item in transcript)
+        routed = any(
+            item.get("tool") == "get_evidence_context"
+            and isinstance(item.get("result"), dict)
+            and not item["result"].get("error")
+            for item in transcript
+        )
+        if not (live or routed):
+            gaps.append("当前运行态证据不可用")
+    return gaps
+
+
 def run_agent(message: str, settings: LocomotionConsoleSettings,
               history: List[Dict[str, str]] | None = None,
               allow_slash: bool = True,
               max_steps: int = 9,
-              preload_operator_context: bool = False) -> Dict[str, Any]:
+              preload_operator_context: bool = False,
+              progress: ProgressCallback | None = None) -> Dict[str, Any]:
     """Run the agentic loop for one user message.
 
     `history` is the prior conversation ([{role, content}, ...]) so the soul has memory across
@@ -2101,7 +2531,10 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
     """
     from autotuner.llm_gateway.client import call_llm_with_schema
 
-    src = RealDataSource(settings)
+    # Respect the configured source boundary. In fake/test mode this must never
+    # instantiate RealDataSource, otherwise a confirmation test can reach SSH.
+    src = make_source(settings)
+    _cache_training_telemetry_for_request(src)
     from .slash_commands import handle_slash_command
 
     if allow_slash:
@@ -2109,6 +2542,27 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
         if slash is not None:
             return slash
     transcript: List[Dict[str, Any]] = []
+    investigation = _build_investigation_profile(message, history or [])
+    _emit_progress(
+        progress,
+        "routing",
+        "正在规划调查路径",
+        detail=str(investigation.get("route") or "knowledge"),
+    )
+    tool_cache: Dict[str, Any] = {}
+    repeated_calls: Dict[str, int] = {}
+    transcript.append({
+        "tool": "intent_router",
+        "args": {},
+        "result": {
+            **_intent_tool_hint(message),
+            **investigation,
+            "instruction": (
+                "按 required_evidence 补齐事实。若现象与已有解释冲突，先调查代码与运行态，"
+                "不要用可能性猜测闭环。"
+            ),
+        },
+    })
     # Always-present, code-derived facts card (gate thresholds, penalty ramp, actual_vx, terrain
     # progression/levels). Lets the agent answer factual questions correctly WITHOUT spending a tool
     # hop, and steers it off the step-fraction "还早" fallacy. Best-effort; must never break the loop.
@@ -2121,7 +2575,36 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
         })
     except Exception:  # noqa: BLE001
         pass
-    if preload_operator_context:
+    # 极小的奖励库索引:让 agent 知道 get_reward_model 存在、覆盖了什么(附覆盖自审),
+    # 细节(公式结构/权重/门控/拆台)按需用工具取。best-effort,绝不拖垮循环。
+    try:
+        from .knowledge_model import reward_model_audit
+        _rm = reward_model_audit()
+        transcript.append({
+            "tool": "reward_model_index",
+            "args": {},
+            "result": {
+                "note": "奖励项的公式结构/权重参数/门控/相互拆台,用 get_reward_model(term=... 或 query=...) 取;"
+                        "结构从代码推导(不过时)、当前权重从 effective_config 现读(带出处)。",
+                "coverage": {"missing": _rm.missing, "dead_params": _rm.dead_params,
+                             "changed": _rm.changed, "vanished": _rm.vanished},
+            },
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    # Authoritative live-state card (current phase / next gate / staleness), stated once so the agent
+    # never misreads a config constant (terrain_start_phase / max_training_phase) as the current phase.
+    # Best-effort; one cheap telemetry read per question, never breaks the loop.
+    if _question_needs_live_evidence(message):
+        _emit_progress(progress, "live_evidence", "正在读取当前运行态", tool="live_state")
+        try:
+            _live = _live_state_card(src)
+            if _live:
+                transcript.append({"tool": "live_state", "args": {}, "result": _live})
+        except Exception:  # noqa: BLE001
+            pass
+    if preload_operator_context and _question_needs_live_evidence(message):
+        _emit_progress(progress, "context", "正在汇集工作台证据", tool="get_evidence_context")
         try:
             result = _tool_get_evidence_context(
                 src,
@@ -2140,12 +2623,44 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
             "result": result,
         })
 
+    if investigation["requires_code_evidence"]:
+        _emit_progress(progress, "code_evidence", "正在核对运行时代码", tool="get_code_facts")
+        code_args = {"query": _code_investigation_query(message, history or [])}
+        code_key = _tool_cache_key("get_code_facts", code_args)
+        try:
+            code_result = _tool_get_code_facts(src, **code_args)
+        except Exception as exc:  # noqa: BLE001
+            code_result = {"error": f"{type(exc).__name__}: {exc}", "complete": False}
+        tool_cache[code_key] = code_result
+        transcript.append({"tool": "get_code_facts", "args": code_args, "result": code_result})
+        transcript.append({
+            "tool": "evidence_gate",
+            "args": {},
+            "result": {
+                "required": investigation["required_evidence"],
+                "code_evidence_complete": bool(code_result.get("complete")),
+                "instruction": (
+                    "A threshold list is not proof that the complete runtime condition passed. "
+                    "If code evidence remains incomplete, state the gap instead of asserting a cause."
+                ),
+            },
+        })
+        _emit_progress(
+            progress,
+            "evidence_gate",
+            "正在检查证据是否足够",
+            detail="complete" if code_result.get("complete") else "incomplete",
+        )
+
     executed_actions: List[Dict[str, Any]] = []
     executed_count = 0
+    claim_corrections = 0
+    stop_reason = "已达工具步数上限"
     for _ in range(max_steps):
+        _emit_progress(progress, "analysis", "正在分析已有证据")
         user_prompt = _render(message, transcript, history or [])
         resp = call_llm_with_schema(_SYSTEM, user_prompt, schema_name="locomotion_console_agent",
-                                    model=_LOOP_MODEL)
+                                    model=_LOOP_MODEL, think=_LOOP_THINK)
         if not resp or not resp.parsed:
             err = resp.error if resp else "no response"
             return {"reply": f"(LLM unavailable: {err})", "transcript": transcript,
@@ -2170,24 +2685,82 @@ def run_agent(message: str, settings: LocomotionConsoleSettings,
                     "transcript": transcript, "steps": len(transcript),
                     "reasoning": resp.reasoning}
         if d.get("reply"):
-            return {"reply": d["reply"], "executed_actions": executed_actions,
+            evidence_gaps = _required_evidence_gaps(investigation, transcript)
+            if evidence_gaps:
+                _emit_progress(progress, "evidence_gap", "发现证据缺口")
+                return {
+                    "reply": "我还不能可靠地给出这个结论：" + "；".join(evidence_gaps) + "。"
+                             "现有证据只支持描述现象，不支持确定原因。",
+                    "executed_actions": executed_actions,
+                    "transcript": transcript,
+                    "steps": len(transcript),
+                    "reasoning": resp.reasoning,
+                    "evidence_gaps": evidence_gaps,
+                }
+            claim_gate = _reply_claim_gate(str(d["reply"]), transcript)
+            if not claim_gate["ok"]:
+                _emit_progress(progress, "claim_gate", "正在修正超出证据的表述")
+                transcript.append({"tool": "claim_gate", "args": {}, "result": claim_gate})
+                if claim_corrections < 1:
+                    claim_corrections += 1
+                    continue
+                return {
+                    "reply": "现有证据只能说明已展示的条件状态，不能证明完整条件集全部满足。"
+                             "需要取得明确的完整条件评估后才能下结论。",
+                    "executed_actions": executed_actions,
+                    "transcript": transcript,
+                    "steps": len(transcript),
+                    "reasoning": resp.reasoning,
+                    "evidence_gaps": claim_gate["violations"],
+                }
+            # 完整草答直接返回；只有被 JSON 循环压缩成短句时才多做一次模型综合。
+            # 这既减少常规回答延迟，也避免已经有依据的答案被二次改写。
+            draft = str(d["reply"])
+            final = (
+                _synthesize_final_answer(message, transcript, history or [], draft)
+                if _needs_final_synthesis(draft)
+                else {"reply": draft, "reasoning": ""}
+            )
+            _emit_progress(progress, "complete", "结论已通过证据检查")
+            return {"reply": final["reply"], "executed_actions": executed_actions,
                     "transcript": transcript, "steps": len(transcript),
-                    "reasoning": resp.reasoning}
+                    "reasoning": final.get("reasoning") or resp.reasoning}
         tool = d.get("tool")
         args = d.get("args") or {}
-        if tool in TOOLS:
+        _emit_progress(
+            progress,
+            "tool",
+            "正在读取补充证据",
+            tool=str(tool or "unknown"),
+        )
+        cache_key = _tool_cache_key(str(tool or ""), args)
+        cache_hit = cache_key in tool_cache
+        if cache_hit:
+            result = tool_cache[cache_key]
+            repeated_calls[cache_key] = repeated_calls.get(cache_key, 0) + 1
+        elif tool in TOOLS:
             try:
                 result = TOOLS[tool](src, **args)
                 if tool == "get_operator_context" and isinstance(result, dict):
                     result = _compact_operator_context_for_llm(result)
             except Exception as e:  # noqa: BLE001
                 result = {"error": f"{type(e).__name__}: {e}"}
+            tool_cache[cache_key] = result
         else:
             result = {"error": f"unknown tool: {tool}"}
-        transcript.append({"tool": tool, "args": args, "result": result})
+        transcript.append({"tool": tool, "args": args, "result": result, "cache_hit": cache_hit})
+        if repeated_calls.get(cache_key, 0) >= 2:
+            stop_reason = f"工具 {tool} 已用相同参数重复请求；没有产生新证据"
+            break
 
-    return {"reply": "(too many tool steps; stopped)", "transcript": transcript,
-            "steps": len(transcript)}
+    # 循环用尽:绝不丢掉已取到的证据——用它综合出一个尽力而实的答案,并说明没能收敛(缺口)。
+    # 这就是"知道自己不知道":给出证据支持的部分答案 + 明确的空白,而不是一句无用的 "stopped"。
+    final = _synthesize_final_answer(
+        message, transcript, history or [],
+        f"({stop_reason};请根据以上已取到的证据尽力给出答案,并明确指出哪些还没查到)")
+    return {"reply": final["reply"], "executed_actions": executed_actions,
+            "transcript": transcript, "steps": len(transcript),
+            "reasoning": final.get("reasoning", "")}
 
 
 _VERIFY_SYSTEM = """You are a strict fact-checker for an RL-locomotion-console assistant. You are given the
@@ -2235,7 +2808,9 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
 
     if name not in ACTION_NAMES:
         return {"ok": False, "detail": f"unknown action: {name}"}
-    src = RealDataSource(settings)
+    # The configured source is a hard isolation boundary: fake/test execution
+    # must never construct an SSH-backed data source.
+    src = make_source(settings)
 
     async def _run():
         if name == "run_diagnostic":
@@ -2341,6 +2916,8 @@ def _tool_result_budget(tool: str) -> int:
         return 5200
     if tool == "get_training_telemetry":
         return 4200
+    if tool == "get_code_facts":
+        return 7600
     return 1800
 
 

@@ -10,19 +10,21 @@ from __future__ import annotations
 
 from . import taili_symmetry as sym
 from . import taili_amp_reference as ref
+from . import taili_geometry as geometry
 
 # pinned Runtime IO constants (verified remote URDF/asset; see strategy doc)
 DT_POLICY = 0.02
 DECIMATION = 4
 PHYSICS_DT = 0.005
 ACTION_SCALE = 0.35
-CMD_SMOOTH_ALPHA = 0.93
+CMD_TRANSITION_MAX_S = 0.80
 HISTORY_LEN = 25
-NOMINAL_BASE_H = 0.52
+NOMINAL_BASE_H = geometry.NOMINAL_BASE_HEIGHT
 EFFORT_LIMIT = {"hip": 320.0, "thigh": 110.0, "calf": 220.0}
 
 # ordered layouts (field -> width); each must sum to its declared total
-BODY53_LAYOUT = [("angvel", 3), ("gravity", 3), ("command", 3), ("jpos", 12),
+BODY57_LAYOUT = [("angvel", 3), ("gravity", 3), ("command", 3),
+                 ("previous_command", 3), ("command_age", 1), ("jpos", 12),
                  ("jvel", 12), ("last_action", 12), ("gait_clock", 8)]
 TICK54_LAYOUT = [("q_rel", 12), ("dq", 12), ("q_des_rel", 12), ("q_error", 12),
                  ("gyro_body", 3), ("projected_gravity", 3)]
@@ -39,20 +41,21 @@ def build_export_manifest():
         "constants": {
             "q_default": list(ref.Q_DEFAULT12),
             "action_scale": ACTION_SCALE,
-            "cmd_smooth_alpha": CMD_SMOOTH_ALPHA,
+            "command_age_normalizer_s": CMD_TRANSITION_MAX_S,
+            "foot_radius": geometry.FOOT_RADIUS,
             "nominal_base_h": NOMINAL_BASE_H,
             "base_height_ref": ref.BASE_HEIGHT_REF,
             "effort_limit": EFFORT_LIMIT,
         },
         "q_des_recipe": "q_des = q_default + action_scale * last_action",
         "q_error_recipe": "q_error = q_des - q_current (servo lag)",
-        "command_recipe": "command_effective += (1 - cmd_smooth_alpha) * (cmd_target - command_effective)",
+        "command_recipe": "command=current user target; previous_command is latched on change; command_age=min(seconds/max_transition_s, 1)",
         "joint_order": {
             "canonical": list(sym.CANONICAL_JOINT_ORDER),
             "real_to_canonical_map": None,   # adapter fills: real SDK order -> canonical index
         },
         "layouts": {
-            "body53": BODY53_LAYOUT,
+            "body57": BODY57_LAYOUT,
             "tick54": TICK54_LAYOUT,
             "amp_frame51": AMP_FRAME51_LAYOUT,
             "gait_clock": GAIT_CLOCK_LAYOUT,

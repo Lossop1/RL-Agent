@@ -34,8 +34,18 @@ def _default_audit_dir() -> str:
     return os.path.join(root, "llm_gateway_audit")
 
 
-def _classify(raw: str):
-    raw = (raw or "").strip()
+def _classify(rec: dict):
+    """Classify one audit record into (kind, tool).
+
+    IMPORTANT: the final-synthesis step logs with schema_name "text:*" and returns free-form
+    prose ON PURPOSE (see llm_gateway.client.call_llm_text). That prose is NOT JSON, so a naive
+    json.loads() mislabels the agent's best, complete answers as "unparsable" and treats them as
+    failures. Trust schema_name first: a non-empty text:* record is a real terminal reply.
+    """
+    raw = (rec.get("raw") or "").strip()
+    schema = str(rec.get("schema_name") or "")
+    if schema.startswith("text:"):
+        return ("reply" if raw else "empty"), None
     if not raw:
         return "empty", None
     try:
@@ -58,18 +68,32 @@ def _pct(values, p):
     return ordered[idx]
 
 
-def analyze(audit_dir: str) -> dict:
+def analyze(audit_dir: str, since: str = "", model: str = "") -> dict:
+    """Summarize the audit logs.
+
+    since  = "YYYYMMDD" keeps only calls on/after that day (the audit dir accumulates across
+             sessions, so old pre-improvement logs otherwise pollute the aggregate).
+    model  = keep only calls made with this model id (e.g. isolate the current fast-model era).
+    """
     files = sorted(glob.glob(os.path.join(audit_dir, "*.json")))
     calls = []
     for fn in files:
+        # filename: llm_call_YYYYMMDD_HHMMSS_...
+        day = os.path.basename(fn).split("_")[2] if os.path.basename(fn).count("_") >= 2 else ""
+        if since and day and day < since:
+            continue
         try:
             d = json.load(open(fn, encoding="utf-8"))
         except Exception:
             continue
-        kind, tool = _classify(d.get("raw"))
+        if model and d.get("model") != model:
+            continue
+        kind, tool = _classify(d)
         calls.append({
             "kind": kind,
             "tool": tool,
+            "model": d.get("model") or "",
+            "day": day,
             "elapsed": float(d.get("elapsed_s") or 0.0),
             "error": d.get("error"),
         })
@@ -91,8 +115,21 @@ def analyze(audit_dir: str) -> dict:
     kinds = Counter(c["kind"] for c in calls)
     tools = Counter(c["tool"] for c in calls if c["tool"])
 
+    def _lat(rows):
+        e = [c["elapsed"] for c in rows]
+        return {"n": len(rows),
+                "p50": round(statistics.median(e), 1) if e else 0.0,
+                "p90": round(_pct(e, 0.9), 1),
+                "max": round(max(e), 1) if e else 0.0}
+
+    models = sorted({c["model"] for c in calls})
+    per_model = {m: _lat([c for c in calls if c["model"] == m]) for m in models}
+    days = Counter(c["day"] for c in calls)
+
     return {
         "audit_dir": audit_dir,
+        "days": dict(sorted(days.items())),
+        "per_model_latency_s": per_model,
         "calls": len(calls),
         "questions": len(questions),
         "errors": sum(1 for c in calls if c["error"]),
@@ -117,11 +154,22 @@ def analyze(audit_dir: str) -> dict:
 
 
 def main() -> None:
-    audit_dir = sys.argv[1] if len(sys.argv) > 1 else _default_audit_dir()
+    args = [a for a in sys.argv[1:]]
+    since = ""
+    model = ""
+    positional = []
+    for a in args:
+        if a.startswith("--since="):
+            since = a.split("=", 1)[1]
+        elif a.startswith("--model="):
+            model = a.split("=", 1)[1]
+        else:
+            positional.append(a)
+    audit_dir = positional[0] if positional else _default_audit_dir()
     if not os.path.isdir(audit_dir):
         print(f"audit dir not found: {audit_dir}")
         raise SystemExit(1)
-    report = analyze(audit_dir)
+    report = analyze(audit_dir, since=since, model=model)
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

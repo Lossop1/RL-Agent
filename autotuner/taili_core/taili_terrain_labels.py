@@ -2,8 +2,9 @@
 (「地形感知器」slope/roughness/impact/support_instability + 共享特权信号契约).
 
 Pure-math kernels the training env feeds with privileged sim quantities (terrain-height
-samples, contact forces, support geometry). Training-ONLY: these produce the geom[9]/risk[2]
-labels that supervise z_terrain; they are NEVER deployment inputs.
+samples, contact forces, support geometry). Training-ONLY: these produce the geom[9] and
+base risk[2] labels; the env appends six post-contact event labels. They supervise z_terrain
+and are NEVER deployment inputs.
 
 Pure torch; CPU-testable with synthetic inputs (test_taili_terrain_labels.py), including a
 physical mirror round-trip that pins the slope/foot_h signs to the y->-y reflection.
@@ -102,13 +103,43 @@ def support_instability(contact_count, polygon_margin, diagonal_pair, dist_to_su
     return torch.maximum(margin_bad, tilt_bad)
 
 
-# ── assemble geom[9] / risk[2] from per-component pieces ─────────────────────
+# ── 组装 geom[9]、基础 risk[2] 和碰触后事件 risk[8] ─────────────────────────
 def assemble_geom9(slope_x_n, slope_y_n, log_rough_n, foot_h_n4, edge_up_n, edge_down_n):
     """foot_h_n4 (...,4) in FOOT order FL,FR,RL,RR."""
     return torch.cat([
         slope_x_n.unsqueeze(-1), slope_y_n.unsqueeze(-1), log_rough_n.unsqueeze(-1),
         foot_h_n4, edge_up_n.unsqueeze(-1), edge_down_n.unsqueeze(-1),
     ], dim=-1)
+
+
+def assemble_risk8(
+    impact_n,
+    support_instability,
+    event_direction,
+    lead_foot4,
+    event_visible,
+):
+    """组装基础风险和碰触后事件监督，同时返回逐维有效掩码。
+
+    `event_visible` 必须由已发生的碰撞、预期触地失败或真实换层触发。事件不可见
+    时后六维完全不参与损失，避免用训练期地形类型给盲态策略提供前视信息。
+    """
+    dtype = impact_n.dtype
+    base = torch.stack([impact_n, support_instability.to(dtype=dtype)], dim=-1)
+    direction = event_direction.to(device=impact_n.device)
+    lead = lead_foot4.to(dtype=dtype, device=impact_n.device)
+    event = torch.cat([
+        (direction > 0).to(dtype)[:, None],
+        (direction < 0).to(dtype)[:, None],
+        lead,
+    ], dim=-1)
+    label = torch.cat([base, event], dim=-1)
+    visible = event_visible.to(dtype=dtype, device=impact_n.device)
+    mask = torch.cat([
+        torch.ones_like(base),
+        visible[:, None].expand_as(event),
+    ], dim=-1)
+    return label, mask
 
 
 def assemble_risk2(impact_n, support_instab):

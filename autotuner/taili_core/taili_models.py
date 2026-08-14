@@ -19,12 +19,14 @@ from . import taili_symmetry as sym
 # layout constants (Runtime IO / Contract v1)
 TICK_DIM = 54
 HISTORY_LEN = 25
-BODY_DIM = 53
+BODY_DIM = 57
 ACTION_DIM = 12
 Z_HALF = 16
 Z_DIM = 2 * Z_HALF          # 32
 GEOM_DIM = 9
-RISK_DIM = 2
+# impact、支撑不稳 + 碰触后事件方向2维 + 动态先导脚4维。
+# 后六维只在楼梯事件已由本体接触触发后监督，不提供前视地形信息。
+RISK_DIM = 8
 
 
 # ── causal TCN encoder u(h): [B,25,54] -> [B,16] ─────────────────────────────
@@ -89,7 +91,7 @@ def apply_grad_scale(z, grad_scale: float):
     return grad_scale * z + (1.0 - grad_scale) * z.detach()
 
 
-# ── structurally-equivariant actor: body53 + z32 -> action12 ─────────────────
+# ── structurally-equivariant actor: body57 + z32 -> action12 ─────────────────
 class EquivariantActor(nn.Module):
     def __init__(self, hidden=(1024, 512), initial_log_std=-1.0):
         super().__init__()
@@ -113,21 +115,21 @@ class EquivariantActor(nn.Module):
         x = torch.cat([body, z], dim=-1)         # [B, 85]
         if os.environ.get("TAILI_NO_EQUIV") == "1":
             return self.net(x)                   # raw, non-equivariant (diagnostic only)
-        return sym.structural_mean(self.net, x, sym.mirror_actor_input85, sym.mirror_action12)
+        return sym.structural_mean(self.net, x, sym.mirror_actor_input89, sym.mirror_action12)
 
     def log_std(self):
         return sym.tie_log_std(self.log_std_param)   # L/R-tied exploration
 
 
-# ── AMP discriminator: two-frame style prior, command/mode-conditioned (D) ────
+# ── AMP discriminator: temporal style prior, command/mode-conditioned ─────────
 AMP_FRAME_DIM = 51
-AMP_NUM_FRAMES = 2
+AMP_NUM_FRAMES = 6
 
 
 class AMPDiscriminator(nn.Module):
-    """Plain MLP on frame51 x 2 = 102 -> 1 logit. NOT equivariant by construction;
+    """Plain MLP on frame51 x 6 = 306 -> 1 logit. NOT equivariant by construction;
     L/R symmetry of the style prior is enforced by mirror-augmenting the training frames
-    (sym.mirror_amp_frame102), applied identically to reference and policy samples."""
+    (sym.mirror_amp_frames), applied identically to reference and policy samples."""
 
     def __init__(self, hidden=(512, 256)):
         super().__init__()

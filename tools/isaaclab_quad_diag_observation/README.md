@@ -789,7 +789,8 @@ Taili 使用 height scanner 命中点，并按足端 XY 查找最近地面高度
 
 ```text
 foot_<leg>_terrain_height
-foot_<leg>_clearance_local
+foot_<leg>_center_clearance_local  # foot link 球心相对地面的高度
+foot_<leg>_clearance_local         # 足底净空 = 球心高度 - 足球半径
 terrain_height_source
 ```
 

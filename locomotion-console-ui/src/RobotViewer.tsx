@@ -3,10 +3,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import URDFLoader from "urdf-loader";
 import {
-  getDiagnosticPlayback,
   type DiagnosticPlayback,
   type DiagnosticPlaybackFrame,
-  type DiagnosticReport,
 } from "./api";
 import { formatBackendText } from "./i18n/format";
 import { zhCN as t } from "./i18n/zh-CN";
@@ -27,12 +25,10 @@ const FOOT_COLORS: Record<string, number> = {
 const PLAYBACK_RATES = [0.25, 0.5, 1, 2, 4];
 
 export default function RobotViewer({
-  report,
-  jobId,
+  playback,
   active = true,
 }: {
-  report: DiagnosticReport | null;
-  jobId?: string | null;
+  playback: DiagnosticPlayback | null;
   active?: boolean;
 }) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -41,20 +37,27 @@ export default function RobotViewer({
   const controlsRef = useRef<OrbitControls | null>(null);
   const feetRef = useRef<Record<string, THREE.Mesh>>({});
   const playbackRef = useRef<DiagnosticPlayback | null>(null);
+  const caseAnchorsRef = useRef<Map<string, DiagnosticPlaybackFrame>>(new Map());
   const playingRef = useRef(true);
+  const cameraTrackingRef = useRef(false);
   const activeRef = useRef(active);
   const playbackRateRef = useRef(1);
   const playheadRef = useRef(0);
   const lastClockRef = useRef(0);
   const [viewerState, setViewerState] = useState<ViewerState>("loading");
-  const [playback, setPlayback] = useState<DiagnosticPlayback | null>(null);
+  const [viewerError, setViewerError] = useState("");
   const [playing, setPlaying] = useState(true);
+  const [cameraTracking, setCameraTracking] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [frameIndex, setFrameIndex] = useState(0);
 
   useEffect(() => {
     playingRef.current = playing;
   }, [playing]);
+
+  useEffect(() => {
+    cameraTrackingRef.current = cameraTracking;
+  }, [cameraTracking]);
 
   useEffect(() => {
     activeRef.current = active;
@@ -66,29 +69,23 @@ export default function RobotViewer({
 
   useEffect(() => {
     playbackRef.current = playback;
+    const anchors = new Map<string, DiagnosticPlaybackFrame>();
+    for (const frame of playback?.frames ?? []) {
+      const key = playbackCaseKey(frame);
+      if (!anchors.has(key)) anchors.set(key, frame);
+    }
+    caseAnchorsRef.current = anchors;
     playheadRef.current = 0;
     setFrameIndex(0);
-    if (playback?.available && playback.frames.length) {
-      setViewerState((current) => current === "loading" ? "loading" : "ready");
-    }
-  }, [playback?.output_dir, playback?.frames.length]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setViewerState("loading");
-    getDiagnosticPlayback(900, jobId ?? report?.job_id)
-      .then((next) => {
-        if (cancelled) return;
-        setPlayback(next);
-        setViewerState(next.available && next.frames.length ? "ready" : "empty");
-      })
-      .catch(() => {
-        if (!cancelled) setViewerState("error");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [jobId, report?.job_id]);
+    setViewerError("");
+    setViewerState(
+      playback === null
+        ? "loading"
+        : playback.available && playback.frames.length
+          ? "ready"
+          : "empty",
+    );
+  }, [playback]);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -100,7 +97,15 @@ export default function RobotViewer({
     camera.up.set(0, 0, 1);
     camera.position.set(1.65, -1.5, 1.1);
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+    } catch (reason) {
+      console.error("Diagnostic WebGL initialization failed", reason);
+      setViewerError("当前浏览器无法创建 WebGL 渲染上下文，请重启浏览器或启用硬件加速。");
+      setViewerState("error");
+      return;
+    }
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.shadowMap.enabled = true;
@@ -110,8 +115,8 @@ export default function RobotViewer({
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
-    controls.minDistance = 0.65;
-    controls.maxDistance = 5;
+    controls.minDistance = 0.25;
+    controls.maxDistance = 15;
     controls.target.set(0, 0, 0.35);
     controlsRef.current = controls;
 
@@ -125,12 +130,12 @@ export default function RobotViewer({
     scene.add(rim);
 
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(7, 7),
+      new THREE.PlaneGeometry(30, 30),
       new THREE.MeshStandardMaterial({ color: 0x1c211b, roughness: 0.95 })
     );
     ground.receiveShadow = true;
     scene.add(ground);
-    const grid = new THREE.GridHelper(7, 28, 0x485246, 0x2c322b);
+    const grid = new THREE.GridHelper(30, 120, 0x485246, 0x2c322b);
     grid.rotation.x = Math.PI / 2;
     scene.add(grid);
     // TERRAIN RECONSTRUCTION: thin contact outlines from foot-contact points.
@@ -138,8 +143,9 @@ export default function RobotViewer({
     scene.add(terrainGroup);
     const terrainOutlines = new Map<string, THREE.LineSegments>();
     const outlineGeo = new THREE.EdgesGeometry(new THREE.PlaneGeometry(0.105, 0.105));
-    let lastCaseId = -1;
+    let lastCaseKey = "";
     let lastFrameT = -1;
+    let lastUiUpdateMs = -Infinity;
 
     const world = new THREE.Group();
     scene.add(world);
@@ -162,10 +168,12 @@ export default function RobotViewer({
     }
     feetRef.current = footMarkers;
 
+    let disposed = false;
     const loader = new URDFLoader();
     loader.load(
       "/robot/taili_dog_description/urdf/robot.urdf",
       (robot) => {
+        if (disposed) return;
         const urdf = robot as UrdfRobot;
         urdf.updateMatrixWorld(true);
         urdf.traverse((object) => {
@@ -188,11 +196,21 @@ export default function RobotViewer({
         });
         world.add(urdf);
         robotRef.current = urdf;
-        applyPlaybackFrame(playbackRef.current?.frames[0], playbackRef.current, urdf, world, footMarkers);
+        applyPlaybackFrame(
+          playbackRef.current?.frames[0],
+          playbackRef.current,
+          caseAnchorsRef.current,
+          urdf,
+          world,
+          footMarkers,
+        );
         setViewerState((current) => current === "empty" ? "empty" : "ready");
       },
       undefined,
-      () => setViewerState("error")
+      () => {
+        setViewerError("机器人 URDF 资源加载失败，请刷新页面后重试。");
+        setViewerState("error");
+      }
     );
 
     const resize = () => {
@@ -222,18 +240,25 @@ export default function RobotViewer({
         playheadRef.current = last > 0 ? (playheadRef.current + delta * playbackRateRef.current) % last : 0;
         const index = frameIndexForTime(data.frames, playheadRef.current);
         const frame = data.frames[index];
-        applyPlaybackFrame(frame, data, robot, worldGroup, footMarkers);
-        setFrameIndex((current) => current === index ? current : index);
+        applyPlaybackFrame(frame, data, caseAnchorsRef.current, robot, worldGroup, footMarkers);
+        if (now - lastUiUpdateMs >= 100) {
+          lastUiUpdateMs = now;
+          setFrameIndex((current) => current === index ? current : index);
+        }
+        let resetCaseView = false;
         if (frame) {
           // reset the reconstructed terrain when the playback wraps or switches case
-          if (frame.case_id !== lastCaseId || frame.t < lastFrameT) {
+          const currentCaseKey = playbackCaseKey(frame);
+          resetCaseView = currentCaseKey !== lastCaseKey || frame.t < lastFrameT;
+          if (resetCaseView) {
             terrainOutlines.forEach((m) => { terrainGroup.remove(m); (m.material as THREE.Material).dispose(); });
             terrainOutlines.clear();
-            lastCaseId = frame.case_id;
+            lastCaseKey = currentCaseKey;
           }
           lastFrameT = frame.t;
-          const aPos = data.frames[0]?.base_position ?? [0, 0, 0];
-          const aTer = data.frames[0]?.terrain_height ?? 0;
+          const anchorFrame = caseAnchorsRef.current.get(currentCaseKey) ?? data.frames[0];
+          const aPos = anchorFrame?.base_position ?? [0, 0, 0];
+          const aTer = anchorFrame?.terrain_height ?? 0;
           for (const foot of Object.values(frame.feet)) {
             if (!foot.contact) continue;
             const fx = foot.position[0] - aPos[0];
@@ -257,14 +282,15 @@ export default function RobotViewer({
             }
           }
         }
-        // FOLLOW CAMERA: keep the robot centered — shift orbit target AND camera by the same
-        // delta so the user's orbit angle/zoom is preserved while the robot never leaves frame.
-        const dx = worldGroup.position.x - controls.target.x;
-        const dy = worldGroup.position.y - controls.target.y;
-        const dz = worldGroup.position.z - controls.target.z;
-        if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-5) {
-          controls.target.x += dx; controls.target.y += dy; controls.target.z += dz * 0.2;
-          camera.position.x += dx; camera.position.y += dy; camera.position.z += dz * 0.2;
+        if (cameraTrackingRef.current) {
+          // Preserve the user's orbit angle and zoom while following the robot.
+          const dx = worldGroup.position.x - controls.target.x;
+          const dy = worldGroup.position.y - controls.target.y;
+          const dz = worldGroup.position.z - controls.target.z;
+          if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 1e-5) {
+            controls.target.x += dx; controls.target.y += dy; controls.target.z += dz * 0.2;
+            camera.position.x += dx; camera.position.y += dy; camera.position.z += dz * 0.2;
+          }
         }
         // snap the grid under the robot in cell-size steps so it reads as an infinite floor,
         // and FOLLOW the local ground height (descending terrain no longer puts the robot
@@ -272,9 +298,12 @@ export default function RobotViewer({
         const cell = 0.25;
         grid.position.x = Math.round(worldGroup.position.x / cell) * cell;
         grid.position.y = Math.round(worldGroup.position.y / cell) * cell;
-        const aTer0 = data.frames[0]?.terrain_height ?? 0;
+        const anchorFrame = frame
+          ? caseAnchorsRef.current.get(playbackCaseKey(frame)) ?? data.frames[0]
+          : data.frames[0];
+        const aTer0 = anchorFrame?.terrain_height ?? 0;
         const groundZ = (frame?.terrain_height ?? aTer0) - aTer0;
-        grid.position.z += (groundZ - grid.position.z) * 0.25;
+        grid.position.z = resetCaseView ? groundZ : grid.position.z + (groundZ - grid.position.z) * 0.25;
       }
       lastClockRef.current = now;
       controls.update();
@@ -283,17 +312,24 @@ export default function RobotViewer({
     render(0);
 
     return () => {
+      disposed = true;
       cancelAnimationFrame(animation);
       observer.disconnect();
       controls.dispose();
+      terrainOutlines.forEach((outline) => {
+        (outline.material as THREE.Material).dispose();
+      });
+      terrainOutlines.clear();
+      outlineGeo.dispose();
       renderer.dispose();
+      renderer.forceContextLoss();
       scene.traverse((object) => {
         if (!(object instanceof THREE.Mesh)) return;
         object.geometry.dispose();
         const materials = Array.isArray(object.material) ? object.material : [object.material];
         materials.forEach((material) => material.dispose());
       });
-      mount.removeChild(renderer.domElement);
+      if (renderer.domElement.parentNode === mount) mount.removeChild(renderer.domElement);
       robotGroupRef.current = null;
       robotRef.current = null;
       controlsRef.current = null;
@@ -316,7 +352,14 @@ export default function RobotViewer({
     playheadRef.current = 0;
     setFrameIndex(0);
     setPlaying(true);
-    applyPlaybackFrame(playback?.frames[0], playback, robotRef.current, robotGroupRef.current, feetRef.current);
+    applyPlaybackFrame(
+      playback?.frames[0],
+      playback,
+      caseAnchorsRef.current,
+      robotRef.current,
+      robotGroupRef.current,
+      feetRef.current,
+    );
   }
 
   function showFrame(index: number, pause = true) {
@@ -326,7 +369,14 @@ export default function RobotViewer({
     playheadRef.current = frame.t;
     setFrameIndex(clamped);
     if (pause) setPlaying(false);
-    applyPlaybackFrame(frame, playback, robotRef.current, robotGroupRef.current, feetRef.current);
+    applyPlaybackFrame(
+      frame,
+      playback,
+      caseAnchorsRef.current,
+      robotRef.current,
+      robotGroupRef.current,
+      feetRef.current,
+    );
   }
 
   const contactSummary = currentFrame
@@ -341,7 +391,9 @@ export default function RobotViewer({
       <div className="robot-canvas" ref={mountRef}>
         {viewerState === "loading" && <span className="robot-loading">{t.robotViewer.loading}</span>}
         {viewerState === "empty" && <span className="robot-loading">{t.robotViewer.empty}</span>}
-        {viewerState === "error" && <span className="robot-loading error">{t.robotViewer.error}</span>}
+        {viewerState === "error" && (
+          <span className="robot-loading error">{viewerError || t.robotViewer.error}</span>
+        )}
         <div className="robot-file-label">
           {playback?.available ? `record.csv / ${frameCount} frames` : t.robotViewer.record}
         </div>
@@ -360,6 +412,14 @@ export default function RobotViewer({
           <button onClick={() => showFrame(frameIndex + 1)} disabled={!frameCount || frameIndex >= frameCount - 1}>{t.robotViewer.next}</button>
           <button onClick={restartPlayback} disabled={!frameCount}>{t.robotViewer.restart}</button>
           <button onClick={resetView}>{t.robotViewer.resetView}</button>
+          <button
+            className={cameraTracking ? "active" : ""}
+            aria-pressed={cameraTracking}
+            title={cameraTracking ? t.robotViewer.cameraTrackingDisable : t.robotViewer.cameraTrackingEnable}
+            onClick={() => setCameraTracking((value) => !value)}
+          >
+            {t.robotViewer.cameraTracking}
+          </button>
         </div>
         <div className="playback-timeline">
           <input
@@ -390,7 +450,7 @@ export default function RobotViewer({
           <span>{t.robotViewer.terrain} <strong>{(currentFrame?.terrain || "--")}{currentFrame?.terrain_level != null ? `@L${currentFrame.terrain_level}` : ""}</strong></span>
           <span>{t.robotViewer.command} <strong>{currentFrame?.command_mode ?? "--"}</strong></span>
           <span>{t.robotViewer.stage} <strong>{currentFrame?.stage ?? "--"}</strong></span>
-          <span>Env <strong>{currentFrame ? currentFrame.env_id : playback?.selected_env_id ?? "--"}</strong></span>
+          <span>环境 <strong>{currentFrame ? currentFrame.env_id : playback?.selected_env_id ?? "--"}</strong></span>
           <span>{t.robotViewer.caseSegment} <strong>{currentFrame ? `${currentFrame.case_id} / ${currentFrame.segment_id}` : "--"}</strong></span>
           <span>{t.robotViewer.contacts} <strong>{contactSummary}</strong></span>
           <span>{t.robotViewer.rows} <strong>{playback ? `${playback.source_rows} raw, stride ${playback.stride}` : "--"}</strong></span>
@@ -414,16 +474,18 @@ function frameIndexForTime(frames: DiagnosticPlaybackFrame[], t: number) {
 function applyPlaybackFrame(
   frame: DiagnosticPlaybackFrame | undefined,
   playback: DiagnosticPlayback | null | undefined,
+  caseAnchors: Map<string, DiagnosticPlaybackFrame>,
   robot: UrdfRobot | null,
   world: THREE.Group | null,
   feet: Record<string, THREE.Mesh>
 ) {
   if (!frame || !robot || !world) return;
   const base = frame.base_position;
-  // TRUE-WORLD z: subtract only the FIRST frame's ground height, so climbing (stairs/slope) renders
-  // as real ascent instead of being flattened onto the grid every frame.
-  const anchor = playback?.frames[0]?.base_position ?? [0, 0, 0];
-  const anchorTerrain = playback?.frames[0]?.terrain_height ?? 0;
+  // Each diagnostic case is spawned on a different world tile. Anchor within the case so
+  // case transitions do not teleport the robot tens of metres out of the camera frustum.
+  const anchorFrame = caseAnchors.get(playbackCaseKey(frame)) ?? playback?.frames[0];
+  const anchor = anchorFrame?.base_position ?? [0, 0, 0];
+  const anchorTerrain = anchorFrame?.terrain_height ?? 0;
   world.position.set(base[0] - anchor[0], base[1] - anchor[1], base[2] - anchorTerrain);
   const [w, x, y, z] = frame.base_quaternion_wxyz;
   world.quaternion.set(x, y, z, w).normalize();
@@ -443,4 +505,8 @@ function applyPlaybackFrame(
     material.opacity = foot.contact ? 1 : 0.45;
     material.transparent = !foot.contact;
   }
+}
+
+function playbackCaseKey(frame: DiagnosticPlaybackFrame) {
+  return `${frame.stage}:${frame.case_id}:${frame.env_id}`;
 }

@@ -1,4 +1,4 @@
-"""Manifest and static checks for the Taili blind runtime payload."""
+"""Taili 盲态运行 payload 的清单和静态检查。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import tempfile
 from typing import Iterable
+
+from autotuner.taili_core import taili_geometry
 
 
 RUNTIME_PACKAGE = "taili_blind_runtime"
@@ -33,10 +35,12 @@ STATIC_FILES: tuple[tuple[str, str], ...] = (
     ("autotuner/blind_locomotion/terrain_perceiver_policy.py", f"{RUNTIME_PACKAGE}/terrain_perceiver_policy.py"),
     ("autotuner/blind_locomotion/terrain_perceiver_aux_patch.py", f"{RUNTIME_PACKAGE}/terrain_perceiver_aux_patch.py"),
     ("autotuner/blind_locomotion/telemetry_emit.py", f"{RUNTIME_PACKAGE}/telemetry_emit.py"),
+    ("autotuner/blind_locomotion/telemetry_payloads.py", f"{RUNTIME_PACKAGE}/telemetry_payloads.py"),
     ("autotuner/blind_locomotion/launch_taili_train.py", f"{RUNTIME_PACKAGE}/launch_taili_train.py"),
     ("autotuner/blind_locomotion/train_taili.py", f"{RUNTIME_PACKAGE}/train_taili.py"),
     ("autotuner/blind_locomotion/diagnose_taili.py", f"{RUNTIME_PACKAGE}/diagnose_taili.py"),
     ("autotuner/blind_locomotion/diagnose_taili_cases.py", f"{RUNTIME_PACKAGE}/diagnose_taili_cases.py"),
+    ("autotuner/blind_locomotion/stair_validation.py", f"{RUNTIME_PACKAGE}/stair_validation.py"),
     ("autotuner/blind_locomotion/taili_blind_config.py", f"{RUNTIME_PACKAGE}/taili_blind_config.py"),
     ("autotuner/blind_locomotion/taili_blind_config.yaml", f"{RUNTIME_PACKAGE}/taili_blind_config.yaml"),
     ("autotuner/blind_locomotion/agents/__init__.py", f"{RUNTIME_PACKAGE}/agents/__init__.py"),
@@ -45,9 +49,9 @@ STATIC_FILES: tuple[tuple[str, str], ...] = (
     ("autotuner/blind_locomotion/motions.py", f"{RUNTIME_PACKAGE}/motions.py"),
     ("autotuner/blind_locomotion/symmetry.py", f"{RUNTIME_PACKAGE}/symmetry.py"),
     ("autotuner/blind_locomotion/_symmetry_local.py", f"{RUNTIME_PACKAGE}/_symmetry_local.py"),
-    # physeval acceptance harness + pure scorers — so the payload can SELF-EVALUATE against the spec
-    # (physeval_blind does `import acceptance_score`, so the scorers ship at BOTH the package dir and
-    # the payload root, which is on PYTHONPATH). These were missing, so remote physeval failed.
+    # physeval 验收框架和纯评分器：payload 需要能在远端按规格自测。
+    # physeval_blind 会直接 import acceptance_score，因此评分器既放包内，
+    # 也放 payload 根目录；payload 根目录会进入 PYTHONPATH。
     ("autotuner/blind_locomotion/physeval_blind.py", f"{RUNTIME_PACKAGE}/physeval_blind.py"),
     ("autotuner/blind_locomotion/physeval_blind_e.py", f"{RUNTIME_PACKAGE}/physeval_blind_e.py"),
     ("autotuner/blind_locomotion/physeval_suite.py", f"{RUNTIME_PACKAGE}/physeval_suite.py"),
@@ -79,7 +83,7 @@ OPTIONAL_STATIC_PREFIXES = (
 
 GENERATED_FILES = {
     "sitecustomize.py": (
-        '"""Auto-register Taili blind runtime tasks when this payload is on PYTHONPATH."""\n'
+        '"""当 payload 位于 PYTHONPATH 时自动注册 Taili 盲态任务。"""\n'
         "try:\n"
         f"    import {RUNTIME_PACKAGE}  # noqa: F401\n"
         "except Exception as exc:\n"
@@ -170,7 +174,7 @@ def _validate_policy_contract(root: Path, report: ValidationReport) -> None:
     policy = root / "autotuner" / "blind_locomotion" / "terrain_perceiver_policy.py"
     text = policy.read_text(encoding="utf-8", errors="replace")
     required = {
-        "BODY_DIM = 53": "actor body must be 53",
+        "BODY_DIM = 57": "actor body must be 57",
         "HIST_LEN = 25": "history length must be 25",
         "TICK_DIM = 54": "history tick dim must be 54",
         "Z_DIM = 32": "terrain latent must be 32",
@@ -189,13 +193,26 @@ def _validate_yaml_contract(root: Path, report: ValidationReport) -> None:
         report.errors.append("style_reward_weight missing from taili_blind_config.yaml")
         return
     value = float(m.group(1))
-    # Sanity range only. The strategy book's 0.3..0.5 is a DRAFT starting band, not authority
-    # (owner directive 2026-07-02): weights are physeval-tuned toward the taili_spec acceptance
-    # bars. Upper bound raised 2.0 -> 4.0 (owner directive 2026-07-04, "OPTION B"): AMP is now the
-    # DOMINANT style shaper (hand-designed gait terms cut), so style_reward_weight legitimately
-    # exceeds 2.0. Guard still rejects a dead (<=0) or absurd (>4) style channel.
+    # 这里只做 sanity range 检查。早期策略书中的 0.3..0.5 只是草案起点，
+    # 不是当前权威范围；当前权重按 physeval / taili_spec 验收目标调过。
+    # 上限从 2.0 放宽到 4.0 后，AMP 是主要风格塑形项，因此 style_reward_weight
+    # 可以合理超过 2.0；该保护只拒绝关闭通道或明显荒谬的数值。
     if not 0.0 < value <= 4.0:
         report.errors.append(f"style_reward_weight={value} outside sanity range (0, 4.0]")
+    for key, expected in (
+        ("nominal_base_h", taili_geometry.NOMINAL_BASE_HEIGHT),
+        ("flat_move_height_target", taili_geometry.NOMINAL_BASE_HEIGHT),
+    ):
+        match = re.search(rf"^\s*{key}:\s*([0-9.]+)", text, flags=re.MULTILINE)
+        if not match or abs(float(match.group(1)) - expected) > 1e-6:
+            report.errors.append(f"{key} must match Taili geometry ({expected:.10f})")
+    trace = re.search(
+        r"^\s*terrain_collision_trace_decay_time:\s*([0-9.]+)",
+        text,
+        flags=re.MULTILINE,
+    )
+    if not trace or not 0.35 <= float(trace.group(1)) <= 0.45:
+        report.errors.append("terrain_collision_trace_decay_time must cover about half a gait cycle")
 
 
 def _validate_registration_contract(root: Path, report: ValidationReport) -> None:
@@ -207,6 +224,36 @@ def _validate_registration_contract(root: Path, report: ValidationReport) -> Non
         report.errors.append("env cfg entry point must resolve to package-local taili_blind_env_cfg")
     if "skrl_taili_blind_cfg.yaml" in text:
         report.errors.append("registration must use taili_blind_config.yaml as the source config")
+
+    env_py = root / "autotuner" / "blind_locomotion" / "blind_tp_env.py"
+    env_text = env_py.read_text(encoding="utf-8", errors="replace")
+    required_terrain_calls = (
+        "terrain_curriculum.loaded_support_height(",
+        "terrain_curriculum.terrain_motion_credit(",
+    )
+    for call in required_terrain_calls:
+        if call not in env_text:
+            report.errors.append(f"blind_tp_env missing continuous terrain contract: {call}")
+    forbidden_state_machine = (
+        "compute_stair_event_progress(",
+        "_stair_event_stage_memory",
+        "_stair_event_lead_foot",
+        "terrain_curriculum.continuous_terrain_height_drive(",
+        "terrain_curriculum.continuous_terrain_layer_hold(",
+        "terrain_curriculum.support_layer_split_quality(",
+    )
+    for marker in forbidden_state_machine:
+        if marker in env_text:
+            report.errors.append(f"blind_tp_env still contains stair state-machine marker: {marker}")
+    if "0.014" in env_text:
+        report.errors.append("blind_tp_env contains the obsolete 0.014m foot radius")
+    for marker in (
+        "taili_geometry.sole_clearance(",
+        "taili_reward.transition_style_weight(",
+        'self.extras["amp_style_scale"]',
+    ):
+        if marker not in env_text:
+            report.errors.append(f"blind_tp_env missing geometry/transition contract: {marker}")
 
 
 def _validate_robot_asset_contract(root: Path, report: ValidationReport) -> None:
@@ -222,6 +269,11 @@ def _validate_robot_asset_contract(root: Path, report: ValidationReport) -> None
         report.errors.append("robot.urdf mesh paths must be payload-local meshes/... paths, not ../meshes/...")
     if 'filename="meshes/base_link.STL"' not in text:
         report.errors.append("robot.urdf must reference payload-local meshes/base_link.STL")
+    radii = [float(value) for value in re.findall(r"<sphere\s+radius=\"([0-9.]+)\"", text)]
+    if len(radii) != 4 or any(abs(value - taili_geometry.FOOT_RADIUS) > 1e-9 for value in radii):
+        report.errors.append(
+            f"robot.urdf foot spheres must all use radius {taili_geometry.FOOT_RADIUS:.3f}m"
+        )
 
 
 def manifest_summary(root: Path = ROOT) -> str:

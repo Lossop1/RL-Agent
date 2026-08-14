@@ -24,6 +24,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .pytest_tmp*/
+.pytest-tmp-*/
 .mypy_cache/
 .venv/
 venv/
@@ -40,6 +41,10 @@ locomotion_console_state/
 .runtime_logs/
 .codegraph/
 .claude/
+.codex_staging/
+.payload-compare-*/
+.codex-tmp-askpass.cmd
+.tmp_ssh_askpass.cmd
 .latest_strategy_backup_path
 *.log
 *.jsonl
@@ -55,6 +60,11 @@ autotuner/training_payloads/**/archive/
 strategy_backups/**/remote/
 strategy_backups/**/*.tar.gz
 strategy_backups/
+
+# Local experiment output and extracted historical comparisons.
+/output/
+/history7_*/
+/history7_*.tar.gz
 
 # ── editor / OS noise ────────────────────────────────────────────────────────
 .DS_Store

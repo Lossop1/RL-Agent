@@ -557,7 +557,7 @@ def install_command_conditioned_reset(base) -> dict[str, Any]:  # pragma: no cov
 def build_columns(n_joints: int, legs: list[str]) -> list[str]:
     cols = [
         "run_id", "case_id", "env_id", "episode_id", "step", "time", "control_dt", "physics_dt", "decimation",
-        "task_name", "robot_name", "nominal_stand_height",
+        "task_name", "robot_name", "foot_radius", "nominal_stand_height",
         "terrain_type_requested", "terrain_type", "terrain_level", "terrain_height_source",
         "dr_level_requested", "dr_level",
         "capture_stage", "terminal_state_available", "post_step_state_may_be_after_reset", "transition_done_after_action",
@@ -579,7 +579,8 @@ def build_columns(n_joints: int, legs: list[str]) -> list[str]:
         cols += [
             f"foot_{leg}_pos_w_x", f"foot_{leg}_pos_w_y", f"foot_{leg}_pos_w_z",
             f"foot_{leg}_vel_w_x", f"foot_{leg}_vel_w_y", f"foot_{leg}_vel_w_z",
-            f"foot_{leg}_terrain_height", f"foot_{leg}_clearance_local", f"foot_{leg}_contact",
+            f"foot_{leg}_terrain_height", f"foot_{leg}_center_clearance_local",
+            f"foot_{leg}_clearance_local", f"foot_{leg}_contact",
             f"foot_{leg}_force_w_x", f"foot_{leg}_force_w_y", f"foot_{leg}_force_w_z", f"foot_{leg}_force_norm",
             f"foot_{leg}_normal_force", f"foot_{leg}_tangent_force",
             f"foot_{leg}_air_time", f"foot_{leg}_stance_time", f"foot_{leg}_touchdown", f"foot_{leg}_liftoff", f"foot_{leg}_touchdown_vz", f"foot_{leg}_stance_slip_xy",
@@ -747,6 +748,7 @@ def make_rows_from_current_state(**kw) -> list[dict[str, Any]]:  # pragma: no co
         "torque": select(getattr(d, "applied_torque", getattr(d, "computed_torque", None)), joint_idx),
         "foot_pos": select(d.body_pos_w, foot_body_idx),
         "foot_vel": select(getattr(d, "body_lin_vel_w", None), foot_body_idx),
+        "foot_ang": select(getattr(d, "body_ang_vel_w", None), foot_body_idx),
         "command": select(kw["command_applied"]),
         "action_mean": select(kw["action_mean"]),
         "action_applied": select(kw.get("action_applied")),
@@ -834,7 +836,10 @@ def make_rows_from_current_state(**kw) -> list[dict[str, Any]]:  # pragma: no co
             "case_id": int(kw["case_id"]),
             "env_id": env_id, "episode_id": int(kw["episode_id"][env_id]), "step": int(kw["step"]), "time": float(kw["t"]),
             "control_dt": float(kw["dt"]), "physics_dt": getattr(base, "physics_dt", np.nan), "decimation": getattr(base.cfg, "decimation", np.nan),
-            "task_name": getattr(base.cfg, "task_name", "unknown"), "robot_name": getattr(kw["spec"], "robot_name", "unknown"), "nominal_stand_height": kw["spec"].nominal_stand_height,
+            "task_name": getattr(base.cfg, "task_name", "unknown"),
+            "robot_name": getattr(kw["spec"], "robot_name", "unknown"),
+            "foot_radius": float(getattr(base.cfg, "foot_radius", 0.0)),
+            "nominal_stand_height": kw["spec"].nominal_stand_height,
             "terrain_type_requested": str(kw["terrain_case"].get("type", "unknown")),
             "terrain_type": actual_terrain_type, "terrain_level": actual_terrain_level, "terrain_height_source": terrain_source,
             "dr_level_requested": str(kw["dr_case"].get("level", "unknown")),
@@ -892,6 +897,18 @@ def make_rows_from_current_state(**kw) -> list[dict[str, Any]]:  # pragma: no co
                 vx, vy, vz = [float(x) for x in arrays["foot_vel"][local_i, li]]
             else:
                 vx = vy = vz = np.nan
+            cp_vx, cp_vy = vx, vy
+            if arrays["foot_ang"] is not None and row["foot_radius"] > 0.0:
+                support_normal = getattr(base, "_support_reference_normal", None)
+                if support_normal is not None:
+                    normal = support_normal[env_id].detach().cpu().numpy()
+                else:
+                    normal = np.asarray([0.0, 0.0, 1.0])
+                contact_offset = -row["foot_radius"] * normal
+                contact_velocity = np.asarray([vx, vy, vz]) + np.cross(
+                    arrays["foot_ang"][local_i, li], contact_offset
+                )
+                cp_vx, cp_vy = float(contact_velocity[0]), float(contact_velocity[1])
             if arrays["force"] is not None:
                 fwx, fwy, fwz = [float(x) for x in arrays["force"][local_i, li]]
                 fnorm = float(arrays["force_norm"][local_i, li])
@@ -900,7 +917,9 @@ def make_rows_from_current_state(**kw) -> list[dict[str, Any]]:  # pragma: no co
             row.update({
                 f"foot_{leg}_pos_w_x": fx, f"foot_{leg}_pos_w_y": fy, f"foot_{leg}_pos_w_z": fz,
                 f"foot_{leg}_vel_w_x": vx, f"foot_{leg}_vel_w_y": vy, f"foot_{leg}_vel_w_z": vz,
-                f"foot_{leg}_terrain_height": th, f"foot_{leg}_clearance_local": fz - th,
+                f"foot_{leg}_terrain_height": th,
+                f"foot_{leg}_center_clearance_local": fz - th,
+                f"foot_{leg}_clearance_local": fz - th - row["foot_radius"],
                 f"foot_{leg}_contact": int(contact_now),
                 f"foot_{leg}_force_w_x": fwx, f"foot_{leg}_force_w_y": fwy, f"foot_{leg}_force_w_z": fwz, f"foot_{leg}_force_norm": fnorm,
                 f"foot_{leg}_normal_force": fwz, f"foot_{leg}_tangent_force": math.sqrt(fwx*fwx + fwy*fwy) if np.isfinite(fwx) and np.isfinite(fwy) else np.nan,
@@ -909,7 +928,7 @@ def make_rows_from_current_state(**kw) -> list[dict[str, Any]]:  # pragma: no co
                 f"foot_{leg}_touchdown": touchdown,
                 f"foot_{leg}_liftoff": liftoff,
                 f"foot_{leg}_touchdown_vz": abs(vz) if (touchdown and np.isfinite(vz)) else np.nan,
-                f"foot_{leg}_stance_slip_xy": math.sqrt(vx*vx + vy*vy) if (contact_now and np.isfinite(vx) and np.isfinite(vy)) else np.nan,
+                f"foot_{leg}_stance_slip_xy": math.sqrt(cp_vx*cp_vx + cp_vy*cp_vy) if (contact_now and np.isfinite(cp_vx) and np.isfinite(cp_vy)) else np.nan,
             })
             if thsrc != row["terrain_height_source"] and row["terrain_height_source"] == "env_origin_fallback":
                 row["terrain_height_source"] = thsrc

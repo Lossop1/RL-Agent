@@ -134,6 +134,7 @@ npm run dev
 | `LOCOMOTION_CONSOLE_DIAG_ROBOT_ROOT` | `/root/gpufree-data/robot_lab` |
 | `LOCOMOTION_CONSOLE_DIAG_PYTHON` | `/opt/conda/envs/isaaclab/bin/python` |
 | `LOCOMOTION_CONSOLE_DIAG_TASK` | framework profile 默认值 |
+| `LOCOMOTION_CONSOLE_DIAG_FORCE_CONCURRENT` | 空；设为 `1` 时按操作者要求跳过训练/诊断并行余量保护 |
 
 ## 鉴权和 Token 参数
 

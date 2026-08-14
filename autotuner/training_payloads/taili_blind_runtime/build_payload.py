@@ -1,4 +1,4 @@
-"""Build the Taili blind runtime payload tarball."""
+"""构建 Taili 盲态运行 payload 的 tar.gz 包。"""
 from __future__ import annotations
 
 from dataclasses import dataclass

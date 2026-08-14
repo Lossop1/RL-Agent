@@ -1,0 +1,33 @@
+diff --git a/scripts/generate_taili_mjcf.py b/scripts/generate_taili_mjcf.py
+--- a/scripts/generate_taili_mjcf.py
++++ b/scripts/generate_taili_mjcf.py
+@@ -32,6 +32,6 @@
+     option = ET.Element("option", {
+-        "timestep": "0.005",
++        "timestep": "0.0025",
+         "integrator": "implicitfast",
+         "cone": "elliptic",
+         "impratio": "100",
+     })
+diff --git a/src/rl_sar/src/rl_sim_mujoco.cpp b/src/rl_sar/src/rl_sim_mujoco.cpp
+--- a/src/rl_sar/src/rl_sim_mujoco.cpp
++++ b/src/rl_sar/src/rl_sim_mujoco.cpp
+@@ -5,2 +5,4 @@
+
++#include <cmath>
++
+ #include "rl_sim_mujoco.hpp"
+@@ -298 +300,8 @@
+-    const int substep = this->taili_physics_substep % this->params.Get<int>("decimation");
++    // MuJoCo使用更小的物理子步抑制高增益外部PD的数值振荡，但策略周期和动作延迟
++    // 必须继续遵守训练契约，不能随物理步长一起缩短。
++    const double physics_dt = this->mj_model->opt.timestep;
++    const double policy_dt = this->params.Get<float>("dt") * this->params.Get<int>("decimation");
++    const int policy_substeps = std::max(1, static_cast<int>(std::lround(policy_dt / physics_dt)));
++    const int action_delay_substeps = std::max(
++        1, static_cast<int>(std::lround(this->params.Get<float>("dt") / physics_dt)));
++    const int substep = this->taili_physics_substep % policy_substeps;
+@@ -311 +320,2 @@
+-    const std::vector<float> &applied_action = substep == 0 ? this->taili_first_substep_action : this->obs.actions;
++    const std::vector<float> &applied_action = substep < action_delay_substeps
++        ? this->taili_first_substep_action : this->obs.actions;

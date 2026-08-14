@@ -7,6 +7,7 @@ available in the Python environment and on this payload being on PYTHONPATH.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import random
 
@@ -54,6 +55,8 @@ def main(argv: list[str] | None = None) -> None:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint}")
         args.checkpoint = str(checkpoint)
+        # 环境在创建时据此恢复检查点所属 run 的地形课程 sidecar。
+        os.environ["TAILI_RESUME_CHECKPOINT"] = args.checkpoint
 
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app

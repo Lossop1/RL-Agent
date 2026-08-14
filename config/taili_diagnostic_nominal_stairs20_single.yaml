@@ -1,0 +1,33 @@
+name: nominal_stairs20_single_20260803
+num_envs: 1
+init_phase: 3
+reset_policy: per_case
+reset_initialization: command_start
+diagnostic_strict_reset: true
+commands:
+  - mode: stand
+    label: settle
+    duration: 0.5
+  - mode: forward
+    label: traverse
+    vx: 0.5
+    vy: 0.0
+    wz: 0.0
+    duration: 12.0
+terrains:
+  - type: stairs_up
+    level: 7
+    params:
+      step_height: 0.20
+      platform_width: 1.5
+      direction: up
+  - type: stairs_down
+    level: 7
+    params:
+      step_height: 0.20
+      platform_width: 1.5
+      direction: down
+dr_cases:
+  - level: 0
+    label: nominal
+    population: forced

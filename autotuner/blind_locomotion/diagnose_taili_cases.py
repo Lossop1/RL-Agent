@@ -20,6 +20,11 @@ import time
 import traceback
 from typing import Any
 
+try:
+    from .diagnose_taili import RECORD_SCHEMA_VERSION
+except ImportError:
+    from diagnose_taili import RECORD_SCHEMA_VERSION
+
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run Taili diagnostics with process isolation per terrain/DR case.")
@@ -213,7 +218,7 @@ def _write_merged_meta(
             }
         )
     payload = {
-        "schema_version": "ilqd_observation_record_v0.5.2",
+        "schema_version": RECORD_SCHEMA_VERSION,
         "task": args.task,
         "checkpoint": args.checkpoint,
         "suite_path": args.suite,
@@ -246,7 +251,7 @@ def _write_merged_meta(
     _write_json(out_dir / "record_meta.json", payload)
 
 
-def _enrich_metrics(metrics_path: Path, suite: dict[str, Any]) -> None:
+def _enrich_metrics(metrics_path: Path, suite: dict[str, Any], record_path: Path | None = None) -> None:
     try:
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception as exc:  # noqa: BLE001
@@ -279,6 +284,12 @@ def _enrich_metrics(metrics_path: Path, suite: dict[str, Any]) -> None:
         "dr_cases": suite.get("dr_cases", []),
         "pushes": suite.get("pushes", {}),
     }
+    if record_path is not None and record_path.is_file():
+        try:
+            from .stair_validation import compute_stair_validation
+        except ImportError:
+            from stair_validation import compute_stair_validation
+        payload["stair_validation"] = compute_stair_validation(record_path, suite)
     metrics_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -402,7 +413,7 @@ def run_cases(args: argparse.Namespace) -> None:
         from isaaclab_quad_diag.metrics import compute_all_metrics
 
     compute_all_metrics(out_dir / "record.csv", out_dir / "metrics", out_dir / "record_meta.json")
-    _enrich_metrics(out_dir / "metrics" / "metrics.json", suite)
+    _enrich_metrics(out_dir / "metrics" / "metrics.json", suite, out_dir / "record.csv")
     _progress(
         out_dir,
         status="complete",

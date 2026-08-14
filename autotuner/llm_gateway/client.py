@@ -57,6 +57,19 @@ class LLMResponse:
     reasoning: str = ""
 
 
+def _thinking_extra(think: Optional[bool]) -> Dict[str, Any]:
+    """把“是否思考”翻成 DeepSeek 的请求参数（放在 SDK 的 extra_body 里）。
+
+    think=False → 关闭思考（便宜的循环跳/综合用，省掉每跳 700–2900 字推理带来的 5–13s）；
+    think=True  → 显式开启；think=None → 不传，走模型默认。
+    """
+    if think is True:
+        return {"extra_body": {"thinking": {"type": "enabled"}}}
+    if think is False:
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {}
+
+
 def _resolve_api_key(raw: str) -> str:
     if raw.startswith("sk-") or raw.startswith("key-"):
         return raw
@@ -102,6 +115,7 @@ def call_llm_with_schema(system_prompt: str,
                             schema_name: str,
     max_retries: int = 1,
                             model: Optional[str] = None,
+                            think: Optional[bool] = None,
                             ) -> LLMResponse:
     """Call configured LLM, expect JSON object back, return parsed.
 
@@ -138,6 +152,7 @@ def call_llm_with_schema(system_prompt: str,
     t0 = time.time()
     last_error: Optional[str] = None
     raw_text = ""
+    extra = _thinking_extra(think)
     for attempt in range(max_retries + 1):
         try:
             completion = client.chat.completions.create(
@@ -149,6 +164,7 @@ def call_llm_with_schema(system_prompt: str,
                     {"role": "user", "content": user_prompt},
                 ],
                 response_format={"type": "json_object"},
+                **extra,
             )
             message = completion.choices[0].message
             raw_text = message.content or ""
@@ -171,6 +187,8 @@ def call_llm_with_schema(system_prompt: str,
                                 elapsed_s=elapsed, attempt=attempt, reasoning=reasoning)
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
+            if extra:                      # thinking 参数可能不被接受：去掉它再试，绝不因此让调用挂
+                extra = {}
             if attempt < max_retries:
                 continue
 
@@ -189,3 +207,87 @@ def call_llm_with_schema(system_prompt: str,
     return LLMResponse(parsed=None, raw_text=raw_text, model=model,
                         elapsed_s=elapsed, attempt=max_retries,
                         error=last_error)
+
+
+def call_llm_text(system_prompt: str,
+                  user_prompt: str,
+                  purpose: str = "text",
+                  model: Optional[str] = None,
+                  think: Optional[bool] = None,
+                  max_retries: int = 1) -> LLMResponse:
+    """自由文本调用（不强制 JSON）——给“最终出答案/综合”那一步用。
+
+    为什么要和 call_llm_with_schema 分开：那条路强制 response_format=json_object，
+    会把真正的答案挤进一个短 JSON 字段（实质漏进 reasoning_content，用户只看到一句话）。
+    最终答案这一步绝不能被 JSON 约束，完整答案才能落进 `content`。
+    返回 LLMResponse：parsed=None，答案在 raw_text；reasoning_content 照样捕获+审计。
+    """
+    try:
+        cfg = _load_config()
+    except Exception as e:
+        return LLMResponse(parsed=None, raw_text="", model="", elapsed_s=0.0,
+                           attempt=0, error=f"config_load:{e!r}")
+
+    api_key = _resolve_api_key(cfg.get("api_key_env_var", ""))
+    if not api_key:
+        return LLMResponse(parsed=None, raw_text="", model=cfg.get("model", ""),
+                           elapsed_s=0.0, attempt=0, error="no_api_key_resolved")
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return LLMResponse(parsed=None, raw_text="", model="", elapsed_s=0.0,
+                           attempt=0, error="openai_sdk_not_installed")
+
+    timeout_s = float(os.environ.get("LOCOMOTION_CONSOLE_LLM_TIMEOUT_S", cfg.get("timeout_s", 35.0)))
+    client = OpenAI(api_key=api_key, base_url=cfg.get("base_url"), timeout=timeout_s)
+    model = model or cfg.get("model", "deepseek-chat")
+    temperature = float(cfg.get("temperature", 0.0))
+
+    t0 = time.time()
+    last_error: Optional[str] = None
+    extra = _thinking_extra(think)
+    for attempt in range(max_retries + 1):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                top_p=1.0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                **extra,
+            )  # 注意：这里刻意不传 response_format，让完整答案落进 content
+            message = completion.choices[0].message
+            content = message.content or ""
+            reasoning = getattr(message, "reasoning_content", "") or ""
+            elapsed = time.time() - t0
+            _audit_log({
+                "schema_name": f"text:{purpose}",
+                "model": model,
+                "attempt": attempt,
+                "elapsed_s": elapsed,
+                "system": system_prompt,
+                "user": user_prompt,
+                "raw": content,
+                "reasoning": reasoning,
+                "parsed": None,
+            })
+            return LLMResponse(parsed=None, raw_text=content, model=model,
+                               elapsed_s=elapsed, attempt=attempt, reasoning=reasoning)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            if extra:                      # thinking 参数可能不被接受：去掉它再试，绝不因此让调用挂
+                extra = {}
+            if attempt < max_retries:
+                continue
+
+    elapsed = time.time() - t0
+    _audit_log({
+        "schema_name": f"text:{purpose}", "model": model, "attempt": max_retries,
+        "elapsed_s": elapsed, "system": system_prompt, "user": user_prompt,
+        "raw": "", "parsed": None, "error": last_error,
+    })
+    return LLMResponse(parsed=None, raw_text="", model=model, elapsed_s=elapsed,
+                       attempt=max_retries, error=last_error)

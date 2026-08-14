@@ -4,8 +4,11 @@ A raised parse error propagates up and is misclassified as a remote-SSH failure,
 box into a self-inflicted cooldown outage (the bad line stays in `tail -n 240` and re-fails every
 poll, escalating the cooldown). parse_telemetry_jsonl must be resilient to bad numeric fields.
 """
+import json
+
 from autotuner.locomotion_console.telemetry import (
     _actual_phase_gate_from_config,
+    build_telemetry,
     parse_telemetry_jsonl,
 )
 
@@ -93,10 +96,91 @@ def test_gate_thresholds_include_terrain_conditions_in_terrain_phase():
     assert cond["terrain_min"] == 0.0 and src["terrain_min"] == "default"
 
 
+def test_gate_preserves_zero_terrain_start_and_exposes_hidden_quality_conditions():
+    text = "\n".join([
+        "env:",
+        "  curriculum:",
+        "    terrain_start_phase: 0",
+        "    phase_gate_execution_0: 0.81",
+        "    phase_gate_duty_target_0: 0.56",
+        "    phase_gate_flat_touchdown_vz_p95_0: 0.61",
+    ])
+    gate = _actual_phase_gate_from_config(text, phase=0)
+    cond = gate["conditions"]
+    src = gate["conditions_source"]
+
+    assert cond["terrain_start_phase"] == 0
+    assert cond["execution_min"] == 0.81
+    assert cond["duty_target_min"] == 0.56
+    assert cond["flat_touchdown_vz_p95_max"] == 0.61
+    assert "flat_ang_accel_p95_max" not in cond
+    assert "boxes_success_min" in cond
+
+
 def test_gate_unavailable_when_config_missing():
     gate = _actual_phase_gate_from_config("", phase=1)
     assert gate["available"] is False
     assert gate["conditions"] == {}
+
+
+def test_runtime_gate_result_makes_condition_set_complete():
+    point = {
+        "step": 100,
+        "curriculum": {
+            "phase": "phi0",
+            "phase_gate_ok": 0.0,
+            "phase_gate_progress_ok": 1.0,
+            "phase_gate_quality_ok": 0.0,
+            "phase_gate_terrain_phase_active_ok": 1.0,
+            "phase_gate_terrain_mixed_active_ok": 0.0,
+            "phase_gate_terrain_level_ok": 0.0,
+            "flat_core_gate_wxy_ok": 0.0,
+            "phase_gate_progress_value": 0.72,
+        },
+    }
+    telemetry = build_telemetry(
+        source="real",
+        run_id="run",
+        running=True,
+        log_path="train.log",
+        telemetry_path="train.telemetry.jsonl",
+        effective_config_text="env:\n  curriculum:\n    terrain_start_phase: 0\n",
+        jsonl_text=json.dumps(point),
+    )
+    gate = telemetry.latest.curriculum["phase_gate"]
+    assert gate["condition_set_complete"] is True
+    assert gate["runtime_gate_ok"] is False
+    assert gate["runtime_conditions"]["phase_gate_progress_ok"] is True
+    assert gate["runtime_conditions"]["flat_core_gate_wxy_ok"] is False
+    assert gate["runtime_state_flags"]["phase_gate_terrain_phase_active_ok"] is True
+    assert "phase_gate_terrain_level_ok" not in gate["runtime_blockers"]
+    assert "phase_gate_quality_ok" in gate["runtime_blockers"]
+    assert "flat_core_gate_wxy_ok" in gate["runtime_blockers"]
+    assert gate["runtime_values"]["phase_gate_progress_value"] == 0.72
+
+
+def test_unevaluated_runtime_gate_default_stays_incomplete():
+    point = {
+        "step": 10,
+        "curriculum": {
+            "phase": "phi0",
+            "phase_gate_ok": 0.0,
+            "flat_core_gate_ok": 0.0,
+            "flat_gait_gate_ok": 0.0,
+        },
+    }
+    telemetry = build_telemetry(
+        source="real",
+        run_id="run",
+        running=True,
+        log_path="train.log",
+        telemetry_path="train.telemetry.jsonl",
+        effective_config_text="env:\n  curriculum:\n    terrain_start_phase: 0\n",
+        jsonl_text=json.dumps(point),
+    )
+    gate = telemetry.latest.curriculum["phase_gate"]
+    assert gate["condition_set_complete"] is False
+    assert "runtime_gate_ok" not in gate
 
 
 def test_playback_keeps_same_env_after_reset():
@@ -116,3 +200,38 @@ def test_playback_keeps_same_env_after_reset():
     out = _best_continuous_rows(rows)
     assert len(out) == 540
     assert {r["episode_id"] for r in out} == {"1", "2"}
+
+
+def test_diagnostic_playback_exposes_per_foot_force_components():
+    from autotuner.locomotion_console.diagnostics import _frame_from_row
+
+    row = {
+        "time": "0.1",
+        "base_pos_w_x": "0",
+        "base_pos_w_y": "0",
+        "base_pos_w_z": "0.4",
+        "base_quat_w": "1",
+        "base_quat_x": "0",
+        "base_quat_y": "0",
+        "base_quat_z": "0",
+        "foot_FL_pos_w_x": "0.2",
+        "foot_FL_pos_w_y": "0.1",
+        "foot_FL_pos_w_z": "0",
+        "foot_FL_contact": "1",
+        "foot_FL_force_norm": "51.0",
+        "foot_FL_force_w_x": "3.0",
+        "foot_FL_force_w_y": "4.0",
+        "foot_FL_force_w_z": "50.0",
+        "foot_FL_normal_force": "50.0",
+        "foot_FL_tangent_force": "5.0",
+    }
+    row.update({f"joint_pos_{index}": "0" for index in range(12)})
+
+    frame = _frame_from_row("flat", row, 0.0)
+
+    assert frame is not None
+    foot = frame.feet["FL"]
+    assert foot.force_norm == 51.0
+    assert (foot.force_w_x, foot.force_w_y, foot.force_w_z) == (3.0, 4.0, 50.0)
+    assert foot.normal_force == 50.0
+    assert foot.tangent_force == 5.0

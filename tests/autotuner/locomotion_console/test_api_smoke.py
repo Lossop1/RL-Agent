@@ -39,7 +39,8 @@ def test_strategy_view_exposes_tuning_settings():
     assert v["available"] is True
     assert v["counts"]["reward_weights"] > 10 and v["counts"]["phases"] == 4
     assert "w_stance_slip" in v["reward"]["gait_quality"]          # a tuning-relevant weight present
-    assert v["amp"]["style_reward_weight"] == 2.0                  # AMP hyperparams surfaced
+    # AMP remains a bounded style prior rather than the task's main driver.
+    assert v["amp"]["style_reward_weight"] == 1.00
 
 
 def test_websocket_stream_connects(client):
@@ -114,10 +115,14 @@ def test_chat_context_route_manages_injected_sources(client):
     assert "selected_sources=" in body["prompt"]
 
 
-def test_chat_execute_is_proposal_bound(client):
+def test_chat_execute_is_proposal_bound(client, monkeypatch):
     # Safety envelope: /chat/execute must refuse an action the copilot never proposed (defeats an
     # out-of-band destructive POST by a token holder), and accept it once a matching proposal exists.
     from autotuner.locomotion_console.app import llm_session
+    monkeypatch.setattr(
+        "autotuner.locomotion_console.agent.execute_action",
+        lambda name, args, settings: {"ok": True, "detail": f"stubbed {name}"},
+    )
     h = {"X-Console-Token": ""}  # loopback + no configured token → passes the mutation gate
     assert client.post("/chat/execute", json={"name": "kill_training", "args": {}}, headers=h).status_code == 409
     assert client.post("/chat/execute", json={"name": "nope", "args": {}}, headers=h).status_code == 400
@@ -134,19 +139,61 @@ def test_action_risk_tiers():
     assert agent.action_risk("get_status") == "auto"  # read-only default
 
 
+def test_execute_action_respects_fake_source_boundary(monkeypatch):
+    from autotuner.locomotion_console import agent
+    from autotuner.locomotion_console.config import LocomotionConsoleSettings
+    from autotuner.locomotion_console import datasource
+
+    class ForbiddenRealSource:
+        def __init__(self, settings):
+            raise AssertionError("fake action crossed into RealDataSource")
+
+    monkeypatch.setattr(datasource, "RealDataSource", ForbiddenRealSource)
+    out = agent.execute_action("kill_training", {}, LocomotionConsoleSettings(source="fake"))
+    assert out["ok"] is True
+    assert out["detail"] == "fake: training killed"
+
+
+def test_real_data_source_rejects_fake_settings():
+    from autotuner.locomotion_console.config import LocomotionConsoleSettings
+    from autotuner.locomotion_console.datasource import RealDataSource
+
+    with pytest.raises(RuntimeError, match="requires source='real'"):
+        RealDataSource(LocomotionConsoleSettings(source="fake"))
+
+
+def test_pytest_process_blocks_real_remote_mutations():
+    from autotuner.locomotion_console.config import LocomotionConsoleSettings
+    from autotuner.locomotion_console.datasource import RealDataSource
+
+    source = RealDataSource(LocomotionConsoleSettings(source="real"))
+    with pytest.raises(RuntimeError, match="pytest is running"):
+        source._require_remote_mutation_permission()
+
+
 def test_mutation_lock_serializes_actions_but_not_reads(client):
     # Concurrency: a held mutation lock 409s a state-changing action but never blocks reads/telemetry.
     import asyncio
     from autotuner.locomotion_console import app as A
-    h = {"X-Console-Token": ""}
-    asyncio.get_event_loop().run_until_complete(A._ACTION_LOCK.acquire())
+    h = {"X-Console-Token": "", "X-Console-Confirmation": "confirm:kill"}
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(A._ACTION_LOCK.acquire())
     try:
         assert client.get("/run/current").status_code == 200          # read unaffected
         assert client.get("/run/current/telemetry").status_code == 200
         assert client.post("/action/kill", headers=h).status_code == 409   # mutation serialized
     finally:
         A._ACTION_LOCK.release()
+        loop.close()
     assert client.post("/action/kill", headers=h).status_code != 409   # freed after release
+
+
+def test_direct_training_action_requires_action_specific_confirmation(client):
+    assert client.post("/action/kill", headers={"X-Console-Token": ""}).status_code == 428
+    wrong = {"X-Console-Token": "", "X-Console-Confirmation": "confirm:start"}
+    assert client.post("/action/kill", headers=wrong).status_code == 428
+    correct = {"X-Console-Token": "", "X-Console-Confirmation": "confirm:kill"}
+    assert client.post("/action/kill", headers=correct).status_code != 428
 
 
 @pytest.mark.parametrize("route", READ_ROUTES)

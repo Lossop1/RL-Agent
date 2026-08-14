@@ -16,7 +16,7 @@ CORE_COLUMNS = [
 ]
 
 OPTIONAL_GROUPS = {
-    "base_height": ["base_height_local", "base_terrain_height"],
+    "base_height": ["base_height_local", "base_terrain_height", "foot_radius"],
     "events": ["terminated", "truncated", "done", "fall_flag"],
     "terrain": ["terrain_type", "terrain_level", "terrain_params"],
     "dr": ["dr_level", "dr_mass", "dr_friction", "dr_com_x", "dr_com_y", "dr_com_z", "dr_latency"],
@@ -41,7 +41,8 @@ def foot_columns(legs: Iterable[str] = LEGS) -> list[str]:
         cols += [
             f"foot_{leg}_pos_w_x", f"foot_{leg}_pos_w_y", f"foot_{leg}_pos_w_z",
             f"foot_{leg}_vel_w_x", f"foot_{leg}_vel_w_y", f"foot_{leg}_vel_w_z",
-            f"foot_{leg}_terrain_height", f"foot_{leg}_clearance_local",
+            f"foot_{leg}_terrain_height", f"foot_{leg}_center_clearance_local",
+            f"foot_{leg}_clearance_local",
             f"foot_{leg}_contact", f"foot_{leg}_normal_force", f"foot_{leg}_tangent_force",
             f"foot_{leg}_force_w_x", f"foot_{leg}_force_w_y", f"foot_{leg}_force_w_z", f"foot_{leg}_force_norm",
             f"foot_{leg}_air_time", f"foot_{leg}_stance_time",

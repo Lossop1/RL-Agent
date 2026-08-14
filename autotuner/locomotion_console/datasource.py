@@ -16,7 +16,9 @@ Both implement the same async-friendly surface:
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -177,6 +179,7 @@ class FakeDataSource(RunDataSource):
     """
 
     def __init__(self, settings: LocomotionConsoleSettings):
+        self.settings = settings
         self.s = settings
         self._iter = 4500          # pretend we resumed mid-run
         self._t0 = time.time()
@@ -461,6 +464,11 @@ class RealDataSource(RunDataSource):
     """
 
     def __init__(self, settings: LocomotionConsoleSettings):
+        if settings.source != "real":
+            raise RuntimeError(
+                "RealDataSource requires source='real'; use make_source(settings) so fake/test mode "
+                "cannot cross the SSH boundary"
+            )
         self.settings = settings
         self.s = settings
         self._scalar_cache = _ScalarCache()
@@ -509,6 +517,18 @@ class RealDataSource(RunDataSource):
             self._remote.banner_timeout = 4
             self._remote.auth_timeout = 4
         return self._remote
+
+    def _require_remote_mutation_permission(self) -> None:
+        if self.settings.source != "real":
+            raise RuntimeError("remote mutation refused outside source='real'")
+        if (
+            os.environ.get("PYTEST_CURRENT_TEST")
+            and os.environ.get("LOCOMOTION_ALLOW_REAL_MUTATIONS_DURING_TESTS", "").lower()
+            not in {"1", "true", "yes"}
+        ):
+            raise RuntimeError(
+                "remote mutation refused while pytest is running; tests must mock the action boundary"
+            )
 
     def _remember_remote_success(self) -> None:
         self._remote_failure_until = 0.0
@@ -790,6 +810,30 @@ class RealDataSource(RunDataSource):
         )
         cmd = "bash -lc " + shlex.quote(script)
         out = remote.exec_out(cmd)
+        return (out or "").strip().rstrip("/")
+
+    def _newest_run_with_checkpoint(self, remote) -> str:
+        import shlex
+
+        globs = self._run_glob_shell()
+        if not globs:
+            return ""
+        sub = self.profile.checkpoints_subdir.strip("/")
+        listing = f"ls -dt {globs} 2>/dev/null"
+        if self.s.run_filter:
+            listing += f" | grep -F -- {shlex.quote(str(self.s.run_filter))}"
+        script = (
+            f"{listing} | while IFS= read -r d; do "
+            '[ -d "$d" ] || continue; '
+            f'ckdir="$d/{sub}"; '
+            '[ -d "$ckdir" ] || continue; '
+            'if find "$ckdir" -maxdepth 1 -type f \\( -name "agent_*.pt" -o -name "best_agent.pt" \\) '
+            '-print -quit 2>/dev/null | grep -q .; then '
+            'printf "%s\\n" "$d"; break; '
+            "fi; "
+            "done"
+        )
+        out = remote.exec_out("bash -lc " + shlex.quote(script), timeout=10)
         return (out or "").strip().rstrip("/")
 
     def get_acceptance(self) -> dict:
@@ -1593,6 +1637,65 @@ class RealDataSource(RunDataSource):
 
     # -- action helpers --
 
+    @staticmethod
+    def _payload_root_from_run_metadata(raw: str) -> str:
+        """Read a payload root from a launcher's structured run metadata."""
+        try:
+            data = json.loads(raw or "")
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        payload = data.get("payload_root") or data.get("payload")
+        if not payload and isinstance(data.get("package_dir"), str):
+            package_dir = data["package_dir"].rstrip("/")
+            if package_dir.endswith("/taili_blind_runtime"):
+                payload = package_dir.rsplit("/", 1)[0]
+        return payload.strip().rstrip("/") if isinstance(payload, str) else ""
+
+    def _recorded_payload_root(self, remote, run: str) -> str:
+        """Resolve and validate the exact payload that created ``run``.
+
+        A checkpoint is only compatible with the model/observation contract of
+        its source payload. Falling back to the newest deployed payload can pair
+        an old checkpoint with a different actor architecture.
+        """
+        import shlex
+
+        if not run:
+            return ""
+        managed_root = "/root/gpufree-data/training_payloads"
+        run = run.rstrip("/")
+        for name in ("run.json", "console_start.json"):
+            path = f"{run}/{name}"
+            raw = remote.exec_out(
+                f"cat {shlex.quote(path)} 2>/dev/null || true",
+                timeout=8,
+            ) or ""
+            payload = self._payload_root_from_run_metadata(raw)
+            if not payload:
+                continue
+            if not payload.startswith(managed_root + "/"):
+                raise RuntimeError(
+                    f"recorded payload for {run} is outside {managed_root}: {payload}"
+                )
+            package = f"{payload}/taili_blind_runtime"
+            probe = remote.exec_out(
+                "bash -lc "
+                + shlex.quote(
+                    f"test -f {shlex.quote(package + '/train_taili.py')} "
+                    f"&& test -f {shlex.quote(package + '/launch_taili_train.py')} "
+                    "&& printf payload_ok"
+                ),
+                timeout=10,
+            ) or ""
+            if probe.strip() != "payload_ok":
+                raise RuntimeError(
+                    f"recorded payload for {run} is missing or incomplete: {payload}"
+                )
+            return payload
+        return ""
+
     def _resolve_checkpoint(self, remote, run: str) -> str:
         """Full path to the latest checkpoint of `run` (agent_<maxiter>.pt, else best_agent.pt)."""
         if not run:
@@ -1602,6 +1705,50 @@ class RealDataSource(RunDataSource):
         if it > 0:
             return f"{run}/{sub}/agent_{it}.pt"
         return (remote.exec_out(f'ls "{run}/{sub}/"best_agent.pt 2>/dev/null | head -1') or "").strip()
+
+    def _infer_resume_phase(self, remote, run: str, checkpoint: str) -> int:
+        import re
+        import shlex
+
+        if not run or not checkpoint:
+            return 1
+        telemetry = f"{run.rstrip('/')}/train.telemetry.jsonl"
+        train_log = f"{run.rstrip('/')}/train.log"
+        console_log = f"{run.rstrip('/')}/console.log"
+        script = (
+            f"python3 - {shlex.quote(telemetry)} {shlex.quote(train_log)} "
+            f"{shlex.quote(console_log)} <<'PY'\n"
+            "import json, re, sys\n"
+            "best_phase = -1\n"
+            "try:\n"
+            "    with open(sys.argv[1], 'r', encoding='utf-8') as f:\n"
+            "        for line in f:\n"
+            "            try:\n"
+            "                item = json.loads(line)\n"
+            "            except Exception:\n"
+            "                continue\n"
+            "            phase = str((item.get('curriculum') or {}).get('phase') or '')\n"
+            "            match = re.fullmatch(r'phi([0-3])', phase)\n"
+            "            if match:\n"
+            "                best_phase = max(best_phase, int(match.group(1)))\n"
+            "except FileNotFoundError:\n"
+            "    pass\n"
+            "for path in sys.argv[2:]:\n"
+            "    try:\n"
+            "        with open(path, 'r', encoding='utf-8', errors='replace') as f:\n"
+            "            for line in f:\n"
+            "                match = re.search(r'\\[PHASE\\]\\s*->\\s*([0-3])', line)\n"
+            "                if match:\n"
+            "                    best_phase = max(best_phase, int(match.group(1)))\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "print(best_phase)\n"
+            "PY"
+        )
+        phase = (remote.exec_out("bash -lc " + shlex.quote(script), timeout=10) or "").strip()
+        if re.fullmatch(r"[0-3]", phase):
+            return int(phase)
+        return 1
 
     def _launch_tmux(self, remote, session: str, cmd: str) -> None:
         """Launch `cmd` detached in a fresh tmux session on the box."""
@@ -1632,6 +1779,7 @@ class RealDataSource(RunDataSource):
             "test -f \"$payload/taili_blind_runtime/train_taili.py\"; "
             "test -f \"$payload/taili_blind_runtime/launch_taili_train.py\"; "
             "test -f \"$payload/taili_blind_runtime/blind_tp_env.py\"; "
+            "test -f \"$payload/taili_blind_runtime/telemetry_payloads.py\"; "
             "test -f \"$payload/taili_blind_runtime/diagnose_taili_cases.py\"; "
             "test -f \"$payload/taili_blind_runtime/taili_blind_config.yaml\"; "
             "test -f \"$payload/taili_blind_runtime/assets/robots/taili-dog/robot.urdf\"; "
@@ -1639,7 +1787,7 @@ class RealDataSource(RunDataSource):
             "PYTHONPATH=\"$payload${PYTHONPATH:+:$PYTHONPATH}\" "
             "/opt/conda/envs/isaaclab/bin/python - <<'PY'\n"
             "import importlib.util\n"
-            "mods = ['taili_blind_runtime', 'taili_blind_runtime.launch_taili_train', 'taili_blind_runtime.train_taili', 'taili_blind_runtime.diagnose_taili_cases']\n"
+            "mods = ['taili_blind_runtime', 'taili_blind_runtime.launch_taili_train', 'taili_blind_runtime.train_taili', 'taili_blind_runtime.telemetry_payloads', 'taili_blind_runtime.diagnose_taili_cases']\n"
             "missing = [m for m in mods if importlib.util.find_spec(m) is None]\n"
             "if missing:\n"
             "    raise SystemExit('missing modules: ' + ','.join(missing))\n"
@@ -1659,26 +1807,45 @@ class RealDataSource(RunDataSource):
 
         if self._is_running(remote):
             raise RuntimeError("training is already running")
-        payload = self._latest_payload_root(remote)
-        if not payload:
-            raise RuntimeError("taili_blind_runtime payload not found under /root/gpufree-data/training_payloads")
-        ts = self._remote_timestamp(remote)
-        run_id = f"taili_train_{ts}" + ("_resume" if resume else "_console")
-        run_dir = f"/root/gpufree-data/taili_runs/{run_id}"
+        payload = ""
         checkpoint_arg = ""
+        checkpoint = ""
+        previous_run = ""
+        init_phase = None
         if resume:
             previous_run = self._newest_run(remote)
             checkpoint = self._resolve_checkpoint(remote, previous_run)
             if not checkpoint:
+                previous_run = self._newest_run_with_checkpoint(remote)
+                checkpoint = self._resolve_checkpoint(remote, previous_run)
+            if not checkpoint:
                 raise RuntimeError("resume requested, but no checkpoint was found")
+            payload = self._recorded_payload_root(remote, previous_run)
+            if not payload:
+                raise RuntimeError(
+                    "resume checkpoint was found, but its source run does not record a usable payload; "
+                    "refusing to combine it with the newest payload"
+                )
             checkpoint_arg = " --checkpoint " + shlex.quote(checkpoint)
+            init_phase = self._infer_resume_phase(remote, previous_run, checkpoint)
+        else:
+            payload = self._latest_payload_root(remote)
+            if not payload:
+                raise RuntimeError(
+                    "taili_blind_runtime payload not found under /root/gpufree-data/training_payloads"
+                )
+        ts = self._remote_timestamp(remote)
+        run_id = f"taili_train_{ts}" + ("_resume" if resume else "_console")
+        run_dir = f"/root/gpufree-data/taili_runs/{run_id}"
         boot_id = self._run_boot_id(remote)
         remote.exec_out(f"mkdir -p {shlex.quote(run_dir)}", timeout=10)
-        # SAFE REGIME (audit 0706): this operator-facing launch used --num_envs 4096 (OOMs — 2048 already
-        # walls ~16k), checkpoint every 5000 (loses more on a stall restart), and no curriculum-phase restore.
-        # Match the campaign's proven regime: 1024 envs, 2000-step checkpoints, and TAILI_INIT_PHASE=3 on a
-        # resume (the checkpoint does not store the phase, so without it a trained resume drops to flat phi0).
-        init_phase_env = "export TAILI_INIT_PHASE=3; " if checkpoint_arg else ""
+        # 1024 与当前有效策略一致，并在 4090 上给四方向、七类地形和轻量 DR 足够的
+        # 同批覆盖；仍可通过 LOCOMOTION_CONSOLE_TRAIN_ENVS 显式覆盖。
+        # checkpoint 每 2000 保存，resume 时恢复检查点附近的课程阶段。
+        # Checkpoints do not store curriculum phase. Resume at the phase observed near the checkpoint
+        # instead of blindly jumping to phi3.
+        init_phase_env = f"export TAILI_INIT_PHASE={int(init_phase)}; " if init_phase is not None else ""
+        train_num_envs = max(1, int(os.environ.get("LOCOMOTION_CONSOLE_TRAIN_ENVS", "1024")))
         inner = (
             "set -e; "
             f"cd {shlex.quote(payload)}; "
@@ -1694,7 +1861,7 @@ class RealDataSource(RunDataSource):
             "--total-steps 1500000 "
             "--telemetry-interval 10 "
             f"{checkpoint_arg} "
-            "--headless -- --num_envs 1024"
+            f"--headless -- --num_envs {train_num_envs}"
         )
         command = (
             f"bash -lc {shlex.quote(inner)}; "
@@ -1713,6 +1880,8 @@ class RealDataSource(RunDataSource):
                 + f"  \"run_id\": \"{run_id}\",\n"
                 + f"  \"run_dir\": \"{run_dir}\",\n"
                 + f"  \"payload\": \"{payload}\",\n"
+                + f"  \"source_run\": \"{previous_run}\",\n"
+                + f"  \"checkpoint\": \"{checkpoint}\",\n"
                 + "  \"tmux_session\": \"rl_train\",\n"
                 + f"  \"remote_boot_id\": \"{boot_id}\",\n"
                 + f"  \"resume\": {str(bool(resume)).lower()}\n"
@@ -1723,6 +1892,7 @@ class RealDataSource(RunDataSource):
         return run_id, run_dir
 
     async def action_kill(self) -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             import shlex
@@ -1745,6 +1915,7 @@ class RealDataSource(RunDataSource):
             return ActionResult(action="kill", ok=False, message=f"kill failed: {self._remote_unavailable_message(message)}")
 
     async def action_deploy_payload(self) -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             if await asyncio.to_thread(self._is_running, remote):
@@ -1762,6 +1933,7 @@ class RealDataSource(RunDataSource):
             return ActionResult(action="deploy_payload", ok=False, message=f"deploy failed: {self._remote_unavailable_message(message)}")
 
     async def action_start(self) -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             run_id, run_dir = await asyncio.to_thread(self._start_payload_training, remote, resume=False)
@@ -1776,6 +1948,7 @@ class RealDataSource(RunDataSource):
             return ActionResult(action="start", ok=False, message=f"start failed: {self._remote_unavailable_message(message)}")
 
     async def action_resume(self) -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             if await asyncio.to_thread(self._is_running, remote):
@@ -1802,6 +1975,7 @@ class RealDataSource(RunDataSource):
         return (out or "").strip().rstrip("/")
 
     async def action_physeval(self, run: str = "") -> PhysevalResult:
+        self._require_remote_mutation_permission()
         if not self.profile.physeval_cmd:
             return PhysevalResult(ok=False, summary="physeval command has not been discovered in the profile")
         try:
@@ -1837,6 +2011,7 @@ class RealDataSource(RunDataSource):
         the product `acceptance_run` CLI in a detached LOCAL subprocess (the console is local; the CLI
         SSHes to the box). It self-refuses if training is active (acceptance_run's own GPU guard), so
         this never contends with a converging run. The scored verdict then surfaces via get_acceptance."""
+        self._require_remote_mutation_permission()
         import os
         import re
         import subprocess
@@ -1872,6 +2047,7 @@ class RealDataSource(RunDataSource):
         the box. This is the system completing a tuning task on its own. Long-running (hours); progress
         is in the campaign log + get_acceptance. Refuses obviously-bad inputs; the campaign manages
         training itself (stall-recovery built in)."""
+        self._require_remote_mutation_permission()
         import os
         import re
         import subprocess
@@ -1905,6 +2081,7 @@ class RealDataSource(RunDataSource):
         best-known checkpoint, then autonomously loop full-battery measure -> analyze -> tune ->
         train -> re-measure until benchmark passes / levers exhausted / budget ends, and emit the
         deliverable report. Detached; hours-long; progress in /tmp/produce_policy.log."""
+        self._require_remote_mutation_permission()
         import os
         import subprocess
         import sys
@@ -1929,6 +2106,7 @@ class RealDataSource(RunDataSource):
             return ActionResult(action="produce_policy", ok=False, message=f"could not launch: {e}")
 
     async def action_edit_config(self, key: str = "", value: str = "") -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             res = await asyncio.to_thread(self._edit_config_value, remote, key, value)
@@ -1942,6 +2120,7 @@ class RealDataSource(RunDataSource):
             return ActionResult(action="edit_config", ok=False, message=f"edit_config failed: {self._remote_unavailable_message(message)}")
 
     async def action_rollback_config(self) -> ActionResult:
+        self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
             ok = await asyncio.to_thread(self._rollback_config, remote)

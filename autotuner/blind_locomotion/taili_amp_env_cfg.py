@@ -12,6 +12,11 @@ from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
 from isaaclab.utils import configclass
 from .assets.taili import TAILI_DOG_CFG
 
+try:
+    from .taili_core import taili_geometry as geometry
+except ImportError:
+    from autotuner.taili_core import taili_geometry as geometry
+
 MOTIONS_DIR = os.environ.get("TAILI_MOTIONS_DIR", str(Path(__file__).resolve().parent / "motions"))
 
 TAILI_TERRAINS_CFG = TerrainGeneratorCfg(
@@ -42,6 +47,8 @@ TAILI_TERRAINS_CFG = TerrainGeneratorCfg(
 
 @configclass
 class TailiAmpEnvCfg(DirectRLEnvCfg):
+    # 固定资产几何；奖励目标和诊断均从同一常量读取。
+    foot_radius = geometry.FOOT_RADIUS
     # 速度跟踪：速度奖励是命令跟踪的主驱动，AMP 只负责风格与姿态，不承担速度语义。
     # 线速度和 yaw 都使用双侧误差核：欠速、超速都会降低奖励。
     rew_track_lin    = 3.5
@@ -70,6 +77,8 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     gait_period      = 0.55
     gait_period_min  = 0.40
     gait_period_slope = 0.10
+    # yaw 命令按足端旋转半径折算成等效线速度，用于 gait clock 和参考步态周期。
+    gait_yaw_speed_equiv = 0.15
     gait_duty        = 0.5
     rew_swing_drag   = 0.0     # 摆动相触地拖脚惩罚，默认关闭。
     rew_gait_enforce = 0.0     # 硬步态约束默认关闭；地形上允许策略打破固定节律。
@@ -104,35 +113,43 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     swing_dir_margin = 0.15
     swing_dir_sigma  = 0.08
 
-    # 地形事件奖励：严格盲狗语义，只在接触/支撑高度变化后给奖励或惩罚，不使用前视地形标签。
+    # 连续地形奖励：只在接触后的承重高度变化上结算，不使用前视地形标签。
     rew_climb = 0.0
     climb_slip_gate = 0.18
     climb_slip_soft_span = 0.18
     climb_vz_cap = 0.8
     rew_terrain_up = 0.0
     rew_terrain_down = 0.0
-    rew_terrain_support_transfer = 0.0
+    rew_terrain_support_loss = 0.0
     rew_terrain_contact_quality = 0.0
-    rew_terrain_event_collapse = 0.0
+    rew_terrain_collapse = 0.0
+    rew_terrain_direction_progress = 0.0
+    rew_terrain_layer_hold = 0.0
+    rew_terrain_overspeed = 0.0
+    support_reference_alpha = 0.10
     terrain_transition_eps = 0.05
     terrain_transition_span = 0.08
-    terrain_event_latch_s = 0.0
+    terrain_probe_height = 0.12
+    terrain_response_height_scale = 0.04
+    terrain_response_delta_scale = 0.025
+    terrain_response_height_deadband = 0.008
+    terrain_response_delta_deadband = 0.008
+    terrain_collision_trace_decay_time = 0.40
+    terrain_collision_response_full_scale = 0.35
+    terrain_support_height_alpha = 0.20
+    terrain_collision_ratio_start = 1.25
+    terrain_collision_ratio_span = 1.50
+    terrain_trajectory_leg_relief = 0.85
+    terrain_progress_full_ratio = 0.35
+    terrain_overspeed_start_ratio = 1.15
+    terrain_overspeed_span_ratio = 0.35
     terrain_up_vz_cap = 0.6
     terrain_down_vz_cap = 0.5
     terrain_down_vz_target = 0.18
-    terrain_event_quality_floor = 0.35
-    terrain_front_duty_margin = 0.12
-    terrain_rear_duty_floor = 0.48
-    terrain_support_scale = 0.22
-    terrain_torque_soft_frac = 0.85
-    terrain_event_collapse_height = 0.42
-    terrain_event_collapse_wxy = 1.50
-    terrain_event_collapse_speed_ratio = 1.60
-    terrain_event_collapse_speed_min = 0.75
-    terrain_event_collapse_speed_scale = 0.60
-    terrain_curriculum_height_gain = 0.08
-    terrain_curriculum_height_loss = 0.08
-    terrain_curriculum_forward_min = 0.25
+    terrain_collapse_height = 0.42
+    terrain_collapse_wxy = 1.50
+    terrain_curriculum_stair_forward_min = 0.75
+    terrain_curriculum_stair_height_min = 0.18
     terrain_curriculum_stable_h = 0.42
     terrain_curriculum_stable_upright = 0.85
     terrain_curriculum_stable_contact_min = 2.0
@@ -146,7 +163,9 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     terrain_curriculum_peak_drop = 0
     terrain_curriculum_move_down_patience = 1
     terrain_curriculum_ignore_flat = True
-    w_settle_brake = 2.0    # 无命令但仍在运动时，奖励主动减速，帮助干净停步。
+    terrain_curriculum_success_ema_beta = 0.90
+    w_settle_brake = 0.35   # 过渡只作弱质量辅助，不能压过主任务。
+    w_transition_failure = 0.0  # 失败率保留诊断，不直接惩罚策略。
     # 不使用固定“楼梯专属高抬腿”。抬脚高度由粗糙度、接触事件和 clearance 目标共同决定。
     discrete_clearance = False
     # 参考步态中的前后站距偏置；YAML 会覆盖为实际策略值。
@@ -154,7 +173,8 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
 
     # 站立与姿态
     rew_stand_pose   = 5.0
-    stand_height     = 0.52
+    stand_height     = geometry.NOMINAL_BASE_HEIGHT
+    flat_stand_reset_clearance = 0.003
     rew_base_height  = -9.0
     rew_hip_neutral  = -8.0     # 抑制髋关节外翻/内扣，保持直线方向下足端横向位置干净。
     hip_neutral_lat_scale = 0.25
@@ -174,23 +194,31 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     cmd_lin_y        = (-0.6,  0.6)
     cmd_ang_z        = (-1.0,  1.0)
     cmd_resample_s   = 5.0
-    # 命令缓冲：self.commands 按一阶低通靠近采样目标，控制频率约 50Hz。
-    # alpha=0.93 约等价于 0.3s 过渡，用于停步、反向和转向时的自然减速。
-    # 稳态下命令仍会收敛到目标值，因此不改变最终速度跟踪语义。
+    # Actor 直接接收真实命令；过渡状态只做短时软质量评价，不改写命令。
     cmd_smooth_alpha = 0.93
     cmd_transition_enable = True
-    cmd_transition_cycles = 0.75
-    cmd_transition_min_s = 0.25
-    cmd_transition_max_s = 0.80
-    cmd_transition_fast_s = 0.16
+    cmd_transition_policy_managed = True
+    cmd_transition_cycles = 0.40
+    cmd_transition_min_s = 0.20
+    cmd_transition_max_s = 0.35
+    terrain_reward_start_phase = 1
+    cmd_transition_fast_s = 0.12
     cmd_transition_sign_flip_v = 0.08
     cmd_transition_sign_flip_w = 0.10
-    cmd_transition_low_speed_v = 0.12
-    cmd_transition_low_speed_w = 0.16
-    cmd_transition_contact_feet = 3.0
+    cmd_transition_low_speed_v = 0.10
+    cmd_transition_low_speed_w = 0.12
     cmd_transition_zero_frac_min = 0.48
     cmd_transition_zero_frac_max = 0.70
     cmd_transition_stop_zero_frac = 0.80
+    cmd_transition_stable_s = 0.08
+    cmd_transition_release_s = 0.12
+    cmd_transition_failure_ema_beta = 0.95
+    cmd_transition_wxy_max = 0.25
+    cmd_transition_tilt_deg = 6.0
+    cmd_transition_joint_speed_max = 1.5
+    cmd_transition_action_rate_max = 0.12
+    cmd_transition_phase_window = 0.10
+    cmd_transition_handoff_s = 0.40
     stand_prob       = 0.25    # 提高站立/停步样本比例，增加从运动命令切到零命令的减速练习。
     cmd_prob_fwd     = 0.25    # bootstrap 阶段四个运动方向等概率。
     cmd_prob_back    = 0.25
@@ -212,6 +240,9 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     vel_cur_down     = 0.55    # 方向进展低于该值时降低上限。
     vel_cur_step     = 0.04    # 每个日志间隔的速度上限调整步长。
     vel_terrain_decouple = True
+    progress_ema_alpha = 0.01
+    progress_ema_min_samples = 8
+    progress_ema_reference_samples = 16
 
     # 域随机化：根据 _dr_level 条件启用，先学会干净步态，再逐步扩大真实部署扰动。
     # DR 从 0 级开始，只有在持续满足能力门控后才升级。
@@ -224,11 +255,21 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     phase_intervals       = 5      # 进入下一阶段前需要连续满足门控的日志间隔数。
     penalty_ramp_intervals = 25    # phi1 中质量惩罚从 0 渐入到 1，避免 critic 冲击。
     phase_gate_prog_0     = 0.60   # phi0 到 phi1：四个方向速度进展的最小值。
+    phase_gate_transition_min_events = 128
     # 阶段门控使用命令进展与去时钟化步态质量；gait_match 只作为读数，不直接门控。
     phase_gate_prog_1     = 0.70   # phi1 到 phi2：保证能进入地形训练，同时不过早放松平地基础。
     phase_gate_slip_1     = 0.20   # 历史兼容字段，当前不再作为门控。
     phase_gate_terrain_2  = 6.0    # phi2 到 phi3：平均地形等级门槛。
     phase_gate_discrete_terrain_2 = 0.0  # 可选：离散障碍平均等级门槛，0 表示不单独门控。
+    phase_gate_boxes_2 = 0.0
+    phase_gate_stairs_2 = 0.0
+    phase_gate_stairs_up_2 = 0.0
+    phase_gate_boxes_success_2 = 0.0
+    phase_gate_stairs_down_success_2 = 0.0
+    phase_gate_stairs_up_success_2 = 0.0
+    phase_gate_boxes_collapse_2 = 1.0
+    phase_gate_stairs_down_collapse_2 = 1.0
+    phase_gate_stairs_up_collapse_2 = 1.0
     phase_gate_fall_2     = 0.05   # phi2 到 phi3：跌倒率门槛。
     phase_gate_prog_2     = 0.50   # phi2 到 phi3：地形上仍需保留基本方向跟踪。
     regress_fall          = 0.10   # phi2 回退保护：跌倒率过高时暂停推进地形/速度。
@@ -251,6 +292,9 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     dr_mass_range_2      = (-3.0, 6.0)
     dr_stiffness_scale_2 = (0.8,  1.2)
     dr_damping_scale_2   = (0.7,  1.3)
+    dr_apply_prob_1      = 1.0
+    dr_apply_prob_2      = 1.0
+    dr_apply_prob_3      = 1.0
     # 3 级：部署级扰动包络。
     dr_push_interval_s_3 = 15.0
     dr_push_vel_3        = 0.8
@@ -316,14 +360,12 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     command_ctx_dim  = 3          # 保留作兼容说明，不再进入 amp_observation_space。
     num_amp_observations = 2
     amp_observation_space = 43 + terrain_ctx_dim  # 46，纯风格加地形上下文。
-    # AMP stride 窗口：启用 TAILI_AMP_STRIDE=1 时，让风格窗口覆盖约一个步态周期。
-    # 策略侧和参考侧都会按 amp_frame_stride 子采样，判别器输入维度自动随帧数扩展。
-    amp_frame_stride  = 4          # 环境步子采样步长，50Hz 下约 80ms。
-    amp_stride_frames = 6          # stride 窗口帧数，总跨度约 420ms。
+    # AMP 时间窗口由 YAML 的 env.amp.frames 和 frame_stride 明确配置。
+    amp_frame_stride  = 1          # 兼容默认值；当前实验由 YAML 覆盖为 4。
 
     action_scale     = 0.35
     early_termination = True
-    termination_height = 0.35
+    termination_height = geometry.NOMINAL_BASE_HEIGHT * 0.67
     contact_force_threshold = 10.0
     actuator_stiffness_by_joint = [120.0] * 12
     actuator_damping_by_joint = [10.0] * 12

@@ -1,13 +1,13 @@
 """skrl Gaussian actor for the Taili blind TerrainPerceiver policy.
 
 Runtime contract from docs/taili_strategy_decisions.md:
-  actor input = body[53] + z_terrain[32] = 85
+  actor input = body[57] + z_terrain[32] = 89
   TerrainPerceiver history = [25, 54]
   z_terrain = [u(history), u(mirror(history))], so mirroring swaps the halves
 
 The critic may receive the full privileged observation from the env, but this
 policy only reads the deployable blind slice:
-  body53 | history(25*54) = 1403
+  body57 | history(25*54) = 1407
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ except ImportError:  # local source tree: autotuner.taili_core
         from taili_core.taili_models import apply_grad_scale
 
 
-BODY_DIM = 53
+BODY_DIM = 57
 HIST_LEN = 25
 TICK_DIM = 54
 HIST_FLAT = HIST_LEN * TICK_DIM
@@ -83,7 +83,7 @@ class TerrainPerceiverPolicy(GaussianMixin, Model):
 def terrain_perceiver_model(observation_space, action_space, device, return_source: bool = False, **kwargs):
     """skrl Runner-compatible factory."""
     if return_source:
-        return "TerrainPerceiverPolicy: body53 + TerrainPerceiver(history25x54)->z32 + equivariant actor."
+        return "TerrainPerceiverPolicy: body57 + TerrainPerceiver(history25x54)->z32 + equivariant actor."
     return TerrainPerceiverPolicy(observation_space, action_space, device, **kwargs)
 
 

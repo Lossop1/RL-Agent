@@ -11,6 +11,11 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import DCMotorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
+try:
+    from ..taili_core import taili_geometry as geometry
+except ImportError:
+    from autotuner.taili_core import taili_geometry as geometry
+
 
 def _taili_urdf_path() -> str:
     asset_dir = Path(__file__).resolve().parent
@@ -50,7 +55,7 @@ TAILI_DOG_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.52),
+        pos=(0.0, 0.0, geometry.NOMINAL_BASE_HEIGHT),
         joint_pos={
             ".*L_hip_joint": 0.0,
             ".*R_hip_joint": 0.0,

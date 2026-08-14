@@ -72,3 +72,27 @@ PHASES = [
 
 def phase_order():
     return [p.name for p in PHASES]
+
+
+def update_sample_weighted_ema(
+    previous: float,
+    sample: float,
+    sample_count: int,
+    *,
+    alpha: float,
+    min_samples: int,
+    reference_samples: int,
+    initialized: bool,
+) -> tuple[float, bool, float]:
+    """按有效样本数更新EMA；小批次不应改变课程能力判断。"""
+    count = max(0, int(sample_count))
+    if count < max(1, int(min_samples)):
+        return float(previous), bool(initialized), 0.0
+
+    base_alpha = min(max(float(alpha), 0.0), 1.0)
+    sample_weight = min(1.0, count / max(1, int(reference_samples)))
+    effective_alpha = 1.0 - (1.0 - base_alpha) ** sample_weight
+    if not initialized:
+        return float(sample), True, effective_alpha
+    value = float(previous) + effective_alpha * (float(sample) - float(previous))
+    return value, True, effective_alpha

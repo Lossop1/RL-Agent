@@ -47,6 +47,8 @@ class MultiMotionLoader:
         self.sigma = float(sigma)
         self.slope_sigma = float(slope_sigma)
         self.cmd_scale = torch.tensor(cmd_scale, dtype=torch.float32, device=device)         # (3,)
+        self.durations = np.asarray([float(loader.duration) for loader in self.loaders], dtype=np.float32)
+        self._gait_phase_maps = None
 
     # ---- delegation (all clips share layout / duration) ----
     def get_dof_index(self, names):
@@ -55,8 +57,88 @@ class MultiMotionLoader:
     def get_body_index(self, names):
         return self.loaders[0].get_body_index(names)
 
-    def sample_times(self, n):
-        return self.loaders[0].sample_times(n)
+    def sample_times(self, n, clip_ids=None):
+        """按被选 clip 的真实时长采样，避免短 clip 被夹在最后一帧。"""
+        if clip_ids is None:
+            return self.loaders[0].sample_times(n)
+        cid = clip_ids.detach().cpu().numpy() if torch.is_tensor(clip_ids) else np.asarray(clip_ids)
+        if len(cid) != int(n):
+            raise ValueError(f"clip_ids 长度 {len(cid)} 与采样数 {n} 不一致")
+        return self.durations[cid] * np.random.uniform(low=0.0, high=1.0, size=int(n))
+
+    def configure_gait_phase_maps(
+        self,
+        reference_fn,
+        *,
+        gait_period: float,
+        gait_period_slope: float,
+        gait_period_min: float,
+        yaw_speed_equiv: float,
+        clearance_base: float,
+        clearance_rough_gain: float,
+        stance_dx: float,
+        grid_size: int = 128,
+    ):
+        """预计算每个 clip 帧在生产解析参考中的最相近 gait phase。
+
+        reset 仍然随机采样 clip 时间，因此保留相位多样性；区别只是 gait clock
+        不再与刚写入仿真的关节姿态相互矛盾。映射只在环境初始化时计算一次。
+        """
+        grid_size = max(int(grid_size), 16)
+        phases = torch.arange(grid_size, dtype=torch.float32, device=self.device) / float(grid_size)
+        maps = []
+        with torch.no_grad():
+            for clip_index, loader in enumerate(self.loaders):
+                command = self.clip_cmd[clip_index].unsqueeze(0).expand(grid_size, -1)
+                speed = torch.linalg.norm(command[0, :2]) + float(yaw_speed_equiv) * command[0, 2].abs()
+                period = torch.clamp(
+                    torch.as_tensor(float(gait_period), dtype=torch.float32, device=self.device)
+                    - float(gait_period_slope) * speed,
+                    min=float(gait_period_min),
+                    max=float(gait_period),
+                )
+                roughness = self.clip_slope[clip_index, 2].expand(grid_size)
+                reference = reference_fn(
+                    command,
+                    phases * period,
+                    gait_period=float(gait_period),
+                    gait_period_slope=float(gait_period_slope),
+                    gait_period_min=float(gait_period_min),
+                    yaw_speed_equiv=float(yaw_speed_equiv),
+                    clearance_base=float(clearance_base),
+                    roughness=roughness,
+                    clearance_rough_gain=float(clearance_rough_gain),
+                    stance_dx=float(stance_dx),
+                    jp_only=True,
+                    iters=12,
+                )
+                mse = (loader.dof_positions[:, None, :] - reference[None, :, :]).square().mean(dim=-1)
+                maps.append(phases[mse.argmin(dim=1)].detach())
+        self._gait_phase_maps = maps
+
+    def sample_gait_phases(self, clip_ids, times):
+        """按 clip 时间插值预计算相位，使用圆周插值正确处理 1 -> 0 回绕。"""
+        if self._gait_phase_maps is None:
+            raise RuntimeError("gait phase maps 尚未配置")
+        cid = clip_ids.detach().cpu().numpy() if torch.is_tensor(clip_ids) else np.asarray(clip_ids)
+        tm = times.detach().cpu().numpy() if torch.is_tensor(times) else np.asarray(times)
+        result = torch.zeros(len(cid), dtype=torch.float32, device=self.device)
+        for clip_index, loader in enumerate(self.loaders):
+            selected = np.where(cid == clip_index)[0]
+            if len(selected) == 0:
+                continue
+            index_0, index_1, blend = loader._compute_frame_blend(tm[selected])
+            index_0_t = torch.as_tensor(index_0, dtype=torch.long, device=self.device)
+            index_1_t = torch.as_tensor(index_1, dtype=torch.long, device=self.device)
+            blend_t = torch.as_tensor(blend, dtype=torch.float32, device=self.device)
+            phase_map = self._gait_phase_maps[clip_index]
+            angle_0 = 2.0 * torch.pi * phase_map[index_0_t]
+            angle_1 = 2.0 * torch.pi * phase_map[index_1_t]
+            x = (1.0 - blend_t) * torch.cos(angle_0) + blend_t * torch.cos(angle_1)
+            y = (1.0 - blend_t) * torch.sin(angle_0) + blend_t * torch.sin(angle_1)
+            phase = torch.remainder(torch.atan2(y, x) / (2.0 * torch.pi), 1.0)
+            result[torch.as_tensor(selected, dtype=torch.long, device=self.device)] = phase
+        return result
 
     def clip_terrain_ctx(self, clip_ids):
         """per-sample terrain context for the given clip ids -> (M, 3)."""

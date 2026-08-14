@@ -6,13 +6,10 @@ runtime:
   data_root: /root/gpufree-data
   telemetry_interval: 10
 training_recipe:
-  id: taili_phased_acceptance_curriculum_v3
-  purpose: 'Taili blind locomotion curriculum. The YAML is the single editable strategy contract; runtime config artifacts
-    are generated from it. v3 removes the single-command conditioning phases: all four directions plus stand train together
-    from step 0 (strategy-book phi-0), quality gates and the budget-controlled penalty ramp are active from step 0, and later
-    phases only add mixed commands, terrain/DR, and the speed envelope.
-
-    '
+  id: taili_temporal_contact_exchange
+  purpose: '隔离验证 AMP 时间语义：从 step 0 同时训练完整速度包络、四方向、站立、混合地形和轻量执行器随机化。
+    AMP 使用覆盖约半个步态周期的稀疏时间窗口，使四足静止不能靠单帧姿态相似获得风格收益；phase 只改变
+    单轴/混合命令与验收强度，不串行推迟速度或地形能力。该实验只允许 fresh 训练。'
   command_mode: phase_curriculum
   init_phase: 0
   touchdown_impact_only: true
@@ -25,31 +22,26 @@ training_recipe:
       - lat
       - yaw
       stand_prob: 0.1
-      prob_fwd: 0.3
-      prob_back: 0.15
-      prob_lat: 0.15
-      prob_yaw: 0.4
+      prob_fwd: 0.25
+      prob_back: 0.25
+      prob_lat: 0.25
+      prob_yaw: 0.25
       fwd_range:
-      - 0.3
-      - 0.8
+      - 0.15
+      - 1.0
       back_range:
       - 0.15
-      - 0.5
+      - 0.8
       lat_range:
-      - 0.15
+      - 0.12
       - 0.5
       yaw_range:
-      - 0.18
-      - 0.65
-      note: flat, all four directions + stand train from step 0, while phase progress gates use fwd/back/lat only so
-        yaw remains trained and measured without blocking terrain forever. Old note below is retained only as history;
-        quality (slip/diag/duty/air) from phase 0. YAW BOOTSTRAP 0704 — yaw was the sole phi0 blocker (plateaued 0.50, needs
-        0.70) while fwd/back/lat all reached 0.80; yaw is an anti-symmetric, hard-to-explore behavior. Fix is more yaw gradient
-        (prob_yaw 0.25 to 0.40). An earlier gentle-turn bootstrap (yaw min ->0.10) BACKFIRED because 0.10 sat at the moving-gate
-        threshold 0.1, so gentle yaw commands were mis-classified as standing and got zero tracking_yaw reward, and the velocity
-        curriculum shrank yaw commands to that trivial floor so the robot never practiced the real yaw the spec A2 (err below
-        0.15 rad per s across the full yaw range) tests. Reverted so yaw floor is raised to 0.30 for meaningful practice,
-        and the moving-gate yaw threshold lowered 0.1 to 0.05 to match yaw_cmd_gate.
+      - 0.15
+      - 1.0
+      note: '平地单轴全方向阶段。前进、后退、横移、yaw 和站立从 step 0 同时训练；
+        采样按全体环境存量补缺，终止 reset 不得把失败方向随机转换为更易存活的方向。
+        phase progress 纳入 yaw，但 yaw 使用单独可达门槛，避免假通过和历史死锁同时出现。
+        质量指标 slip/diag/duty/air 从 phase 0 开始约束。'
     1:
       command_mode: mixed
       active_dirs:
@@ -60,23 +52,24 @@ training_recipe:
       stand_prob: 0.1
       near_zero_prob: 0.08
       near_zero_scale: 0.04
-      mixed_axis_prob: 0.45
-      x_axis_prob: 0.75
+      # 非站立、非近零样本中固定保留 40% 单轴命令，四方向各占 10%。
+      # 其余 60% 是 vx+wz、vy+wz、vx+vy 三种双轴混合。
+      single_axis_fraction: 0.40
       prob_fwd: 0.50
       prob_back: 0.50
       fwd_range:
-      - 0.3
+      - 0.15
       - 1.0
       back_range:
       - 0.15
-      - 0.6
-      lat_range:
-      - 0.15
-      - 0.55
-      yaw_range:
-      - 0.2
       - 0.8
-      note: mixed vx/vy/wz plus stop exposure on flat; quality bars tighten (walk-down _1 keys).
+      lat_range:
+      - 0.12
+      - 0.5
+      yaw_range:
+      - 0.15
+      - 1.0
+      note: '平地 mixed commands 阶段。加入 vx/vy/wz 混合、近零命令和停顿样本；质量门槛使用 _1 配置收紧。'
     2:
       command_mode: mixed
       active_dirs:
@@ -87,24 +80,22 @@ training_recipe:
       stand_prob: 0.08
       near_zero_prob: 0.08
       near_zero_scale: 0.04
-      mixed_axis_prob: 0.60
-      x_axis_prob: 0.72
-      prob_fwd: 0.55
-      prob_back: 0.45
+      single_axis_fraction: 0.40
+      prob_fwd: 0.50
+      prob_back: 0.50
       fwd_range:
-      - 0.3
+      - 0.15
       - 1.0
       back_range:
       - 0.15
       - 0.8
       lat_range:
-      - 0.15
+      - 0.12
       - 0.5
       yaw_range:
-      - 0.25
+      - 0.15
       - 1.0
-      note: terrain and domain randomization begin here; tracking bars relax on terrain per spec (controlled traversal, not
-        flat-band tracking).
+      note: '地形能力在前两阶段已经训练；本阶段提高混合命令和地形验收要求。地形上以稳定通过为先，不强制满足平地窄带跟踪；轻量执行器 DR 已从 phase 0 开启，完整 DR 仍按能力门控升级。'
     3:
       command_mode: mixed
       active_dirs:
@@ -115,31 +106,32 @@ training_recipe:
       stand_prob: 0.1
       near_zero_prob: 0.1
       near_zero_scale: 0.04
-      mixed_axis_prob: 0.75
-      x_axis_prob: 0.7
-      prob_fwd: 0.55
-      prob_back: 0.45
+      single_axis_fraction: 0.40
+      prob_fwd: 0.50
+      prob_back: 0.50
       fwd_range:
-      - 0.3
+      - 0.15
       - 1.0
       back_range:
       - 0.15
       - 0.8
       lat_range:
-      - 0.15
+      - 0.12
       - 0.5
       yaw_range:
-      - 0.25
+      - 0.15
       - 1.0
-      note: final command envelope fixed for terrain traversal; terrain is the primary difficulty axis.
+      note: '最终混合命令验收阶段。速度包络从 phase 0 已完整训练，本阶段不再改变速度分布。'
 model:
   terrain_perceiver:
     history_len: 25
+    history_stride: 2
+    history_order: oldest_first
     tick_dim: 54
     z_dim: 32
     dropout: 0.0
   actor:
-    input_dim: 85
+    input_dim: 89
     hidden:
     - 1024
     - 512
@@ -148,34 +140,44 @@ model:
     epochs: 2
     batch: 4096
     lr_scale: 0.75
+    exploration_entropy_final: 0.005
+    exploration_entropy_hold_fraction: 0.75
+    # 仅约束训练采样；导出策略始终使用确定性均值。
+    exploration_log_std_floor_initial: -1.5
+    exploration_log_std_floor_final: -2.5
 env:
   observation_contract:
     deployable:
-      body_dim: 53
+      body_dim: 57
       history_len: 25
+      history_stride: 2
+      history_order: oldest_first
       tick_dim: 54
       history_flat_dim: 1350
-      actor_raw_dim: 1403
+      actor_raw_dim: 1407
     actor_mlp:
-      input_dim: 85
+      input_dim: 89
       formula: body_dim + terrain_perceiver.z_dim
     training_only:
       privileged_dim: 197
-      aux_label_dim: 22
-    policy_tensor_dim: 1622
+      aux_label_dim: 34
+    policy_tensor_dim: 1638
   amp:
     frame_dim: 51
-    frames: 2
-    tensor_dim: 102
+    frames: 6
+    frame_stride: 4
+    tensor_dim: 306
   observation:
     history_len: 25
+    history_stride: 2
+    history_order: oldest_first
     tick_dim: 54
-    body_dim: 53
+    body_dim: 57
     privileged_dim: 197
-    aux_label_dim: 22
+    aux_label_dim: 34
     amp_frame_dim: 51
-    amp_frames: 2
-    observation_space: 1622
+    amp_frames: 6
+    observation_space: 1638
     amp_observation_space: 51
   control:
     action_scale: 0.35
@@ -185,69 +187,127 @@ env:
     dt: 0.005
     contact_force_threshold: 10.0
   gait:
-    period: 0.72
-    period_min: 0.56
-    period_slope: 0.06
+    period: 0.76
+    period_min: 0.62
+    period_slope: 0.05
+    yaw_speed_equiv: 0.3
     duty: 0.50
   actuator:
     stiffness:
-      hip: 349
-      thigh: 120
-      calf: 240
+      hip: 100
+      thigh: 100
+      calf: 100
     damping:
-      hip: 8
-      thigh: 4
-      calf: 3
+      hip: 5.0
+      thigh: 5.0
+      calf: 5.0
   scene:
     num_envs: 4096
     env_spacing: 2.5
   commands:
-    resample_s_min: 3.0
-    resample_s_max: 6.0
-    smooth_alpha: 0.93
-    transition_enable: true
-    transition_cycles: 1.4
-    transition_min_s: 0.4
-    transition_max_s: 1.2
-    transition_fast_s: 0.18
+    resample_s_min: 5.0
+    resample_s_max: 8.0
+    smooth_alpha: 0.85
+    # 当前训练不启用命令过渡机制；Actor 始终直接接收原始目标命令。
+    transition_enable: false
+    # 若以后重新启用，仍只允许策略管理动作响应，不能改写用户命令。
+    transition_policy_managed: true
+    transition_cycles: 0.4
+    transition_min_s: 0.20
+    transition_max_s: 0.35
+    transition_fast_s: 0.12
     transition_sign_flip_v: 0.08
     transition_sign_flip_w: 0.1
-    transition_low_speed_v: 0.12
-    transition_low_speed_w: 0.16
-    transition_contact_feet: 3.0
+    transition_low_speed_v: 0.10
+    transition_low_speed_w: 0.12
     transition_zero_frac_min: 0.52
-    transition_zero_frac_max: 0.76
-    transition_stop_zero_frac: 0.86
+    transition_zero_frac_max: 0.68
+    transition_stop_zero_frac: 0.78
+    transition_stable_s: 0.08
+    transition_release_s: 0.12
+    transition_failure_ema_beta: 0.95
+    transition_wxy_max: 0.25
+    transition_tilt_deg: 6.0
+    transition_joint_speed_max: 1.5
+    transition_action_rate_max: 0.12
+    transition_phase_window: 0.10
+    transition_handoff_s: 0.40
     fwd_max: 1.0
     back_max: 0.8
     lat_max: 0.5
     yaw_max: 1.0
+    # 最终速度包络从 step 0 保持不变；多数样本落在历史已验证核心区间，
+    # 其余样本覆盖完整区间。这是固定混合分布，不是速度课程。
+    core_sample_fraction: 0.75
+    core_fwd_range:
+    - 0.3
+    - 0.7
+    core_back_range:
+    - 0.15
+    - 0.5
+    core_lat_range:
+    - 0.15
+    - 0.5
+    core_yaw_range:
+    - 0.18
+    - 0.65
   curriculum:
     vel_curriculum_enable: false
     vel_cur_up: 0.85
     vel_cur_down: 0.55
     vel_cur_step: 0.0
     vel_terrain_decouple: false
+    # Gate使用约2秒的稳定方向能力；当前批次值仍单独写入遥测。
+    progress_ema_alpha: 0.01
+    progress_ema_min_samples: 8
+    progress_ema_reference_samples: 16
     phase_intervals: 4
     phase_max_steps: 60000
+    phase_timeout_enable: false
     penalty_ramp_intervals: 16
     penalty_budget_ratio_max: 1.05
+    # 预算仅用于遥测；核心和接触质量不能因当前代价偏大而被反向削弱。
+    penalty_budget_controls_quality: false
     phase_progress_dirs_0:
     - fwd
     - back
     - lat
+    - yaw
+    phase_progress_thresholds_0:
+      fwd: 0.65
+      back: 0.60
+      lat: 0.60
+      yaw: 0.35
     phase_progress_dirs_1:
     - fwd
     - back
     - lat
+    - yaw
+    phase_progress_thresholds_1:
+      fwd: 0.60
+      back: 0.60
+      lat: 0.60
+      yaw: 0.35
     phase_progress_dirs_2:
     - fwd
     - back
     - lat
+    - yaw
+    phase_progress_thresholds_2:
+      fwd: 0.60
+      back: 0.60
+      lat: 0.60
+      yaw: 0.35
     phase_progress_dirs_3:
     - fwd
     - back
     - lat
+    - yaw
+    phase_progress_thresholds_3:
+      fwd: 0.65
+      back: 0.60
+      lat: 0.60
+      yaw: 0.40
     phase_gate_prog_0: 0.65
     phase_gate_prog_1: 0.62
     phase_gate_prog_2: 0.62
@@ -255,37 +315,114 @@ env:
     phase_gate_slip_0: 0.35
     phase_gate_diag_0: 0.45
     phase_gate_duty_0: 0.55
+    phase_gate_duty_target_0: 0.55
+    phase_gate_duty_symmetry_0: 0.55
+    phase_gate_period_0: 0.45
+    phase_gate_yaw_gait_0: 0.30
+    phase_gate_duty_valid_0: 0.70
+    phase_gate_execution_0: 0.80
+    # 训练批次中的方向终止率必须足够低；短时冲刺后 reset 不能算持续能力。
+    phase_gate_terminal_rate_0: 0.01
+    # 过渡在早期只训练和记录，不阻塞核心、跟踪、步态与地形课程。
+    # 这些阈值保留作诊断口径；最终部署级 DR 使用分类型门槛收口。
+    phase_gate_transition_start_phase: 2
+    phase_gate_transition_fail_0: 0.45
     phase_gate_air_0: 0.0
+    # phi0 从第一步同时训练地形，但阶段推进仍必须保住平地核心质量。
+    # 这些值显式写入有效配置，避免运行时默认值在监控中成为隐藏条件。
+    phase_gate_flat_tilt_p95_0: 0.16
+    phase_gate_flat_wxy_0: 0.40
+    phase_gate_flat_height_error_p95_0: 0.055
+    phase_gate_flat_touchdown_vz_p95_0: 0.60
+    phase_gate_flat_slip_high_0: 0.28
+    phase_gate_flat_trajectory_p95_0: 3.0
     phase_gate_slip_1: 0.31
+    phase_gate_duty_target_1: 0.60
+    phase_gate_duty_symmetry_1: 0.60
+    phase_gate_period_1: 0.55
+    phase_gate_yaw_gait_1: 0.38
+    phase_gate_duty_valid_1: 0.75
+    phase_gate_execution_1: 0.80
+    phase_gate_terminal_rate_1: 0.008
+    phase_gate_transition_fail_1: 0.45
+    phase_gate_transition_min_events: 128
     phase_gate_diag_1: 0.5
     phase_gate_duty_1: 0.58
     phase_gate_air_1: 0.0
     phase_gate_terrain_2: 3.5
-    phase_gate_discrete_terrain_2: 1.0
+    phase_gate_discrete_terrain_2: 2.0
+    phase_gate_boxes_2: 2.0
+    phase_gate_stairs_2: 1.5
+    phase_gate_stairs_up_2: 1.5
+    phase_gate_boxes_success_2: 0.65
+    phase_gate_stairs_down_success_2: 0.65
+    phase_gate_stairs_up_success_2: 0.65
+    phase_gate_boxes_collapse_2: 0.10
+    phase_gate_stairs_down_collapse_2: 0.10
+    phase_gate_stairs_up_collapse_2: 0.10
     phase_gate_fall_2: 0.05
-    terrain_start_phase: 2
-    dr_start_phase: 2
-    max_training_phase: 2
+    # phi2 仍保留22%平地样本；以下门槛防止地形平均值掩盖平地动作质量退化。
+    phase_gate_flat_tilt_p95_2: 0.06
+    phase_gate_flat_wxy_2: 0.30
+    phase_gate_flat_height_error_p95_2: 0.04
+    phase_gate_flat_touchdown_vz_p95_2: 0.40
+    phase_gate_flat_slip_high_2: 0.28
+    phase_gate_flat_trajectory_p95_2: 3.0
+    # 平地接触传感器存在约 0.003 的响应底噪，不能再使用 1e-6 的数学零门槛。
+    phase_gate_flat_false_terrain_response_0: 0.01
+    terrain_start_phase: 0
+    terrain_reward_start_phase: 0
+    # level 0 只使用 0.9~1.1 Kp 和 0.85~1.15 Kd；质量、推扰、摩擦、质量和 IMU
+    # 仍由正式 DR 等级门控，避免基础策略只适应一个理想执行器点。
+    dr_start_phase: 0
+    max_training_phase: 3
     terrain_curriculum_floor_after_peak: 3
     terrain_curriculum_peak_drop: 2
     terrain_curriculum_move_down_patience: 2
+    # v4 起楼梯等级只由整段承重高度净变化验收；旧状态机课程状态不能继承。
+    terrain_curriculum_state_schema: 4
     terrain_curriculum_ignore_flat: true
     regress_fall: 0.1
     regress_prog: 0.4
+    regress_execution: 0.70
+    dr_gate_execution: 0.82
+    # 初级 DR 由稳定、跟踪和地形能力解锁；最终部署级 DR 再检查平地过渡安全。
+    dr_gate_transition_start_level: 2
+    dr_gate_transition_stop_fail_final: 0.35
+    dr_gate_transition_reverse_fail_final: 0.30
+    dr_gate_transition_axis_fail_final: 0.40
+    dr_gate_transition_handoff_fail_final: 0.10
     terrain_gate_slip_high: 0.26
   terrain:
+    flat:
+      proportion: 0.30
+    slope:
+      proportion: 0.08
+    slope_inv:
+      proportion: 0.07
+    rough:
+      proportion: 0.08
     stairs:
       step_height_range:
-      - 0.08
-      - 0.38
-      proportion: 0.25
+      - 0.04
+      - 0.30
+      platform_width: 1.5
+      proportion: 0.15
+    stairs_up:
+      step_height_range:
+      - 0.04
+      - 0.30
+      platform_width: 1.5
+      proportion: 0.20
     boxes:
       grid_height_range:
-      - 0.05
-      - 0.3
+      - 0.04
+      - 0.20
+      proportion: 0.12
   domain_randomization:
     enable: true
     start_level: 0
+    full_start_level: 3
     unlock_terrain: 6.0
     push_interval_s_0: 0.0
     push_vel_0: 0.0
@@ -300,6 +437,7 @@ env:
     damping_scale_1:
     - 0.85
     - 1.15
+    apply_prob_1: 0.5
     push_interval_s_2: 20.0
     push_vel_2: 1.5
     mass_range_2:
@@ -311,6 +449,7 @@ env:
     damping_scale_2:
     - 0.7
     - 1.3
+    apply_prob_2: 0.75
     push_interval_s_3: 15.0
     push_vel_3: 2.0
     push_ang_scale: 0.8
@@ -323,6 +462,7 @@ env:
     damping_scale_3:
     - 0.6
     - 1.4
+    apply_prob_3: 1.0
     friction_range_3:
     - 0.4
     - 1.4
@@ -343,46 +483,73 @@ env:
     rew_clearance_heavy: -9.5
     rew_gait_enforce: -1.6
     rew_underspeed: 0.0
-    rew_backward_underspeed: -0.45
+    rew_backward_underspeed: 0.0
     rew_backward_wrong_dir: 0.0
-    rew_lateral_underspeed: -0.35
+    rew_lateral_underspeed: 0.0
     rew_wrong_dir: -0.25
-    w_imitate_live: 1.6
+    w_settle_brake: 0.08
+    w_transition_failure: 0.0
+    # 平地零命令直接从 q_default 静态姿态开始；只保留 3 mm 防穿透间隙。
+    flat_stand_reset_clearance: 0.003
+    w_imitate_live: 0.6
     imitate_sigma_live: 0.09
     imitate_fwd_floor: 0.5
     w_swing_dir: 0.0
-    rew_climb: 6.2
+    # 楼梯任务由统一方向/速度跟踪驱动。高度与承重层只用于外部验收，不进入奖励。
+    rew_climb: 0.0
     climb_slip_gate: 0.26
     climb_slip_soft_span: 0.22
     climb_vz_cap: 0.8
-    rew_terrain_up: 7.4
-    rew_terrain_down: 5.0
-    rew_terrain_support_transfer: 3.4
-    rew_terrain_contact_quality: 3.8
-    rew_terrain_event_collapse: 5.8
+    rew_terrain_contact_quality: 0.0
+    # 楼梯不另收一套安全代价；统一支撑、核心、落脚和 terminal 已覆盖真实风险。
+    rew_terrain_support_loss: 0.0
+    rew_terrain_collapse: 0.0
+    rew_terrain_overspeed: 0.0
+    support_reference_alpha: 0.10
     strict_blind_terrain_reward: true
     w_lateral_foot_excursion: 1.8
     lateral_foot_margin: 0.025
     lateral_foot_scale: 0.065
     terrain_transition_eps: 0.025
     terrain_transition_span: 0.065
-    terrain_event_latch_s: 0.48
+    # 地形生成器不可用时的保守回退值；正常训练按当前课程行计算碰障抬脚目标。
+    terrain_probe_height: 0.12
+    # 地形响应只来自当前承重高差、真实支撑高度变化和水平碰撞，不保留隐藏状态。
+    terrain_response_height_scale: 0.04
+    terrain_response_delta_scale: 0.025
+    # 8 mm 死区过滤足端球面接触、网格离散和支撑足切换产生的平地底噪；
+    # 最低 4 cm 台阶仍保留至少 0.8 的高差响应。
+    terrain_response_height_deadband: 0.008
+    terrain_response_delta_deadband: 0.008
+    # 仅保存已经发生的碰障，覆盖一次本体感知到动作响应的延迟；不包含前视或足序状态。
+    # 碰障资格迹覆盖约半个步态周期，使同一只脚有时间完成抬起和重新落脚。
+    terrain_collision_trace_decay_time: 0.40
+    # 中等以上碰障直接使用本课程行的完整抬脚目标，避免响应强度被重复相乘。
+    terrain_collision_response_full_scale: 0.35
+    terrain_support_height_alpha: 0.20
+    terrain_collision_ratio_start: 1.25
+    terrain_collision_ratio_span: 1.50
+    # 非足端碰障使用整机接触传感器；5 N 以下忽略，随后在 45 N 范围内连续增强。
+    terrain_body_collision_force_start: 5.0
+    terrain_body_collision_force_span: 45.0
+    # 平地仍使用 nominal_base_h*0.67；离散地形给碰后恢复保留物理空间。
+    terrain_recovery_termination_height: 0.18
+    terrain_recovery_termination_tilt_deg: 60.0
+    terrain_trajectory_leg_relief: 0.85
+    # 30 cm 换层按严格势能差结算；退回完整追回正向信用，不能通过上下振荡套利。
+    terrain_progress_full_ratio: 0.35
+    terrain_overspeed_start_ratio: 1.15
+    terrain_overspeed_span_ratio: 0.35
     terrain_up_vz_cap: 0.7
     terrain_down_vz_cap: 0.55
     terrain_down_vz_target: 0.16
-    terrain_event_quality_floor: 0.2
-    terrain_front_duty_margin: 0.16
-    terrain_rear_duty_floor: 0.44
-    terrain_support_scale: 0.25
-    terrain_torque_soft_frac: 0.85
-    terrain_event_collapse_height: 0.44
-    terrain_event_collapse_wxy: 1.25
-    terrain_event_collapse_speed_ratio: 1.4
-    terrain_event_collapse_speed_min: 0.75
-    terrain_event_collapse_speed_scale: 0.6
-    terrain_curriculum_height_gain: 0.08
-    terrain_curriculum_height_loss: 0.09
-    terrain_curriculum_forward_min: 0.25
+    terrain_collapse_height: 0.44
+    terrain_collapse_wxy: 1.25
+    terrain_curriculum_stair_forward_min: 0.75
+    # level 0 的台阶高度为 4 cm；一次真实承重换层即可获得课程信用，
+    # 不再强制先连续跨过两级才允许从 0 升级。
+    terrain_curriculum_stair_height_min: 0.035
+    terrain_curriculum_success_ema_beta: 0.90
     terrain_curriculum_stable_h: 0.44
     terrain_curriculum_stable_upright: 0.85
     terrain_curriculum_stable_contact_min: 2.0
@@ -393,7 +560,7 @@ env:
     terrain_curriculum_failure_upright: 0.75
     terrain_curriculum_failure_wxy: 1.7
     discrete_clearance: false
-    base_clearance: 0.11
+    base_clearance: 0.06
     stance_dx: 0.05
     clr_rough_flat: 0.01
     clr_rough_span: 0.12
@@ -406,73 +573,251 @@ reward:
   sigma_stand_yaw: 0.05
   sigma_stand_pose: 0.2
   sigma_stand_action: 0.3
-  nominal_base_h: 0.52
+  # q_default 下足端球心高度 0.505196m + URDF 足球半径 0.042m。
+  nominal_base_h: 0.5471961541
   tilt_ok_rad: 0.2617993878
   tilt_gate_close_rad: 0.6981317008
-  flat_clearance_target: 0.08
-  terrain_clearance_margin: 0.05
+  flat_clearance_target: 0.06
+  # 碰障抬脚余量 m(h)=clip(0.02+0.05h, 0.02, 0.035)。
+  terrain_clearance_margin: 0.035
+  terrain_clearance_margin_min: 0.02
+  terrain_clearance_margin_gain: 0.05
+  terrain_clearance_margin_max: 0.035
   clearance_band: 0.02
   terrain_v_floor: 0.08
-  tracking_touchdown_clean_floor: 0.7
-  gait_anchor_progress_floor: 0.5
-  gait_anchor_min_ratio: 0.45
-  linear_underspeed_min_ratio: 0.65
-  w_linear_underspeed: 1.0
+  # 能力奖励只在真实失效时归零；软稳定性差时仍保留学习梯度。
+  capability_gate_floor: 0.25
+  tracking_touchdown_clean_floor: 0.65
+  gait_anchor_progress_floor: 0.2
+  gait_anchor_min_ratio: 0.6
+  linear_underspeed_min_ratio: 0.85
+  # 近场、远场和方向推进构成完整正向驱动；欠速不再作为重复负奖励。
+  w_linear_underspeed: 0.0
   w_tracking_lin: 2.25
   w_track_far: 1.0
   scale_track_far: 0.35
-  w_tracking_yaw: 5.6
-  w_yaw_far: 5.2
+  # yaw 与线性方向使用相同的 4.0 基础预算，质量由独立加性项负责。
+  w_tracking_yaw: 2.25
+  w_yaw_progress: 0.75
+  yaw_progress_quality_floor: 0.50
+  w_yaw_underspeed: 0.0
+  yaw_underspeed_min_ratio: 0.75
+  w_yaw_far: 1.0
   scale_yaw_far: 0.60
   w_stand: 1.5
+  # 乘法 stand 核用于精确收敛；独立姿态项保证蹲低或单腿偏离时仍有恢复梯度。
+  w_stand_posture: 0.90
+  stand_pose_free: 0.03
+  stand_pose_scale: 0.20
+  stand_height_band: 0.015
+  stand_height_scale: 0.04
   w_stand_far: 1.5
   scale_stand_far: 0.2
   w_stand_contact: 2.0
-  w_terrain_progress: 2.25
-  w_gait_anchor: 1.35
-  w_feet_air_time: 0.95
+  # 同一个推进项覆盖平地和碰障后的地形响应；地形只放宽速度大小。
+  w_supported_progress: 0.75
+  direction_progress_full_ratio: 0.60
+  # 平地 progress 只记录真实支撑和核心稳定；探索驱动由 tracking/欠速项承担。
+  direction_progress_support_floor: 0.0
+  direction_progress_quality_floor: 0.0
+  # 兼容字段保留，但不再叠加第二份地形任务奖励。
+  w_terrain_progress: 0.0
+  # 楼梯低速达到命令的 35% 即可领取完整方向信用；非零对齐下限用于碰障脱困，
+  # 离轴运动继续由 off_axis、planar_purity 和 heading_hold 约束。
+  terrain_progress_full_ratio: 0.35
+  terrain_direction_alignment_floor: 0.35
+  terrain_style_max_relief: 0.65
+  w_gait_anchor: 1.20
+  # 相位错配和真实周期直接进入奖励，避免只靠 gate 等待错误步态自行消失。
+  w_gait_phase_mismatch: 0.45
+  gait_false_contact_scale: 2.0
+  w_excess_support: 0.60
+  # 完成真实接触周期后才奖励对角换腿，reset 默认窗口和静止动作不能取巧。
+  w_contact_exchange: 0.80
+  w_contact_period: 0.50
+  contact_period_free: 0.05
+  contact_period_scale: 0.15
+  w_feet_air_time: 0.60
   air_time_target: 0.3
-  w_off_axis: 0.5
-  w_planar_purity: 1.65
+  w_off_axis: 0.65
+  off_axis_free: 0.03
+  off_axis_scale: 0.25
+  w_planar_purity: 0.0
   planar_purity_yaw_scale: 0.75
-  w_heading_hold: 1.15
-  heading_hold_scale: 0.35
-  w_wrong_dir: 1.45
-  w_action_rate: 0.09
-  w_stance_slip: 0.9
-  w_stance_slip_late: 1.55
-  slip_free_speed: 0.05
+  w_heading_hold: 1.05
+  # 纯 yaw 必须原地旋转，角速度跟踪不能用伴随平移换取。
+  w_yaw_translation: 0.0
+  yaw_translation_free: 0.03
+  yaw_translation_scale: 0.25
+  w_transition_readiness: 0.02
+  transition_tracking_floor: 1.0
+  transition_gait_floor: 1.0
+  transition_trajectory_floor: 0.15
+  # 足端语义由 clearance、触地速度、滑移和平滑项负责，避免再追一套固定轨迹。
+  w_foot_trajectory: 0.0
+  foot_trajectory_error_scale: 0.35
+  foot_trajectory_back_scale: 1.15
+  foot_trajectory_velocity_mix: 0.45
+  foot_trajectory_terminal_vz_scale: 0.28
+  w_terminal_swing_velocity: 0.80
+  terminal_swing_vz_free: 0.12
+  terminal_swing_vz_scale: 0.35
+  heading_hold_scale: 0.20
+  w_wrong_dir: 0.0
+  w_action_rate: 0.04
+  # 只限制平地异常大动作；被动碰障后保留跨越高台阶所需的关节行程。
+  w_action_magnitude: 0.0
+  action_magnitude_free: 1.0
+  action_magnitude_scale: 1.0
+  action_magnitude_terrain_relief: 0.75
+  w_stance_slip: 0.65
+  w_stance_slip_late: 1.05
+  slip_free_speed: 0.08
   slip_speed_scale: 1.0
-  w_landing_impact: 0.55
-  w_landing_impact_late: 4.2
-  impact_speed_scale: 1.0
-  w_orient: 0.4
-  orient_soft_rad: 0.09
-  orient_scale_rad: 0.35
-  w_base_vz: 1.0
-  w_base_wxy: 1.15
-  w_hip_deviation: 3.9
-  hip_deviation_scale: 0.25
-  w_clearance_under: 1.9
-  w_clearance_over: 0.8
-  w_diagonal_contact: 1.35
-  w_duty_balance: 2.6
+  # 触地三项都按真实事件均值计算。竖直均值降到原来的 40%，保留最差足尾部约束，
+  # 避免策略通过把竖直冲击转成水平扫腿来规避代价。
+  w_landing_impact: 0.45
+  w_landing_impact_late: 0.45
+  impact_speed_scale: 0.35
+  touchdown_vz_free: 0.15
+  w_orient: 1.40
+  orient_soft_rad: 0.025
+  orient_scale_rad: 0.20
+  # 超过旧饱和点后保留 25% 尾部斜率：能区分严重失稳，又不压住 fresh 方向探索。
+  core_tail_gain: 0.40
+  orient_terrain_relief: 0.70
+  w_base_vz: 2.0
+  base_vz_free: 0.05
+  base_vz_scale: 0.75
+  w_base_wxy: 1.40
+  # 角加速度保留为诊断量，不进入奖励或 Gate。
+  w_base_ang_accel: 0.0
+  base_ang_accel_free: 2.5
+  base_ang_accel_scale: 6.0
+  base_ang_vel_filter_beta: 0.55
+  w_base_ang_accel_raw_tail: 0.0
+  base_ang_accel_raw_free: 8.0
+  base_ang_accel_raw_scale: 20.0
+  w_flat_move_height: 2.0
+  flat_move_height_target: 0.5471961541
+  flat_move_height_band: 0.018
+  flat_move_height_terrain_relief: 0.80
+  # 核心质量是加性正奖励，不乘回速度跟踪。平地要求严格，真实碰障后连续放宽。
+  w_core_quality: 1.20
+  core_tilt_scale: 0.035
+  core_ang_vel_scale: 0.20
+  core_height_scale: 0.020
+  core_vz_scale: 0.12
+  core_progress_floor: 0.20
+  core_terrain_relief: 0.70
+  w_support_integrity: 3.0
+  support_integrity_min_contacts: 2.0
+  support_integrity_wxy_soft: 0.9
+  support_integrity_wxy_hard: 2.4
+  w_hip_deviation: 1.35
+  hip_deviation_free: 0.04
+  hip_deviation_scale: 0.13
+  hip_deviation_lat_scale: 0.40
+  hip_deviation_yaw_scale: 0.30
+  # 前后腿平均伸展差只在平地严格约束；横移和 yaw 保留一半载荷重排空间。
+  w_front_rear_extension: 0.75
+  front_rear_extension_free: 0.015
+  front_rear_extension_scale: 0.05
+  front_rear_extension_lat_yaw_scale: 0.50
+  w_clearance_under: 1.8
+  w_clearance_over: 1.0
+  clearance_worst_leg_mix: 0.65
+  w_diagonal_contact: 1.3
+  w_duty_balance: 1.45
+  diagonal_contact_yaw_scale: 0.30
+  duty_balance_yaw_scale: 0.50
   duty_target: 0.5
+  duty_linear_min: 0.42
+  duty_linear_max: 0.66
+  duty_linear_margin: 0.16
+  duty_symmetry_tolerance: 0.20
+  duty_cycle_ema_beta: 0.60
+  gait_period_tolerance: 0.22
   quality_window_ema_beta: 0.98
   slip_high_threshold: 0.2
   rear_duty_tolerance: 0.05
-  w_torque_margin: 2.2
-  w_torque_saturation: 7.0
-  w_terminal: 10.0
-  healthy_progress_floor: 0.22
-  healthy_progress_slip_target: 0.05
-  healthy_progress_slip_width: 0.09
-  terrain_clearance_drive: 2.1
-  validated_tracking_floor: 0.18
+  w_torque_margin: 1.5
+  w_torque_saturation: 5.0
+  # 0.4~1.4 秒短时跟踪后倒下不能被前序任务收益抵消。
+  w_terminal: 60.0
+  healthy_progress_floor: 0.15
+  quality_reward_progress_start: 0.05
+  quality_reward_progress_full: 0.45
+  quality_reward_floor: 0.55
+  # 高阶机身动态和轨迹精修晚于接触步态形成，避免基础运动尚未出现时压制探索。
+  refinement_reward_progress_start: 0.15
+  refinement_reward_progress_full: 0.55
+  refinement_reward_floor: 0.25
+  healthy_progress_slip_target: 0.1
+  healthy_progress_slip_width: 0.18
+  terrain_clearance_drive: 0.0
+  validated_tracking_floor: 0.15
   tracking_validity_terrain_mix: 1.25
-  w_stance_slip_high_late: 4.6
-  w_landing_impact_tail_late: 2.8
-  w_touchdown_slip_late: 3.0
+  # 已发生不规则接触后仅放松速度大小，方向信用保持完整。
+  terrain_tracking_min_scale: 0.30
+  # 姿态门仅供诊断和验收，不参与基础任务奖励乘法。
+  tracking_posture_floor: 0.20
+  # 连续执行年龄仅供诊断，不延迟基础任务正收益。
+  task_credit_floor: 0.20
+  task_credit_start_s: 1.50
+  task_credit_full_s: 3.00
+  tracking_motion_floor: 0.20
+  tracking_wxy_target: 0.15
+  tracking_wxy_width: 0.45
+  tracking_vz_target: 0.12
+  tracking_vz_width: 0.30
+  yaw_duty_quality_floor: 0.50
+  yaw_tracking_base_fraction: 0.15
+  yaw_tracking_wxy_target: 0.22
+  yaw_tracking_wxy_width: 0.50
+  yaw_support_contact_target: 2.25
+  yaw_support_contact_width: 0.75
+  w_yaw_support_moment: 0.0
+  w_yaw_wrong_moment: 0.0
+  w_stance_slip_high_late: 2.2
+  w_worst_leg_slip: 0.70
+  # 同一只脚早于目标周期 65% 再次触地，视为碎步或接触抖动。
+  w_contact_chatter: 0.65
+  contact_chatter_min_period_ratio: 0.65
+  w_directional_support_balance: 1.35
+  # 直行同样要求前后支撑一致，不能只保证左右平衡后让后足长期拖地。
+  # 真实地形接触后，奖励侧会用 terrain_pattern_scale 连续放松这一约束。
+  linear_front_rear_support_scale: 1.0
+  w_lateral_coordinated_progress: 0.0
+  lateral_quality_floor: 0.20
+  w_lateral_pair_velocity: 0.65
+  lateral_pair_velocity_free: 0.12
+  lateral_pair_velocity_scale: 0.60
+  w_cycle_wxy_bias: 0.0
+  w_cycle_wxy_bias_late: 0.0
+  cycle_wxy_rms_free: 0.10
+  cycle_wxy_rms_scale: 0.30
+  # 平地周期内垂向 RMS 超过 0.08m/s 后持续惩罚，真实地形响应时连续退让。
+  w_cycle_vz_bias: 0.0
+  cycle_vz_rms_free: 0.08
+  cycle_vz_rms_scale: 0.22
+  w_cycle_yaw_residual: 0.0
+  cycle_yaw_rms_free: 0.04
+  cycle_yaw_rms_scale: 0.28
+  # 普通触地仍使用有界均值；最重单脚改用 Huber 尾部，因此降低权重并只强化极端重砸。
+  w_landing_impact_tail: 1.35
+  w_landing_impact_tail_late: 0.55
+  # 水平与承重项从四足均值改为事件均值后按典型对角两足触地折半，保持原总预算量级。
+  w_touchdown_slip: 0.25
+  w_touchdown_slip_late: 0.45
+  w_touchdown_slip_tail: 1.00
+  w_touchdown_force_rate: 0.45
+  touchdown_force_rate_scale: 0.45
+  touchdown_hold_s: 0.10
+  touchdown_hold_scale: 0.65
+  w_swing_action_accel: 0.30
+  swing_action_accel_scale: 0.30
+  swing_foot_velocity_delta_scale: 0.60
 skrl:
   seed: 42
   models:
@@ -482,7 +827,8 @@ skrl:
       clip_actions: false
       clip_log_std: true
       min_log_std: -20.0
-      max_log_std: 2.0
+      # 1024 个并行环境已经提供足够探索；std 上限 exp(-0.4)=0.67，避免噪声本身破坏支撑。
+      max_log_std: -0.4
       initial_log_std: -1.0
       fixed_log_std: false
       output: ACTIONS
@@ -519,7 +865,8 @@ skrl:
     memory_size: 1000000
   agent:
     class: AMP
-    rollouts: 32
+    # 48 个控制步约 0.96 s，完整覆盖 0.62~0.76 s 的目标步态周期。
+    rollouts: 48
     learning_epochs: 4
     mini_batches: 16
     discount_factor: 0.99
@@ -541,12 +888,15 @@ skrl:
     ratio_clip: 0.2
     value_clip: 0.2
     clip_predicted_values: true
+    # phase0 使用已验证的探索强度，之后由持久化成熟度平滑降到 0.005。
     entropy_loss_scale: 0.02
     value_loss_scale: 2.5
     discriminator_loss_scale: 5.0
     amp_batch_size: 512
     task_reward_weight: 1.0
-    style_reward_weight: 2.0
+    # 平地用动作先验帮助形成自然接触周期；真实地形响应会连续降低该权重。
+    # AMP 只作为宽泛风格先验，不能超过明确任务与物理质量的预算。
+    style_reward_weight: 1.00
     discriminator_batch_size: 4096
     discriminator_reward_scale: 3.0
     discriminator_logit_regularization_scale: 0.05

@@ -52,10 +52,12 @@ try:
     import taili_blind_runtime as taili_runtime  # noqa: F401
     from taili_blind_runtime.taili_blind_env_cfg import TailiBlindEnvCfg
     from taili_blind_runtime.taili_blind_config import build_skrl_config, load_taili_blind_config
+    from taili_blind_runtime.taili_core import taili_geometry
 except Exception:
     import autotuner.blind_locomotion as taili_runtime  # noqa: F401
     from autotuner.blind_locomotion.taili_blind_env_cfg import TailiBlindEnvCfg
     from autotuner.blind_locomotion.taili_blind_config import build_skrl_config, load_taili_blind_config
+    from autotuner.taili_core import taili_geometry
 import acceptance_score as ACC                          # pure spec-threshold judge (off-sim unit-tested)
 
 LEGS = ["FL", "FR", "RL", "RR"]
@@ -164,7 +166,7 @@ def main():
         dxy = fp[:, :, None, :2] - hits[:, None, :, :2]
         near = torch.argmin((dxy * dxy).sum(-1), dim=-1)
         gz = torch.gather(hits[:, :, 2], 1, near)
-        return torch.clamp(fp[:, :, 2] - gz, min=0.0)
+        return torch.clamp(taili_geometry.sole_clearance(fp[:, :, 2], gz), min=0.0)
 
     obs, _ = env.reset()
     warm = args.steps // 3
@@ -222,12 +224,16 @@ def main():
                 inc = contact.float()                       # 1N contact — for DUTY (contact timing)
                 settled_f = settled.float()                 # weight-bearing — for SLIP (spec: settled only)
                 swing = 1.0 - inc
-                # CONTACT-POINT velocity (not foot-CoM): a sphere foot (r=0.014m) has a ROLLING CoM
+                # 接触点速度而不是足端球心速度；滚动时球心速度不等于滑移。
                 # velocity even with a non-sliding contact; the spec's slip is the bottom-of-sphere
                 # (contact-point) velocity = v_com + omega x r, r=(0,0,-radius). Removing the roll
                 # deletes the ~0.05 m/s phantom slip that was the whole B2 budget (D3m).
                 _omega = robot.data.body_ang_vel_w[:, foot_b, :]                      # (N,4,3)
-                _r = torch.tensor([0.0, 0.0, -0.014], device=robot.data.body_lin_vel_w.device).view(1, 1, 3)
+                _normal = getattr(base, "_support_reference_normal", None)
+                if _normal is None:
+                    _normal = torch.zeros((base.num_envs, 3), device=robot.data.body_lin_vel_w.device)
+                    _normal[:, 2] = 1.0
+                _r = -taili_geometry.FOOT_RADIUS * _normal[:, None, :]
                 _vc = robot.data.body_lin_vel_w[:, foot_b, :] + torch.cross(_omega, _r.expand_as(_omega), dim=-1)
                 fvel = _vc[:, :, :2].norm(dim=-1)
                 A["bh"].append(float((robot.data.root_pos_w[:, 2] - base._terrain.env_origins[:, 2]).mean()))

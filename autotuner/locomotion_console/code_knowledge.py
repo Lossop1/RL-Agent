@@ -20,7 +20,10 @@ _ALLOWLIST_FILES: tuple[str, ...] = (
     "autotuner/blind_locomotion/taili_blind_config.yaml",
     "autotuner/blind_locomotion/taili_blind_config.py",
     "autotuner/blind_locomotion/blind_tp_env.py",
+    "autotuner/blind_locomotion/taili_amp_env.py",
+    "autotuner/blind_locomotion/taili_amp_env_cfg.py",
     "autotuner/blind_locomotion/telemetry_emit.py",
+    "autotuner/blind_locomotion/telemetry_payloads.py",
     "autotuner/blind_locomotion/train_taili.py",
     "autotuner/blind_locomotion/diagnose_taili_cases.py",
     "autotuner/blind_locomotion/diagnose_taili.py",
@@ -30,6 +33,7 @@ _ALLOWLIST_FILES: tuple[str, ...] = (
     "autotuner/blind_locomotion/terrain_perceiver_aux_patch.py",
     "autotuner/blind_locomotion/parametric_ref.py",
     "autotuner/blind_locomotion/assets/taili.py",
+    "autotuner/taili_core/taili_geometry.py",
     "autotuner/taili_core/taili_reward.py",
     "autotuner/taili_core/taili_curriculum.py",
     "autotuner/taili_core/taili_obs.py",
@@ -264,6 +268,13 @@ _QUERY_ALIASES = {
     "来源": "provenance telemetry jsonl paths",
     "消费": "yaml_keys code_refs consumed",
     "死键": "yaml_keys consumed code_refs",
+    "计数": "count counter increment update reset condition",
+    "不增加": "count increment update condition",
+    "没变化": "update assign condition state",
+    "没过": "condition gate threshold pass failure",
+    "满足": "condition gate threshold pass",
+    "重置": "reset state update",
+    "生效": "config consumed wired update",
 }
 
 
@@ -293,16 +304,39 @@ def search_code_knowledge(query: str = "", max_snippets: int = 16) -> dict[str, 
     if not terms:
         matched_rows = _SIGNAL_ROWS[:8]
     expanded_terms = _expand_terms(terms, matched_rows)
-    files = _files_for_rows(matched_rows) or list(_ALLOWLIST_FILES)
+    files = _files_for_rows(matched_rows)
+    files.extend(rel for rel in _ALLOWLIST_FILES if rel not in files)
+    exact_identifiers = {
+        token.lower() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query or "")
+    }
 
-    snippets: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for rel in files:
         text = _read_allowlisted(rel)
         if text is None:
             continue
-        snippets.extend(_snippets_for_text(rel, text, expanded_terms, max_snippets=max_snippets - len(snippets)))
-        if len(snippets) >= max_snippets:
-            break
+        candidates.extend(_snippets_for_text(
+            rel,
+            text,
+            expanded_terms,
+            max_snippets=max_snippets,
+            priority_terms=exact_identifiers,
+        ))
+
+    def snippet_score(item: dict[str, Any]) -> tuple[int, int]:
+        body = str(item.get("text") or "").lower()
+        exact = sum(1 for token in exact_identifiers if token in body)
+        writes = sum(
+            1
+            for token in exact_identifiers
+            if re.search(rf"(?:self\.)?_*{re.escape(token)}\s*(?:\+|-|\*|/)?=", body)
+        )
+        matched = len(item.get("matched_terms") or [])
+        logic = int(any(marker in body for marker in (" if ", " and ", " or ", " = ", "+=", "return ")))
+        return (writes * 40 + exact * 20 + matched * 2 + logic, -int(item.get("line_start") or 0))
+
+    candidates.sort(key=snippet_score, reverse=True)
+    snippets = candidates[:max_snippets]
 
     consumption = _consumption_checks(matched_rows, files)
     return {
@@ -405,7 +439,14 @@ def _read_allowlisted(rel: str) -> str | None:
         return None
 
 
-def _snippets_for_text(rel: str, text: str, terms: list[str], *, max_snippets: int) -> list[dict[str, Any]]:
+def _snippets_for_text(
+    rel: str,
+    text: str,
+    terms: list[str],
+    *,
+    max_snippets: int,
+    priority_terms: set[str] | None = None,
+) -> list[dict[str, Any]]:
     if max_snippets <= 0:
         return []
     lines = text.splitlines()
@@ -417,10 +458,10 @@ def _snippets_for_text(rel: str, text: str, terms: list[str], *, max_snippets: i
         matched = [term for term in lower_terms if term in lower]
         if not matched:
             continue
-        start = max(0, idx - 3)
-        end = min(len(lines), idx + 4)
+        start = max(0, idx - 5)
+        end = min(len(lines), idx + 8)
         window = (start, end)
-        if window in used_windows:
+        if any(not (end <= used_start or start >= used_end) for used_start, used_end in used_windows):
             continue
         used_windows.add(window)
         out.append({
@@ -430,9 +471,16 @@ def _snippets_for_text(rel: str, text: str, terms: list[str], *, max_snippets: i
             "matched_terms": matched[:8],
             "text": "\n".join(f"{line_no + 1}: {lines[line_no]}" for line_no in range(start, end))[:2400],
         })
-        if len(out) >= max_snippets:
-            break
-    return out
+    priorities = priority_terms or set()
+    out.sort(
+        key=lambda item: (
+            sum(1 for term in priorities if term in str(item.get("text") or "").lower()),
+            len(item.get("matched_terms") or []),
+            -int(item.get("line_start") or 0),
+        ),
+        reverse=True,
+    )
+    return out[:max_snippets]
 
 
 def _consumption_checks(rows: list[dict[str, Any]], files: list[str]) -> list[dict[str, Any]]:

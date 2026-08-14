@@ -18,12 +18,17 @@ import math
 import numpy as np
 import torch
 
+try:
+    from .taili_core import taili_geometry as geometry
+except ImportError:
+    from autotuner.taili_core import taili_geometry as geometry
+
 # --- URDF kinematic constants (identical to gen_taili_gaits.py) ---
 L1 = 0.36385                                          # thigh length
 FOOT_OFF = (0.0252765, 0.0, -0.3179635)              # calf->foot offset (sagittal x,z used)
 HIPX, HIPY = 0.30414, 0.065                          # hip joint offset from base (x, y)
 THIGHY = 0.1432                                       # hip-abduction-axis -> thigh sagittal-plane y offset
-BASE_Z = 0.52                                        # nominal standing base height; YAML reward.nominal_base_h is the source
+BASE_Z = geometry.NOMINAL_BASE_HEIGHT                # 足端球心高度加 URDF 碰撞球半径。
 LEGS = ["FL", "FR", "RL", "RR"]
 SGN = {"FL": (1, 1), "FR": (1, -1), "RL": (-1, 1), "RR": (-1, -1)}   # (x,y) sign per leg
 TROT = {"FL": 0.0, "FR": 0.5, "RL": 0.5, "RR": 0.0}                  # diagonal trot phase offsets
@@ -65,32 +70,33 @@ def _ik2(tx, tz, iters=40):
 
 # nominal foot (x,z) rel hip at the standing joints — q_default (0, 0.7, -1.4), matching the TASK reward's
 # default pose so AMP style + imitation + the phi-gate style_err no longer fight the task at every stance/stand
-# frame (ROOT-1, 0707). BASE_Z is DERIVED from FK(q_default) so the nominal foot is grounded (was stale 0.52
-# with a 0.548 foot depth -> foot 0.028 m below ground; now 0.5052 consistent).
+# frame (ROOT-1, 0707). H0 是默认姿态下 base 到足端球心的距离；BASE_Z 还需
+# 加上真实足球半径，才能让碰撞球足底落在地面而不是让球心落在地面。
 with torch.no_grad():
     _nx, _nz = _fk2(torch.tensor(0.7), torch.tensor(-1.4))
     X0 = float(_nx)
     H0 = -float(_nz)
-    BASE_Z = H0   # FK-derived; overrides the stale 0.52 literal above, matches taili_amp_reference.BASE_HEIGHT_REF
+    BASE_Z = geometry.NOMINAL_BASE_HEIGHT
 
 
 def _foot_traj(p, sdx, sdy, clearance):
     """trot stance/swing foot trajectory (torch) at per-leg phase p in [0,1). Matches foot_traj_rel_hip.
     stance (p<0.5): planted, sliding back rel body; swing (p>=0.5): lift + return to front foothold.
 
-    SOFT, NO-SLAM, NO-SCUFF swing (spec: smooth/no-slam/no-slip):
-      * vertical  clearance*sin^2(pi*s): dz/dt -> 0 at touchdown (sin gave -clearance*2pi/T ~ -0.5 m/s = SLAM).
-      * horizontal velocity-matched RETRACTION h(s)=-4s^3+6s^2-s (h(0)=0,h(1)=1, h'(0)=h'(1)=-1): the foot's
-        body-frame velocity == the stance slide rate (-sdx*2/T) at BOTH liftoff & touchdown -> the foot is
-        already world-stationary when it plants (no scuff; linear swing landed at +0.6 vs stance -0.6 = skid).
+    平滑摆动：
+      * vertical 使用 64*s^3*(1-s)^3，离地和落地端点的速度、加速度均为 0；
+      * horizontal 使用 h(s)=2*smoothstep5(s)-s。它保持 h'(0)=h'(1)=-1，
+        使足端在离地/触地时仍与支撑相的机体系后滑速度匹配，同时把端点加速度降为 0。
       Foothold endpoints (+/-sdx/2) unchanged -> stance & no-slip body-velocity consistency preserved."""
     stance = p < 0.5
     s_st = p / 0.5
     s_sw = (p - 0.5) / 0.5
-    hsw = -4.0 * s_sw ** 3 + 6.0 * s_sw ** 2 - s_sw
+    smooth5 = s_sw ** 3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
+    hsw = 2.0 * smooth5 - s_sw
     fx = torch.where(stance, X0 + sdx / 2 - sdx * s_st, X0 - sdx / 2 + sdx * hsw)
     fy = torch.where(stance, sdy / 2 - sdy * s_st, -sdy / 2 + sdy * hsw)
-    fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * torch.sin(math.pi * s_sw) ** 2)
+    swing_bump = 64.0 * s_sw ** 3 * (1.0 - s_sw) ** 3
+    fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * swing_bump)
     return fx, fy, fz
 
 
@@ -99,8 +105,46 @@ def period_for_speed(speed, base, slope, pmin):
     return torch.clamp(base - slope * speed, min=pmin, max=base)
 
 
+def clearance_for_speed(speed, clearance_base, clearance_gain):
+    """低速缩短步幅时同步降低平地抬脚高度，避免小步高抬后重落脚。"""
+    speed_ratio = torch.clamp(speed / 0.50, 0.0, 1.0)
+    base_scale = 0.55 + 0.45 * speed_ratio
+    return clearance_base * base_scale + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)
+
+
+def foot_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075,
+                   gait_period_min=0.40, yaw_speed_equiv=0.15,
+                   clearance_base=0.09, clearance_gain=0.03, stance_dx=0.0):
+    """生成命令条件化的四足相对机身轨迹，不执行 IK。"""
+    vx, vy, wz = commands[:, 0], commands[:, 1], commands[:, 2]
+    speed = torch.norm(commands[:, :2], dim=1)
+    period_speed = speed + float(yaw_speed_equiv) * wz.abs()
+    period = period_for_speed(period_speed, gait_period, gait_period_slope, gait_period_min)
+    clearance = clearance_for_speed(period_speed, clearance_base, clearance_gain)
+    clearance = clearance * torch.clamp(torch.norm(commands, dim=1) / 0.1, 0.0, 1.0)
+
+    feet = []
+    for leg in LEGS:
+        sx, sy = SGN[leg]
+        hx, hy = sx * HIPX, sy * HIPY
+        dx = stance_dx if leg in ("FL", "FR") else -stance_dx
+        foot_x0 = hx + X0 + dx
+        foot_y0 = hy + sy * THIGHY
+        stride_x = (vx - wz * foot_y0) * period / 2.0
+        stride_y = (vy + wz * foot_x0) * period / 2.0
+        phase = ((times / period) + TROT[leg]) % 1.0
+        fx, fy, fz = _foot_traj(phase, stride_x, stride_y, clearance)
+        fx = fx + dx
+        hip_angle = torch.atan2(fy, -fz)
+        fy_body = hy + fy + sy * THIGHY * torch.cos(hip_angle)
+        fz_body = fz + sy * THIGHY * torch.sin(hip_angle)
+        feet.append(torch.stack((hx + fx, fy_body, fz_body), dim=-1))
+    return torch.stack(feet, dim=1)
+
+
 def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075, gait_period_min=0.40,
-                   clearance_base=0.09, clearance_gain=0.03, roughness=None, clearance_rough_gain=0.30,
+                   yaw_speed_equiv=0.15, clearance_base=0.09, clearance_gain=0.03,
+                   roughness=None, clearance_rough_gain=0.30,
                    stance_dx=0.0, iters=40, jp_only=False):
     """Analytic trot reference. commands (M,3) [vx,vy,wz], times (M,) local time (s).
     roughness (M,) optional terrain roughness in [0,~0.3]: raises swing clearance so the AMP discriminator
@@ -109,8 +153,10 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
     dev = commands.device
     vx, vy, wz = commands[:, 0], commands[:, 1], commands[:, 2]
     speed = torch.norm(commands[:, :2], dim=1)
-    T = period_for_speed(speed, gait_period, gait_period_slope, gait_period_min)           # (M,)
-    clearance = clearance_base + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)        # (M,)
+    # yaw 按足端旋转半径折算成等效线速度，只影响步态周期；步幅仍由刚体足端速度公式决定。
+    period_speed = speed + float(yaw_speed_equiv) * wz.abs()
+    T = period_for_speed(period_speed, gait_period, gait_period_slope, gait_period_min)    # (M,)
+    clearance = clearance_for_speed(period_speed, clearance_base, clearance_gain)             # (M,)
     if roughness is not None:
         clearance = clearance + clearance_rough_gain * torch.clamp(roughness, 0.0, 0.3)     # higher lift on rough
     # STAND reference: at ~zero command the stride is already 0, but the swing still lifts -> the reference is

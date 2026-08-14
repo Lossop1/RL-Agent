@@ -97,7 +97,7 @@ _nom = fk_foot(0.6, -1.2)
 X0 = _nom[0]          # nominal foot x rel hip
 H0 = -_nom[2]         # nominal thigh->foot vertical (FK at nominal joints)
 BASE_Z = 0.56         # taller nominal standing base height for a more upright flat/slope style
-                      # FK feet-on-ground -> stance foot link origin sits ~0.014 (foot sphere radius)
+                      # FK 足端 link 原点位于碰撞球球心；实际足球半径为 0.042m。
 
 LEGS = ['FL', 'FR', 'RL', 'RR']
 # hip offset rel base center: front sx=+1 rear -1; left sy=+1 right -1

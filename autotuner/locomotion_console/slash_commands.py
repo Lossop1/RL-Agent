@@ -914,22 +914,6 @@ def handle_slash_command(message: str, settings: LocomotionConsoleSettings, sour
         from .diagnostics import DiagnosticsController
 
         catalog = asyncio.run(DiagnosticsController(settings, source).catalog())
-        if catalog.training_running:
-            # Do NOT blanket-block: run the diagnostic CONCURRENTLY when the box has RAM+VRAM headroom.
-            from .diagnostics import probe_concurrent_headroom
-            try:
-                _remote = source._get_remote()
-                _ok, _detail = asyncio.run(probe_concurrent_headroom(_remote, 4))
-            except Exception:
-                _ok, _detail = (False, "无法读取余量")
-            if not _ok:
-                return {
-                    "reply": f"训练运行中且余量不足({_detail})——诊断暂停以避免 OOM/显存争用。降低 num_envs 或先停训练；也可查看历史诊断或 /diag explain。",
-                    "transcript": [{"tool": "diagnostics.catalog", "args": {"preset": preset}, "result": catalog.model_dump()}],
-                    "steps": 1,
-                    "mode": "slash_fast",
-                }
-            # headroom OK → fall through to propose the diagnostic (it will run alongside training)
         return {
             "reply": f"准备运行诊断 preset={preset}。这会占用远程 GPU，可能影响正在训练的进程；确认后才会执行。",
             "proposed_action": {

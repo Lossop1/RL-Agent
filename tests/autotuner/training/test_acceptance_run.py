@@ -79,18 +79,17 @@ def test_best_registry_updates_only_on_improvement():
     assert AR._maybe_update_best_registry(empty, "/data", verdict) is True  # first-ever write
 
 
-def test_action_run_acceptance_allowlists_inputs():
+def test_action_run_acceptance_allowlists_inputs(monkeypatch):
     """The copilot's measure action reaches a subprocess argv — inputs must be allowlisted and no
     shell metacharacters can survive into the spawned command."""
     import asyncio
-    import os
     from unittest.mock import patch
 
-    os.environ.setdefault("LOCOMOTION_CONSOLE_SOURCE", "fake")
-    from autotuner.locomotion_console.config import get_settings
+    from autotuner.locomotion_console.config import LocomotionConsoleSettings
     from autotuner.locomotion_console.datasource import RealDataSource
 
-    src = RealDataSource(get_settings())
+    src = RealDataSource(LocomotionConsoleSettings(source="real"))
+    monkeypatch.setenv("LOCOMOTION_ALLOW_REAL_MUTATIONS_DURING_TESTS", "1")
 
     async def go():
         with patch("subprocess.Popen") as P:

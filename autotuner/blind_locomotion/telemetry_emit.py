@@ -231,6 +231,7 @@ class TrainingTelemetryEmitter:
             ("tracking_lin_far", reward.get("tracking_lin_far")),
             ("tracking_yaw", reward.get("tracking_yaw")),
             ("tracking_yaw_far", reward.get("tracking_yaw_far")),
+            ("yaw_progress", reward.get("yaw_progress")),
             ("stand", reward.get("stand")),
             ("stand_far", reward.get("stand_far")),
             ("terrain_progress", reward.get("terrain_progress")),

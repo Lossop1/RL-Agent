@@ -12,14 +12,23 @@ import torch.nn.functional as F
 
 GEOM_W = 1.0
 RISK_W = 0.5
+EVENT_RISK_W = 0.75
 SMOOTH_W = 0.03
 
 
 def masked_huber(pred, label, mask, delta=1.0):
-    """Per-element Huber, masked, averaged over VALID entries only (mask in {0,1})."""
-    per = F.huber_loss(pred, label, reduction="none", delta=delta)
-    denom = mask.sum().clamp_min(1.0)
-    return (per * mask).sum() / denom
+    """只在掩码有效且输入有限的位置计算 Huber 均值。
+
+    仅在损失之后乘零不能隔离 NaN，因为 ``NaN * 0`` 仍然是 NaN。
+    无效标签必须在进入 Huber 之前替换掉。
+    """
+    valid = (mask > 0) & torch.isfinite(mask) & torch.isfinite(pred) & torch.isfinite(label)
+    safe_pred = torch.where(valid, pred, torch.zeros_like(pred))
+    safe_label = torch.where(valid, label, torch.zeros_like(label))
+    per = F.huber_loss(safe_pred, safe_label, reduction="none", delta=delta)
+    valid_f = valid.to(dtype=per.dtype)
+    denom = valid_f.sum().clamp_min(1.0)
+    return (per * valid_f).sum() / denom
 
 
 def smoothness_loss(z_t, z_prev, steady_mask):
@@ -31,9 +40,17 @@ def smoothness_loss(z_t, z_prev, steady_mask):
 
 def aux_loss(geom_pred, geom_label, geom_mask, risk_pred, risk_label, risk_mask,
              z_t=None, z_prev=None, steady_mask=None):
-    """L_aux = 1.0*Huber(geom) + 0.5*Huber(risk) + 0.03*smoothness (if z_t/z_prev given)."""
+    """辅助损失；稀疏事件通道独立归一化，避免被常驻基础风险样本稀释。"""
+    if risk_pred.shape != risk_label.shape or risk_pred.shape != risk_mask.shape:
+        raise ValueError("risk prediction, label and mask shapes must match")
     loss = GEOM_W * masked_huber(geom_pred, geom_label, geom_mask) \
-        + RISK_W * masked_huber(risk_pred, risk_label, risk_mask)
+        + RISK_W * masked_huber(risk_pred[..., :2], risk_label[..., :2], risk_mask[..., :2])
+    if risk_pred.shape[-1] > 2:
+        loss = loss + EVENT_RISK_W * masked_huber(
+            risk_pred[..., 2:],
+            risk_label[..., 2:],
+            risk_mask[..., 2:],
+        )
     if z_t is not None and z_prev is not None and steady_mask is not None:
         loss = loss + smoothness_loss(z_t, z_prev, steady_mask)
     return loss

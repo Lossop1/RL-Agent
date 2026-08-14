@@ -36,6 +36,8 @@ const DEFAULT_LOG_FIELDS = [
 ];
 const DIAGNOSTIC_POLL_MS = 3000;
 const ACTIVE_REFRESH_MS = 15000;
+// Preserve full-rate short diagnostics and at least ~25 Hz for the usual 4500-row suite.
+const PLAYBACK_FRAME_LIMIT = 2400;
 
 type TelemetryGroupKey = "reward" | "curriculum" | "health" | "command" | "counters";
 type ScaleMode = "normalized" | "raw";
@@ -56,9 +58,10 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
   const [history, setHistory] = useState<DiagnosticHistoryItem[]>([]);
   const [report, setReport] = useState<DiagnosticReport | null>(null);
   const [playback, setPlayback] = useState<DiagnosticPlayback | null>(null);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<TrainingTelemetry | null>(null);
   const [preset, setPreset] = useState("terrain");
-  const [checkpoint, setCheckpoint] = useState("best");
+  const [checkpoint, setCheckpoint] = useState("");
   const [planDraft, setPlanDraft] = useState<Partial<DiagnosticPlan> | null>(null);
   const [useJsonOverride, setUseJsonOverride] = useState(false);
   const [planText, setPlanText] = useState("");
@@ -70,6 +73,10 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
   const initializedRef = useRef(false);
   const draftKeyRef = useRef("");
   const refreshInFlightRef = useRef(false);
+  const selectedJobIdRef = useRef<string | null>(null);
+  const reportRequestRef = useRef(0);
+  const loadedArtifactJobIdRef = useRef<string | null>(null);
+  const loadingArtifactJobIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -117,7 +124,7 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
     .filter((item) => logFields.includes(item.key))
     .map((item, index) => toSeries(logScaleMode === "normalized" ? { ...item, values: normalizeSeries(item.values) } : item, index, false));
 
-  async function refresh(options: { silent?: boolean } = {}) {
+  async function refresh(options: { silent?: boolean; forceArtifacts?: boolean } = {}) {
     if (refreshInFlightRef.current) return;
     refreshInFlightRef.current = true;
     if (!options.silent) setBusy("refresh");
@@ -134,10 +141,25 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
       setTelemetry(nextTelemetry);
       if (!initializedRef.current) {
         setPreset(nextJob.preset || nextCatalog.presets.find((item) => item.id === "terrain")?.id || nextCatalog.presets[0]?.id || "quick");
-        setCheckpoint(nextCatalog.checkpoint || "best");
+        setCheckpoint(nextCatalog.checkpoint || "");
         initializedRef.current = true;
+      } else {
+        const checkpointPaths = new Set(nextCatalog.checkpoints.map((item) => item.path));
+        setCheckpoint((current) => {
+          if (!nextCatalog.checkpoint) return current;
+          if (!current || current === "best") return nextCatalog.checkpoint || "";
+          if (!checkpointPaths.has(current)) return nextCatalog.checkpoint || "";
+          return current;
+        });
       }
-      await loadReport(nextJob.job_id || nextHistory.items[0]?.job_id || null);
+      const reportJobId = selectedJobIdRef.current || nextJob.job_id || nextHistory.items[0]?.job_id || null;
+      if (reportJobId !== selectedJobIdRef.current) setReportSelection(reportJobId);
+      const reportJobState = reportJobId === nextJob.job_id
+        ? nextJob.state
+        : nextHistory.items.find((item) => item.job_id === reportJobId)?.state;
+      if (reportJobState === "complete") {
+        await loadReport(reportJobId, { force: options.forceArtifacts });
+      }
       setError("");
     } catch (reason) {
       setError(formatError(reason));
@@ -147,23 +169,59 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
     }
   }
 
-  async function loadReport(jobId: string | null | undefined) {
+  async function loadReport(
+    jobId: string | null | undefined,
+    options: { force?: boolean } = {},
+  ) {
     if (!jobId) {
+      reportRequestRef.current += 1;
+      loadedArtifactJobIdRef.current = null;
+      loadingArtifactJobIdRef.current = null;
       setReport(null);
       setPlayback(null);
       return;
     }
-    const nextReport = await getDiagnosticReport(jobId).catch(() => null);
+    if (!options.force && (
+      loadedArtifactJobIdRef.current === jobId
+      || loadingArtifactJobIdRef.current === jobId
+    )) return;
+    const requestId = ++reportRequestRef.current;
+    loadingArtifactJobIdRef.current = jobId;
+    const [nextReport, nextPlayback] = await Promise.all([
+      getDiagnosticReport(jobId).catch(() => null),
+      getDiagnosticPlayback(PLAYBACK_FRAME_LIMIT, jobId).catch(() => null),
+    ]);
+    if (requestId !== reportRequestRef.current) return;
+    loadingArtifactJobIdRef.current = null;
+    loadedArtifactJobIdRef.current = nextReport || nextPlayback?.available ? jobId : null;
     setReport(nextReport);
-    setPlayback(await getDiagnosticPlayback(1200, jobId).catch(() => null));
+    setPlayback(nextPlayback);
+  }
+
+  function setReportSelection(jobId: string | null) {
+    if (selectedJobIdRef.current !== jobId) {
+      reportRequestRef.current += 1;
+      loadedArtifactJobIdRef.current = null;
+      loadingArtifactJobIdRef.current = null;
+      setReport(null);
+      setPlayback(null);
+    }
+    selectedJobIdRef.current = jobId;
+    setSelectedJobId(jobId);
+  }
+
+  async function selectReport(jobId: string) {
+    setReportSelection(jobId);
+    await loadReport(jobId);
   }
 
   async function run() {
     setBusy("run");
     try {
       const plan = useJsonOverride ? parsePlanText(planText) : effectivePlan;
-      const next = await startDiagnostic(preset, checkpoint || "best", plan);
+      const next = await startDiagnostic(preset, checkpoint || catalog?.checkpoint || null, plan);
       setJob(next);
+      setReportSelection(next.job_id || null);
       setError("");
       await refresh();
     } catch (reason) {
@@ -192,7 +250,11 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
           <p className="eyebrow">物理诊断</p>
           <h1>诊断运行、调参和回放</h1>
         </div>
-        <button className="secondary-button" disabled={Boolean(busy)} onClick={() => void refresh()}>
+        <button
+          className="secondary-button"
+          disabled={Boolean(busy)}
+          onClick={() => void refresh({ forceArtifacts: true })}
+        >
           刷新
         </button>
       </div>
@@ -213,10 +275,12 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
           <label>
             <span>检查点</span>
             <select value={checkpoint} onChange={(event) => setCheckpoint(event.target.value)}>
-              <option value="best">后端默认：{catalog?.checkpoint_name || catalog?.checkpoint || "最新可用检查点"}</option>
+              <option value={catalog?.checkpoint || ""}>
+                默认：{catalog?.checkpoint_name || catalog?.checkpoint || "等待检查点生成"}
+              </option>
               {(catalog?.checkpoints ?? []).map((item) => (
                 <option key={item.path} value={item.path}>
-                  {item.name}{item.is_default ? "（默认）" : ""} · {item.framework_label || item.framework_id}
+                  {item.name}{item.is_default ? "（默认）" : ""} · {item.run_name || "运行未知"} · {item.framework_label || item.framework_id}
                 </option>
               ))}
             </select>
@@ -335,13 +399,15 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
           </div>
           <span className="render-source">{report?.job_id || "暂无报告"}</span>
         </div>
-        <Suspense fallback={<div className="viewer-fallback">正在加载渲染器</div>}>
-          <RobotViewer report={report} jobId={report?.job_id ?? job?.job_id ?? null} active={active} />
-        </Suspense>
+        {active ? (
+          <Suspense fallback={<div className="viewer-fallback">正在加载渲染器</div>}>
+            <RobotViewer playback={playback} active />
+          </Suspense>
+        ) : null}
       </section>
 
       <section className="tool-section">
-        <h2>最新报告</h2>
+        <h2>诊断报告</h2>
         {report ? (
           <div className="report-grid">
             <DetailGrid items={[
@@ -365,7 +431,12 @@ export default function Diagnostics({ active = true }: { active?: boolean }) {
         <h2>历史</h2>
         <div className="history-list">
           {history.map((item) => (
-            <button key={item.job_id} onClick={async () => await loadReport(item.job_id)}>
+            <button
+              key={item.job_id}
+              className={selectedJobId === item.job_id ? "active" : ""}
+              aria-pressed={selectedJobId === item.job_id}
+              onClick={() => void selectReport(item.job_id)}
+            >
               <strong>{item.preset_label || item.preset}</strong>
               <span>{item.state} · {item.checkpoint_name || item.checkpoint || "检查点未知"}</span>
             </button>
@@ -483,17 +554,17 @@ function PlanControls({
               {isCustom ? (
                 <>
                   <label>
-                    <span>vx m/s</span>
+                    <span>{"vx m/s"}</span>
                     <input type="number" min={-1.5} max={1.5} step={0.05} value={numberParam(command.vx, 0)}
                            onChange={(event) => updateCommand(index, { vx: clampNumberInput(event.currentTarget.value, -1.5, 1.5, 0), mode: "custom" })} />
                   </label>
                   <label>
-                    <span>vy m/s</span>
+                    <span>{"vy m/s"}</span>
                     <input type="number" min={-0.7} max={0.7} step={0.05} value={numberParam(command.vy, 0)}
                            onChange={(event) => updateCommand(index, { vy: clampNumberInput(event.currentTarget.value, -0.7, 0.7, 0), mode: "custom" })} />
                   </label>
                   <label>
-                    <span>wz rad/s</span>
+                    <span>{"wz rad/s"}</span>
                     <input type="number" min={-1.5} max={1.5} step={0.05} value={numberParam(command.wz, 0)}
                            onChange={(event) => updateCommand(index, { wz: clampNumberInput(event.currentTarget.value, -1.5, 1.5, 0), mode: "custom" })} />
                   </label>
@@ -799,6 +870,11 @@ function buildDiagnosticOptions(report: DiagnosticReport | null, playback: Diagn
       options.push(
         frameSeries(`${leg}_clearance`, `${leg} 离地`, frames, (frame) => frame.feet[leg]?.clearance, "m"),
         frameSeries(`${leg}_force`, `${leg} 足力`, frames, (frame) => frame.feet[leg]?.force_norm, "N"),
+        frameSeries(`${leg}_force_w_x`, `${leg} 足端力 X`, frames, (frame) => frame.feet[leg]?.force_w_x, "N"),
+        frameSeries(`${leg}_force_w_y`, `${leg} 足端力 Y`, frames, (frame) => frame.feet[leg]?.force_w_y, "N"),
+        frameSeries(`${leg}_force_w_z`, `${leg} 足端力 Z`, frames, (frame) => frame.feet[leg]?.force_w_z, "N"),
+        frameSeries(`${leg}_normal_force`, `${leg} 法向足端力`, frames, (frame) => frame.feet[leg]?.normal_force, "N"),
+        frameSeries(`${leg}_tangent_force`, `${leg} 切向足端力`, frames, (frame) => frame.feet[leg]?.tangent_force, "N"),
       );
     }
   }

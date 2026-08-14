@@ -522,11 +522,26 @@ def _actual_phase_gate_from_config(effective_config_text: str, phase: Any) -> di
     slip_v, slip_s = phase_thr("slip", 0.20)
     diag_v, diag_s = phase_thr("diag", 0.80)
     duty_v, duty_s = phase_thr("duty", 0.80)
+    duty_target_v, duty_target_s = phase_thr("duty_target", duty_v)
+    duty_symmetry_v, duty_symmetry_s = phase_thr("duty_symmetry", duty_v)
+    period_v, period_s = phase_thr("period", 0.55)
+    yaw_gait_v, yaw_gait_s = phase_thr("yaw_gait", 0.35)
+    duty_valid_v, duty_valid_s = phase_thr("duty_valid", 0.70)
+    execution_v, execution_s = phase_thr("execution", 0.80)
+    transition_fail_v, transition_fail_s = phase_thr("transition_fail", 0.12)
     air_v, air_s = phase_thr("air", 0.0)
+    flat_tilt_v, flat_tilt_s = phase_thr("flat_tilt_p95", 0.16)
+    flat_wxy_v, flat_wxy_s = phase_thr("flat_wxy", 0.40)
+    flat_height_v, flat_height_s = phase_thr("flat_height_error_p95", 0.055)
+    flat_touchdown_v, flat_touchdown_s = phase_thr("flat_touchdown_vz_p95", 0.60)
+    flat_slip_v, flat_slip_s = phase_thr("flat_slip_high", 0.28)
+    flat_trajectory_v, flat_trajectory_s = phase_thr("flat_trajectory_p95", 3.0)
+    flat_false_response_v, flat_false_response_s = phase_thr("flat_false_terrain_response", 0.01)
     terrain_slip_high = _as_float(curriculum.get("terrain_gate_slip_high"))
     terrain_slip_v = max(slip_v, float(terrain_slip_high) if terrain_slip_high is not None else 0.22)
     terrain_slip_s = "config" if (slip_s == "config" or terrain_slip_high is not None) else "default"
-    terrain_start = int(cfg_num("terrain_start_phase", 5) or 5)
+    terrain_start_raw = cfg_num("terrain_start_phase", 5)
+    terrain_start = int(5 if terrain_start_raw is None else terrain_start_raw)
 
     put("penalty_gate_min", 1.0, "constant")
     put("progress_min", prog_v, prog_s)
@@ -534,7 +549,21 @@ def _actual_phase_gate_from_config(effective_config_text: str, phase: Any) -> di
     put("terrain_slip_max", terrain_slip_v, terrain_slip_s)
     put("diagonal_min", diag_v, diag_s)
     put("duty_min", duty_v, duty_s)
+    put("duty_target_min", duty_target_v, duty_target_s)
+    put("duty_symmetry_min", duty_symmetry_v, duty_symmetry_s)
+    put("period_min", period_v, period_s)
+    put("yaw_gait_min", yaw_gait_v, yaw_gait_s)
+    put("duty_valid_min", duty_valid_v, duty_valid_s)
+    put("execution_min", execution_v, execution_s)
+    put("transition_fail_max", transition_fail_v, transition_fail_s)
     put("air_min", air_v, air_s)
+    put("flat_tilt_p95_max", flat_tilt_v, flat_tilt_s)
+    put("flat_wxy_max", flat_wxy_v, flat_wxy_s)
+    put("flat_height_error_p95_max", flat_height_v, flat_height_s)
+    put("flat_touchdown_vz_p95_max", flat_touchdown_v, flat_touchdown_s)
+    put("flat_slip_high_max", flat_slip_v, flat_slip_s)
+    put("flat_trajectory_p95_max", flat_trajectory_v, flat_trajectory_s)
+    put("flat_false_terrain_response_max", flat_false_response_v, flat_false_response_s)
     put("phase_intervals", int(cfg_num("phase_intervals", 5) or 5), "config" if present("phase_intervals") else "default")
     put("phase_max_steps", int(cfg_num("phase_max_steps", 25000) or 25000), "config" if present("phase_max_steps") else "default")
     put("terrain_start_phase", terrain_start, "config" if present("terrain_start_phase") else "default")
@@ -543,6 +572,15 @@ def _actual_phase_gate_from_config(effective_config_text: str, phase: Any) -> di
     if int(phase_idx) >= terrain_start:
         put("terrain_min", cfg_num("phase_gate_terrain_2", 0.0), "config" if present("phase_gate_terrain_2") else "default")
         put("discrete_terrain_min", cfg_num("phase_gate_discrete_terrain_2", 0.0), "config" if present("phase_gate_discrete_terrain_2") else "default")
+        put("boxes_min", cfg_num("phase_gate_boxes_2", 0.0), "config" if present("phase_gate_boxes_2") else "default")
+        put("stairs_down_min", cfg_num("phase_gate_stairs_2", 0.0), "config" if present("phase_gate_stairs_2") else "default")
+        put("stairs_up_min", cfg_num("phase_gate_stairs_up_2", 0.0), "config" if present("phase_gate_stairs_up_2") else "default")
+        put("boxes_success_min", cfg_num("phase_gate_boxes_success_2", 0.0), "config" if present("phase_gate_boxes_success_2") else "default")
+        put("stairs_down_success_min", cfg_num("phase_gate_stairs_down_success_2", 0.0), "config" if present("phase_gate_stairs_down_success_2") else "default")
+        put("stairs_up_success_min", cfg_num("phase_gate_stairs_up_success_2", 0.0), "config" if present("phase_gate_stairs_up_success_2") else "default")
+        put("boxes_collapse_max", cfg_num("phase_gate_boxes_collapse_2", 1.0), "config" if present("phase_gate_boxes_collapse_2") else "default")
+        put("stairs_down_collapse_max", cfg_num("phase_gate_stairs_down_collapse_2", 1.0), "config" if present("phase_gate_stairs_down_collapse_2") else "default")
+        put("stairs_up_collapse_max", cfg_num("phase_gate_stairs_up_collapse_2", 1.0), "config" if present("phase_gate_stairs_up_collapse_2") else "default")
         put("fall_max", cfg_num("phase_gate_fall_2", 0.05), "config" if present("phase_gate_fall_2") else "default")
 
     return {
@@ -551,6 +589,12 @@ def _actual_phase_gate_from_config(effective_config_text: str, phase: Any) -> di
         "phase_index": phase_idx,
         "conditions": conditions,
         "conditions_source": conditions_source,
+        "condition_set_complete": False,
+        "scope": "configured thresholds only",
+        "completeness_note": (
+            "These are thresholds reconstructed from effective_config, not a complete evaluation of "
+            "the runtime boolean gate. Code evidence is required before claiming every condition passed."
+        ),
     }
 
 
@@ -1734,10 +1778,92 @@ def build_telemetry(
         _augment_points_from_side_log(points, side_log_text)
     latest = points[-1] if points else None
     if latest is not None:
-        latest.curriculum["phase_gate"] = _actual_phase_gate_from_config(
+        phase_gate = _actual_phase_gate_from_config(
             effective_config_text,
             latest.curriculum.get("phase"),
         )
+        runtime_gate = _as_float(latest.curriculum.get("phase_gate_ok"))
+        runtime_state_flags = {
+            key: bool(float(value) > 0.5)
+            for key, value in latest.curriculum.items()
+            if key in {
+                "phase_gate_terrain_phase_active_ok",
+                "phase_gate_terrain_mixed_active_ok",
+            }
+            and _as_float(value) is not None
+        }
+        runtime_conditions = {
+            key: bool(float(value) > 0.5)
+            for key, value in latest.curriculum.items()
+            if (
+                key.endswith("_ok")
+                and (
+                    key.startswith("phase_gate_")
+                    or key.startswith("flat_core_gate_")
+                    or key.startswith("flat_gait_gate_")
+                )
+                and key not in {"phase_gate_ok", "flat_core_gate_ok", "flat_gait_gate_ok"}
+                and key not in runtime_state_flags
+                and _as_float(value) is not None
+            )
+        }
+        runtime_values = {
+            key: float(value)
+            for key, value in latest.curriculum.items()
+            if key.startswith("phase_gate_")
+            and key.endswith("_value")
+            and _as_float(value) is not None
+        }
+        # _log_training_diag 每 500 step 才计算一次完整 gate。此前 payload 中的
+        # phase_gate_ok 只是兼容默认值，不能据此声称已经完成运行时评估。
+        if runtime_gate is not None and runtime_conditions and runtime_values:
+            terrain_phase_active = runtime_state_flags.get(
+                "phase_gate_terrain_phase_active_ok", False
+            )
+            terrain_mixed_active = runtime_state_flags.get(
+                "phase_gate_terrain_mixed_active_ok", False
+            )
+            active_condition_names = {
+                "phase_gate_progress_ok",
+                "phase_gate_execution_ok",
+                "phase_gate_quality_ok",
+            }
+            if terrain_phase_active:
+                active_condition_names.update(
+                    key for key in runtime_conditions
+                    if key.startswith("flat_core_gate_") or key.startswith("flat_gait_gate_")
+                )
+            else:
+                active_condition_names.add("phase_gate_transition_ok")
+            if terrain_mixed_active:
+                active_condition_names.update({
+                    "phase_gate_terrain_level_ok",
+                    "phase_gate_terrain_discrete_ok",
+                    "phase_gate_terrain_type_ok",
+                    "phase_gate_terrain_capability_ok",
+                    "phase_gate_terrain_fall_ok",
+                    "phase_gate_terrain_mixed_ok",
+                })
+            active_conditions = {
+                key: value for key, value in runtime_conditions.items()
+                if key in active_condition_names
+            }
+            phase_gate["runtime_gate_ok"] = bool(runtime_gate > 0.5)
+            phase_gate["runtime_conditions"] = runtime_conditions
+            phase_gate["runtime_state_flags"] = runtime_state_flags
+            phase_gate["runtime_active_conditions"] = active_conditions
+            phase_gate["runtime_blockers"] = [
+                key for key, value in active_conditions.items() if not value
+            ]
+            phase_gate["runtime_values"] = runtime_values
+            phase_gate["condition_set_complete"] = True
+            phase_gate["scope"] = "runtime final gate and subconditions"
+            phase_gate["source"] = "runtime telemetry + effective_config.yaml/env.curriculum"
+            phase_gate["completeness_note"] = (
+                "The training environment emitted the final gate result and its subconditions; "
+                "thresholds come from this run's effective configuration."
+            )
+        latest.curriculum["phase_gate"] = phase_gate
     if not points and not error:
         limitations.append("远程训练脚本尚未输出 telemetry JSONL，且日志里没有可解析的 [TPREW] 行。")
     resolved_source_stats: dict[str, Any] = dict(source_stats or {})
@@ -1797,6 +1923,7 @@ def build_telemetry(
         telemetry_age_s=latest_age,
         log_path=log_path,
         telemetry_path=telemetry_path,
+        effective_config_text=effective_config_text,
         mode=mode,  # type: ignore[arg-type]
         source_stats=resolved_source_stats,
         latest=latest,
@@ -1814,6 +1941,15 @@ def build_telemetry(
         effective_config_text=effective_config_text,
         path_evidence=list(path_evidence or []),
     )
+    # 目标记分牌：和 snapshot 并列，复用同一份 effective_config 文本做底线出处。
+    # 局部 import 避免与本模块形成循环依赖（scoreboard 反过来依赖这里的 helper）。
+    # try/except：记分牌是只读派生视图，任何异常都不能拖垮遥测主链路。
+    try:
+        from .scoreboard import build_scoreboard
+
+        telemetry.scoreboard = build_scoreboard(telemetry, effective_config_text)
+    except Exception:  # noqa: BLE001
+        telemetry.scoreboard = None
     if stale:
         telemetry.limitations.append(
             "Telemetry is stale: the latest sample is not live; displayed values are the last recorded state."

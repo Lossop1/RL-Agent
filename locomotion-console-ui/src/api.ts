@@ -683,7 +683,10 @@ export async function postAction(
 ): Promise<ActionResult> {
   const r = await fetchWithTimeout(`${API_BASE}/action/${action}`, {
     method: "POST",
-    headers: authHeaders(),
+    headers: {
+      ...authHeaders(),
+      "X-Console-Confirmation": `confirm:${action}`,
+    },
   });
   if (!r.ok) {
     const data = await r.json().catch(() => ({}));
@@ -769,6 +772,9 @@ export interface DiagnosticTerrainSpec {
 
 export interface DiagnosticDRCaseSpec {
   level: number;
+  population?: "forced" | "mixed";
+  stress_profile?: "mixed" | "single" | "compound" | "full";
+  stress_factor?: "mechanics" | "contact" | "actuation" | "sensing" | "push" | "";
   friction?: number | null;
   mass_scale?: number | null;
   stiffness_scale?: number | null;
@@ -945,6 +951,11 @@ export interface DiagnosticPlaybackFoot {
   position: [number, number, number];
   contact: boolean;
   force_norm?: number | null;
+  force_w_x?: number | null;
+  force_w_y?: number | null;
+  force_w_z?: number | null;
+  normal_force?: number | null;
+  tangent_force?: number | null;
   clearance?: number | null;
 }
 
@@ -1010,6 +1021,77 @@ export interface AcceptanceVerdict {
 
 export function getAcceptance(): Promise<AcceptanceVerdict> {
   return jsonRequest("/run/current/acceptance");
+}
+
+// 目标记分牌：把训练目标拆成「指标族」，每个指标只报事实
+// （现在读数 / 底线 / 出处），并自报还没覆盖到的目标。
+export interface ScoreboardContext {
+  phase: string;
+  command_mode: string;
+  active_dirs: string;
+  terrain_mean: number | null;
+  terrain_max: number | null;
+  penalty_gate: number | null;
+  dr_level: number | null;
+  note: string;
+}
+
+export interface ScoreboardMetric {
+  key: string;
+  label: string;
+  family: string;
+  value: any;
+  numeric_value: number | null;
+  unit: string;
+  precision: number;
+  reading: string;
+  floor: number | null;
+  floor_op: "<=" | ">=" | "";
+  floor_label: string;
+  floor_source: string;
+  floor_confidence: "spec" | "config" | "derived" | "default" | "unknown";
+  status: "meets" | "below" | "no_floor" | "no_data";
+  value_confidence: "high" | "medium" | "low";
+  tensions: string[];
+  meaning: string;
+  note: string;
+}
+
+export interface ScoreboardFamily {
+  id: string;
+  title: string;
+  summary: string;
+  metrics: ScoreboardMetric[];
+}
+
+export interface ScoreboardTension {
+  a: string;
+  b: string;
+  reason: string;
+}
+
+export interface ScoreboardCoverage {
+  mapped_reward_terms: string[];
+  unmapped_reward_terms: string[];
+  note: string;
+}
+
+export interface Scoreboard {
+  available: boolean;
+  run_id: string;
+  generated_at: number;
+  step: number;
+  stale: boolean;
+  status: "ok" | "watch" | "blocked" | "missing" | "error";
+  context: ScoreboardContext;
+  families: ScoreboardFamily[];
+  tensions: ScoreboardTension[];
+  coverage: ScoreboardCoverage;
+  notes: string[];
+}
+
+export function getScoreboard(): Promise<Scoreboard> {
+  return jsonRequest("/run/current/scoreboard");
 }
 
 export function getDiagnosticCatalog(): Promise<DiagnosticCatalog> {
@@ -1099,6 +1181,23 @@ export interface ChatResponse {
   proposal_id?: string | null;
   context_envelope?: ContextEnvelopeInfo | null;
 }
+
+export interface AgentProgressEvent {
+  type: "progress";
+  seq?: number;
+  stage: string;
+  label: string;
+  detail?: string;
+  tool?: string;
+}
+
+export type ChatStreamEvent =
+  | AgentProgressEvent
+  | { type: "heartbeat" }
+  | { type: "answer_start" }
+  | { type: "answer_delta"; delta: string }
+  | { type: "complete"; response: ChatResponse }
+  | { type: "error"; message: string };
 
 export interface ChatProposalInfo {
   id: string;
@@ -1254,6 +1353,55 @@ export async function chat(
     throw new Error(data.detail || `chat ${r.status}`);
   }
   return r.json();
+}
+
+export async function chatStream(
+  message: string,
+  ui_mode = "",
+  context = "",
+  signal: AbortSignal | undefined,
+  context_request: Partial<ContextRequestInfo> | undefined,
+  onEvent: (event: ChatStreamEvent) => void,
+): Promise<ChatResponse> {
+  const response = await fetch(`${API_BASE}/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ message, ui_mode, context, context_request }),
+    signal,
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.detail || `chat stream ${response.status}`);
+  }
+  if (!response.body) throw new Error("chat stream response has no body");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let completed: ChatResponse | null = null;
+
+  const consumeLine = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line) as ChatStreamEvent;
+    if (event.type === "error") throw new Error(event.message);
+    onEvent(event);
+    if (event.type === "complete") completed = event.response;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      consumeLine(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+    if (done) break;
+  }
+  consumeLine(buffer);
+  if (!completed) throw new Error("chat stream ended before completion");
+  return completed;
 }
 
 export function routeChatContext(

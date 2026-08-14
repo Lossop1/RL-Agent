@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 import io
 import json
 import math
+import os
 import re
 import shlex
 import tempfile
@@ -36,34 +37,8 @@ from .schemas import (
 )
 
 
-async def probe_concurrent_headroom(remote, n_env: int = 4) -> "tuple[bool, str]":
-    """Whether a num_envs=n_env diagnostic fits ALONGSIDE a running training: checks BOTH the memory-cgroup
-    RAM headroom AND GPU free VRAM. The operator wants mid-training probes to run whenever there is space —
-    block ONLY on a real OOM / VRAM-contention risk that would kill both processes."""
-    import asyncio as _asyncio
-    need_ram = 12.0 + 0.03 * n_env + 4.0
-    need_vram = 3.0 + 0.05 * n_env
-    ram_free = -1.0
-    vram_free = -1.0
-    try:
-        raw = await _asyncio.to_thread(
-            remote.exec_out,
-            "lim=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null); "
-            "cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null); "
-            "vram=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9'); "
-            "echo \"$lim $cur ${vram:-X}\"")
-        parts = (raw or "").split()
-        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-            ram_free = (int(parts[0]) - int(parts[1])) / (1024.0 ** 3)
-        if len(parts) >= 3 and parts[2].isdigit():
-            vram_free = int(parts[2]) / 1024.0
-    except Exception:
-        return (False, "无法读取内存/显存余量")
-    if ram_free < 0:
-        return (False, "无法读取 cgroup 内存余量")
-    ok = (ram_free >= need_ram) and (vram_free < 0 or vram_free >= need_vram)
-    detail = (f"RAM空闲~{ram_free:.0f}GB(需~{need_ram:.0f}) 显存空闲~{vram_free:.0f}GB(需~{need_vram:.0f}) num_envs={n_env}")
-    return (ok, detail)
+_CHECKPOINT_CATALOG_LIMIT = 100
+_CHECKPOINT_CANDIDATE_MULTIPLIER = 3
 
 
 @dataclass(frozen=True)
@@ -177,7 +152,7 @@ _PRESET_BY_ID = {preset.id: preset for preset in PRESETS}
 _SESSION = "locomotion_console_diag"
 _TASK_MARKER = "__LOCOMOTION_CONSOLE_DIAGNOSTIC_TASKS__"
 _PAYLOAD_DIAG_FRAMEWORKS = {"taili_amp_blind"}
-_PAYLOAD_GLOB = "taili_blind_runtime_*"
+_PAYLOAD_GLOBS = ("taili_blind_runtime_*", "taili_recovered_*")
 _TASK_GENERIC_TOKENS = {
     "direct",
     "env",
@@ -283,10 +258,10 @@ def _default_plan_for_preset(preset: _Preset) -> dict[str, Any]:
     elif preset.id == "directions":
         commands = [
             {"id": "stand", "label": "Stand baseline", "mode": "stand", "vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 1.0, "repeats": 1},
-            {"id": "forward", "label": "Forward", **_direction_command("forward"), "settle_s": 0.4, "repeats": 1},
-            {"id": "backward", "label": "Backward", **_direction_command("backward"), "settle_s": 0.4, "repeats": 1},
-            {"id": "lateral", "label": "Lateral", **_direction_command("lateral"), "settle_s": 0.4, "repeats": 1},
-            {"id": "yaw", "label": "Yaw", **_direction_command("yaw"), "settle_s": 0.4, "repeats": 1},
+            {"id": "forward", "label": "Forward", **_direction_command("forward"), "settle_s": 0.8, "repeats": 1},
+            {"id": "backward", "label": "Backward", **_direction_command("backward"), "settle_s": 0.8, "repeats": 1},
+            {"id": "lateral", "label": "Lateral", **_direction_command("lateral"), "settle_s": 0.8, "repeats": 1},
+            {"id": "yaw", "label": "Yaw", **_direction_command("yaw"), "settle_s": 0.8, "repeats": 1},
         ]
     elif preset.id == "terrain":
         commands = [
@@ -437,9 +412,21 @@ def _normalize_plan(preset: _Preset, requested_plan: DiagnosticPlan | dict[str, 
     for item in dr_raw:
         if not isinstance(item, dict):
             continue
+        population = str(item.get("population") or "forced").strip().lower()
+        if population not in {"forced", "mixed"}:
+            population = "forced"
+        stress_profile = str(item.get("stress_profile") or "").strip().lower()
+        if stress_profile not in {"", "mixed", "single", "compound", "full"}:
+            stress_profile = ""
+        stress_factor = str(item.get("stress_factor") or "").strip().lower()
+        if stress_factor not in {"", "mechanics", "contact", "actuation", "sensing", "push"}:
+            stress_factor = ""
         case = {
             "level": _clamp_int(item.get("level"), 0, 3, 0),
             "label": str(item.get("label") or f"DR{_clamp_int(item.get('level'), 0, 3, 0)}"),
+            "population": population,
+            "stress_profile": stress_profile,
+            "stress_factor": stress_factor,
         }
         for key, low, high in [
             ("friction", 0.2, 2.0),
@@ -752,10 +739,8 @@ class DiagnosticsController:
             if checkpoint not in paths:
                 raise ValueError("Selected checkpoint is not in the available checkpoint list")
         else:
-            training_running = False
             try:
                 remote = self.source._get_remote()
-                training_running = await asyncio.to_thread(self.source._is_running, remote)
                 available = await asyncio.to_thread(self._recent_checkpoints, remote)
             except RuntimeError:
                 raise
@@ -765,9 +750,8 @@ class DiagnosticsController:
                 raise RuntimeError("No checkpoint was found on the remote host")
             paths = {item.path for item in available}
             if (requested_checkpoint or "").strip().lower() == "best":
-                # the BEST_CHECKPOINT.json registry is maintained by acceptance_run whenever a
-                # measured score improves — diagnose the best-known policy, not merely the newest
-                # (which once picked an under-converged fragment of a stalled run).
+                # BEST_CHECKPOINT.json 来自验收评分，可能指向已经清理掉的历史 run。
+                # 诊断入口的“默认”必须能落到当前可用检查点，否则训练中途探测会被旧注册表卡住。
                 raw = await asyncio.to_thread(
                     remote.exec_out,
                     "cat /root/gpufree-data/taili_runs/BEST_CHECKPOINT.json 2>/dev/null")
@@ -775,29 +759,16 @@ class DiagnosticsController:
                     best = str((json.loads(raw or "{}") or {}).get("checkpoint") or "")
                 except Exception:
                     best = ""
-                if not best:
-                    raise RuntimeError("no BEST_CHECKPOINT registry yet — run an acceptance measurement first")
-                exists = await asyncio.to_thread(
-                    remote.exec_out, f"[ -f {shlex.quote(best)} ] && echo yes || echo no")
-                if (exists or "").strip() != "yes":
-                    raise RuntimeError(f"registered best checkpoint is missing on disk: {best}")
-                checkpoint = best
+                if best:
+                    exists = await asyncio.to_thread(
+                        remote.exec_out, f"[ -f {shlex.quote(best)} ] && echo yes || echo no")
+                    checkpoint = best if (exists or "").strip() == "yes" else available[0].path
+                else:
+                    checkpoint = available[0].path
             else:
                 checkpoint = requested_checkpoint or available[0].path
                 if checkpoint not in paths:
                     raise ValueError("Selected checkpoint is not in the recent checkpoint list; refresh and retry")
-            if training_running:
-                # Training + a diagnostic are two Isaac procs sharing the box RAM cgroup + one GPU. Block ONLY on
-                # a real OOM/VRAM risk; otherwise run the diagnostic CONCURRENTLY (operator wants mid-training probes
-                # whenever there is space). Headroom = cgroup RAM free AND GPU VRAM free vs the num_envs footprint.
-                n_env = int((plan or {}).get("num_envs", 1) or 1)
-                _ok, _detail = await probe_concurrent_headroom(remote, n_env)
-                if not _ok:
-                    raise RuntimeError(
-                        f"训练运行中且余量不足({_detail})——诊断暂停以避免 OOM/显存争用同时杀掉训练和诊断。"
-                        f"降低 num_envs,或先停训练。")
-                # enough headroom → let the diagnostic run concurrently with training
-
         job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_dir = f"{self.settings.diagnostic_output_root}/locomotion_console_{job_id}_{preset.id}"
         selected_checkpoint = next((item for item in available if item.path == checkpoint), None)
@@ -1035,7 +1006,18 @@ class DiagnosticsController:
         checkpoints = self._recent_checkpoints(remote)
         return checkpoints[0].path if checkpoints else ""
 
-    def _recent_checkpoints(self, remote: Any, limit: int = 20) -> list[DiagnosticCheckpoint]:
+    def _recent_checkpoints(
+        self,
+        remote: Any,
+        limit: int = _CHECKPOINT_CATALOG_LIMIT,
+    ) -> list[DiagnosticCheckpoint]:
+        active_run_name = ""
+        resolve_active_run = getattr(getattr(self, "source", None), "_newest_run_with_checkpoint", None)
+        if callable(resolve_active_run):
+            try:
+                active_run_name = str(resolve_active_run(remote) or "").rstrip("/").rsplit("/", 1)[-1]
+            except Exception:
+                active_run_name = ""
         checkpoints: list[DiagnosticCheckpoint] = []
         seen: set[str] = set()
         for framework in list_framework_profiles():
@@ -1068,7 +1050,19 @@ class DiagnosticsController:
         checkpoints = normalized
         checkpoints.sort(
             key=lambda item: (
-                0 if item.kind == "latest" else 1 if item.kind == "iteration" else 2 if item.kind == "best" else 3,
+                0
+                if active_run_name and item.run_name == active_run_name and item.kind == "latest"
+                else 1
+                if active_run_name and item.run_name == active_run_name and item.kind == "iteration"
+                else 2
+                if active_run_name and item.run_name == active_run_name and item.kind == "best"
+                else 3
+                if item.kind == "latest"
+                else 4
+                if item.kind == "iteration"
+                else 5
+                if item.kind == "best"
+                else 6,
                 -(item.iteration or -1),
                 item.framework_id,
                 item.run_name,
@@ -1083,7 +1077,7 @@ class DiagnosticsController:
         self,
         remote: Any,
         framework: FrameworkProfile,
-        limit: int = 20,
+        limit: int = _CHECKPOINT_CATALOG_LIMIT,
     ) -> list[DiagnosticCheckpoint]:
         roots = framework.checkpoint_roots or (
             f"{self.settings.diagnostic_robot_root}/logs/skrl/{framework.experiment}",
@@ -1092,7 +1086,8 @@ class DiagnosticsController:
         command = (
             f"find -L {quoted_roots} -type f \\( -path '*/checkpoints/agent_*.pt' "
             f"-o -path '*/checkpoints/best_agent.pt' \\) "
-            f"-printf '%T@|%p\\n' 2>/dev/null | sort -t'|' -k1,1nr | head -{int(max(limit * 3, limit))}"
+            f"-printf '%T@|%p\\n' 2>/dev/null | sort -t'|' -k1,1nr "
+            f"| head -{int(max(limit * _CHECKPOINT_CANDIDATE_MULTIPLIER, limit))}"
         )
         return self._parse_checkpoint_lines((remote.exec_out(command) or "").strip(), framework)
 
@@ -1138,7 +1133,7 @@ class DiagnosticsController:
             return self._build_payload_remote_script(job)
         return self._build_legacy_remote_script(job)
 
-    def _payload_root_shell(self) -> str:
+    def _payload_root_shell(self, checkpoint: str = "") -> str:
         roots = []
         root = str(self.settings.diagnostic_tool_root or "").rstrip("/")
         if root:
@@ -1148,18 +1143,48 @@ class DiagnosticsController:
         for item in roots:
             if item and item not in unique:
                 unique.append(item)
-        clauses = " ".join(f"{shlex.quote(root.rstrip('/'))}/{_PAYLOAD_GLOB}" for root in unique)
+        clauses = " ".join(
+            f"{shlex.quote(root.rstrip('/'))}/{pattern}"
+            for root in unique
+            for pattern in _PAYLOAD_GLOBS
+        )
+        preferred = ""
+        if checkpoint:
+            load_payload = (
+                "import json, sys; "
+                "data = json.load(open(sys.argv[1], encoding='utf-8')); "
+                "print(str(data.get('payload_root') or ''))"
+            )
+            preferred = (
+                f"CHECKPOINT={shlex.quote(checkpoint)}\n"
+                "RUN_DIR=\"$(dirname \"$(dirname \"$CHECKPOINT\")\")\"\n"
+                "PREFERRED_PAYLOAD=''\n"
+                "if [ -f \"$RUN_DIR/run.json\" ]; then\n"
+                f"  PREFERRED_PAYLOAD=\"$(python3 -c {shlex.quote(load_payload)} \"$RUN_DIR/run.json\" 2>/dev/null || true)\"\n"
+                "fi\n"
+                "if [ -n \"$PREFERRED_PAYLOAD\" ] "
+                "&& [ -f \"$PREFERRED_PAYLOAD/taili_blind_runtime/diagnose_taili_cases.py\" ] "
+                "&& [ -f \"$PREFERRED_PAYLOAD/taili_blind_runtime/isaaclab_quad_diag/metrics.py\" ]; then\n"
+                "  PAYLOAD=\"$PREFERRED_PAYLOAD\"\n"
+                "  echo \"[diagnostics] payload selected from checkpoint run metadata: $PAYLOAD\"\n"
+                "elif [ -n \"$PREFERRED_PAYLOAD\" ]; then\n"
+                "  echo \"[diagnostics] checkpoint run payload is unavailable or incomplete: $PREFERRED_PAYLOAD\" >&2\n"
+                "fi\n"
+            )
         return (
             "PAYLOAD=''\n"
-            f"for candidate in $(ls -td {clauses} 2>/dev/null || true); do\n"
+            f"{preferred}"
+            "if [ -z \"$PAYLOAD\" ]; then\n"
+            f"  for candidate in $(ls -td {clauses} 2>/dev/null || true); do\n"
             "  if [ -f \"$candidate/taili_blind_runtime/diagnose_taili_cases.py\" ] && [ -f \"$candidate/taili_blind_runtime/isaaclab_quad_diag/metrics.py\" ]; then\n"
-            "    PAYLOAD=\"$candidate\"\n"
-            "    break\n"
+            "      PAYLOAD=\"$candidate\"\n"
+            "      break\n"
             "  fi\n"
             "  if [ -f \"$candidate/taili_blind_runtime/diagnose_taili_cases.py\" ]; then\n"
-            "    echo \"[diagnostics] skipping incomplete payload without taili_blind_runtime/isaaclab_quad_diag/metrics.py: $candidate\" >&2\n"
+            "      echo \"[diagnostics] skipping incomplete payload without taili_blind_runtime/isaaclab_quad_diag/metrics.py: $candidate\" >&2\n"
             "  fi\n"
-            "done\n"
+            "  done\n"
+            "fi\n"
             "if [ -z \"$PAYLOAD\" ]; then\n"
             "  echo '[diagnostics] compatible taili_blind_runtime payload was not found under configured payload roots; expected diagnose_taili_cases.py and isaaclab_quad_diag/metrics.py' >&2\n"
             "  exit 31\n"
@@ -1174,7 +1199,7 @@ class DiagnosticsController:
         s = self.settings
         commands = [
             "set -e",
-            self._payload_root_shell(),
+            self._payload_root_shell(job.checkpoint),
             "if [ -L /tmp/IsaacLab ]; then mkdir -p \"$(readlink -f /tmp/IsaacLab)\"; else mkdir -p /tmp/IsaacLab; fi",
         ]
         for stage in job.preset.stages:
@@ -1951,6 +1976,11 @@ def _frame_from_row(stage_id: str, row: dict[str, str], t_offset: float) -> Diag
             position=[float(value) for value in pos if value is not None],
             contact=_bool_cell(row.get(f"foot_{leg}_contact")),
             force_norm=_finite_float(row.get(f"foot_{leg}_force_norm")),
+            force_w_x=_finite_float(row.get(f"foot_{leg}_force_w_x")),
+            force_w_y=_finite_float(row.get(f"foot_{leg}_force_w_y")),
+            force_w_z=_finite_float(row.get(f"foot_{leg}_force_w_z")),
+            normal_force=_finite_float(row.get(f"foot_{leg}_normal_force")),
+            tangent_force=_finite_float(row.get(f"foot_{leg}_tangent_force")),
             clearance=_finite_float(row.get(f"foot_{leg}_clearance_local")),
         )
     return DiagnosticPlaybackFrame(
@@ -2079,6 +2109,11 @@ def _fake_playback(job: _Job, max_frames: int = 900) -> DiagnosticPlayback:
                 position=[x + ox + 0.04 * math.sin(leg_phase), oy, 0.04 if swing else 0.0],
                 contact=not swing,
                 force_norm=55.0 if not swing else 2.0,
+                force_w_x=0.0,
+                force_w_y=0.0,
+                force_w_z=55.0 if not swing else 2.0,
+                normal_force=55.0 if not swing else 2.0,
+                tangent_force=0.0,
                 clearance=0.04 if swing else 0.0,
             )
         frames.append(

@@ -14,13 +14,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import json
 import os
 import time
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import get_settings
 from .config_manager import (
@@ -94,6 +95,7 @@ from .schemas import (
     RemoteProfileUpdateResult,
     RobotProfileInfo,
     RunSnapshot,
+    Scoreboard,
     RunStatus,
     SpecCoverageReport,
     TensorboardScalarCatalog,
@@ -1273,6 +1275,15 @@ async def run_current_snapshot() -> RunSnapshot:
     return telemetry.snapshot
 
 
+@app.get("/run/current/scoreboard", response_model=Scoreboard)
+async def run_current_scoreboard() -> Scoreboard:
+    """目标记分牌：按五+类目标排开，每个指标给出 现值/底线/底线出处，只讲事实。"""
+    telemetry = await source.training_telemetry()
+    if telemetry.scoreboard is None:
+        raise HTTPException(status_code=404, detail="No objective scoreboard available.")
+    return telemetry.scoreboard
+
+
 @app.get("/run/current/acceptance")
 async def run_current_acceptance() -> dict:
     """Benchmark verdict vs docs/taili_spec.md for the newest run — scored from persisted physeval
@@ -1352,6 +1363,20 @@ async def spec_coverage() -> SpecCoverageReport:
 _ACTION_LOCK = asyncio.Lock()
 
 
+def _require_direct_action_confirmation(action: str, confirmation: Optional[str]) -> None:
+    """Require an action-specific acknowledgement for direct training controls.
+
+    Chat execution has proposal binding; these legacy direct endpoints do not. An
+    explicit value prevents an accidental or generic POST from changing training.
+    """
+    expected = f"confirm:{action}"
+    if not confirmation or not hmac.compare_digest(confirmation, expected):
+        raise HTTPException(
+            status_code=428,
+            detail=f"direct action requires X-Console-Confirmation: {expected}",
+        )
+
+
 @contextlib.asynccontextmanager
 async def _action_lock():
     try:
@@ -1366,25 +1391,37 @@ async def _action_lock():
 
 
 @app.post("/action/deploy-payload", response_model=ActionResult)
-async def action_deploy_payload() -> ActionResult:
+async def action_deploy_payload(
+    confirmation: Optional[str] = Header(default=None, alias="X-Console-Confirmation"),
+) -> ActionResult:
+    _require_direct_action_confirmation("deploy-payload", confirmation)
     async with _action_lock():
         return await source.action_deploy_payload()
 
 
 @app.post("/action/resume", response_model=ActionResult)
-async def action_resume() -> ActionResult:
+async def action_resume(
+    confirmation: Optional[str] = Header(default=None, alias="X-Console-Confirmation"),
+) -> ActionResult:
+    _require_direct_action_confirmation("resume", confirmation)
     async with _action_lock():
         return await source.action_resume()
 
 
 @app.post("/action/start", response_model=ActionResult)
-async def action_start() -> ActionResult:
+async def action_start(
+    confirmation: Optional[str] = Header(default=None, alias="X-Console-Confirmation"),
+) -> ActionResult:
+    _require_direct_action_confirmation("start", confirmation)
     async with _action_lock():
         return await source.action_start()
 
 
 @app.post("/action/kill", response_model=ActionResult)
-async def action_kill() -> ActionResult:
+async def action_kill(
+    confirmation: Optional[str] = Header(default=None, alias="X-Console-Confirmation"),
+) -> ActionResult:
+    _require_direct_action_confirmation("kill", confirmation)
     async with _action_lock():
         return await source.action_kill()
 
@@ -1455,14 +1492,32 @@ async def diagnostics_playback(max_frames: int = 900, job_id: str | None = None)
     return await diagnostics.playback_for_job(max_frames=max_frames, job_id=job_id)
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
+def _publish_chat_progress(
+    callback: Optional[Callable[[dict], None]],
+    stage: str,
+    label: str,
+    **extra,
+) -> None:
+    if callback is None:
+        return
+    event = {"stage": stage, "label": label, **extra}
+    try:
+        callback(event)
+    except Exception:  # noqa: BLE001 - progress transport must not affect the answer
+        pass
+
+
+async def _chat_impl(
+    req: ChatRequest,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> ChatResponse:
     """The soul: the LLM operates the locomotion console's read-only tools to answer in plain language."""
     import asyncio as _asyncio
 
     from .agent import run_agent
 
     started = time.perf_counter()
+    _publish_chat_progress(progress, "request", "已接收问题")
     original_message = req.message or ""
     stripped_message = original_message.strip()
     force_llm = False
@@ -1484,6 +1539,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         )
     history = llm_session.recent_turns(limit=16)
     llm_session.append_turn(role="user", content=original_message)
+    _publish_chat_progress(progress, "command", "正在检查快速命令")
     try:
         slash = None if force_llm else await _asyncio.to_thread(handle_slash_command, original_message, settings, source)
     except Exception as exc:  # noqa: BLE001
@@ -1544,6 +1600,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
             suggestions=_chat_suggestions(response_mode, transcript, req.ui_mode),
         )
     if not force_llm and _fast_status_intent(agent_message, req.ui_mode):
+        _publish_chat_progress(progress, "live_evidence", "正在读取当前训练状态")
         response = await _fast_training_status_response(req, started)
         llm_session.append_turn(
             role="assistant",
@@ -1553,6 +1610,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         )
         return response
     # run_agent does blocking SSH + LLM calls -> off the event loop; pass prior dialogue
+    _publish_chat_progress(progress, "context", "正在选择相关上下文")
     remote_for_context = None
     if should_probe_remote_for_context(message=agent_message, ui_mode=req.ui_mode, context_request=req.context_request):
         try:
@@ -1583,6 +1641,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 not force_llm,
                 max_agent_steps,
                 force_llm or req.ui_mode in {"training", "diagnostics"},
+                progress,
             ),
             timeout=float(os.environ.get("LOCOMOTION_CONSOLE_AGENT_TIMEOUT_S", "70")),
         )
@@ -1678,6 +1737,73 @@ async def chat(req: ChatRequest) -> ChatResponse:
                         mode=response_mode,
                         elapsed_s=_chat_elapsed(started),
                         suggestions=_chat_suggestions(response_mode, transcript, req.ui_mode))
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest) -> ChatResponse:
+    return await _chat_impl(req)
+
+
+def _ndjson_event(payload: dict) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest) -> StreamingResponse:
+    """Stream public controller progress, then the evidence-gated final answer."""
+
+    async def event_stream():
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+        sequence = 0
+
+        def publish(event: dict) -> None:
+            nonlocal sequence
+            sequence += 1
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "progress", "seq": sequence, **event},
+            )
+
+        task = asyncio.create_task(_chat_impl(req, publish))
+        yield _ndjson_event({"type": "progress", "seq": 0, "stage": "accepted", "label": "请求已进入队列"})
+        try:
+            while not task.done():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=10.0)
+                    yield _ndjson_event(event)
+                except asyncio.TimeoutError:
+                    yield _ndjson_event({"type": "heartbeat"})
+            while not queue.empty():
+                yield _ndjson_event(queue.get_nowait())
+
+            response = await task
+            yield _ndjson_event({"type": "answer_start"})
+            for start in range(0, len(response.reply), 48):
+                yield _ndjson_event({"type": "answer_delta", "delta": response.reply[start:start + 48]})
+                await asyncio.sleep(0)
+            serialized = response.model_dump(mode="json") if hasattr(response, "model_dump") else response.dict()
+            yield _ndjson_event({"type": "complete", "response": serialized})
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            yield _ndjson_event({
+                "type": "error",
+                "message": f"{type(exc).__name__}: {exc}",
+            })
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/chat/proposals", response_model=ChatProposalHistory)

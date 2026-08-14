@@ -240,11 +240,15 @@ class TrainingTelemetry(BaseModel):
     telemetry_age_s: Optional[float] = None
     log_path: str = ""
     telemetry_path: str = ""
+    # 本次 run 的 effective_config 原文（当前奖励权重/门控阈值的来源）。exclude=True:
+    # 服务端工具可取,但不进 API 响应/model_dump,避免把整段 YAML 塞进前端负载。
+    effective_config_text: str = Field(default="", exclude=True)
     mode: Literal["jsonl", "log_fallback", "fake", "missing", "error"] = "missing"
     source_stats: dict[str, Any] = Field(default_factory=dict)
     latest: Optional[TrainingTelemetryPoint] = None
     history: List[TrainingTelemetryPoint] = Field(default_factory=list)
     snapshot: Optional[RunSnapshot] = None
+    scoreboard: Optional["Scoreboard"] = None
     definitions: List["DefinitionInfo"] = Field(default_factory=list)
     summary: str = ""
     limitations: List[str] = Field(default_factory=list)
@@ -551,6 +555,9 @@ class DiagnosticTerrainSpec(BaseModel):
 
 class DiagnosticDRCaseSpec(BaseModel):
     level: int = 0
+    population: str = "forced"
+    stress_profile: str = ""
+    stress_factor: str = ""
     friction: Optional[float] = None
     mass_scale: Optional[float] = None
     stiffness_scale: Optional[float] = None
@@ -864,6 +871,11 @@ class DiagnosticPlaybackFoot(BaseModel):
     position: list[float]
     contact: bool = False
     force_norm: Optional[float] = None
+    force_w_x: Optional[float] = None
+    force_w_y: Optional[float] = None
+    force_w_z: Optional[float] = None
+    normal_force: Optional[float] = None
+    tangent_force: Optional[float] = None
     clearance: Optional[float] = None
 
 
@@ -898,3 +910,96 @@ class DiagnosticPlayback(BaseModel):
     stride: int = 1
     selected_env_id: Optional[int] = None
     available_env_ids: List[int] = Field(default_factory=list)
+
+
+# ── 目标记分牌（Objective Scoreboard）────────────────────────────────────────
+# 一块屏幕，按五类目标（速度跟踪 / 步态 / 效率 / 地形 / 鲁棒性）排开。
+# 每个指标三件事：现在是多少 / 底线是多少 / 这条底线哪来的。
+# 只讲事实：状态只有 达标 / 未达底线 / 未定底线 / 无数据，绝不替用户下“好/坏”判断。
+# 底线的出处（provenance）必须显式：来自规范、来自本次 run 配置、还是出处不明，
+# 一律标清楚——绝不把“默认值”或“出处不明的写死值”冒充成本次 run 的真实验收标准。
+
+# 底线可信度：spec=规范文档；config=本次 run 有效配置；derived=由规范量推导；
+# default=配置缺失时的兜底默认；unknown=代码里写死但没标出处。
+FloorConfidence = Literal["spec", "config", "derived", "default", "unknown"]
+# 指标状态（纯事实，不含价值判断）。
+MetricStatus = Literal["meets", "below", "no_floor", "no_data"]
+
+
+class ScoreboardMetric(BaseModel):
+    """记分牌上的一行：一个可测量指标的当前值、底线、底线出处与互相拆台关系。"""
+    key: str
+    label: str
+    family: str                                  # 所属目标族 id
+    value: Any = None                            # 当前值（原始）
+    numeric_value: Optional[float] = None        # 数值化后的当前值（无法数值化则 None）
+    unit: str = ""
+    precision: int = 3
+    reading: str = ""                            # 展示串，如 "0.084 m/s"
+    floor: Optional[float] = None                # 底线数值（无底线则 None）
+    floor_op: Literal["<=", ">=", ""] = ""       # 底线方向：<= 上界、>= 下界
+    floor_label: str = ""                        # 人读底线，如 "≤0.10 m/s"
+    floor_source: str = ""                       # 出处文字（带 file:line 或规范章节）
+    floor_confidence: FloorConfidence = "unknown"
+    status: MetricStatus = "no_data"
+    # 当前值本身的可信度：地形扫描派生量（粗糙度/局部障碍高）标 low。
+    value_confidence: Literal["high", "medium", "low"] = "high"
+    tensions: List[str] = Field(default_factory=list)   # 与之直接拆台的其它指标 key
+    meaning: str = ""                            # 一句话说明这个指标看的是什么
+    note: str = ""                               # 附注：口径差异、出处存疑等
+
+
+class ScoreboardFamily(BaseModel):
+    """一个目标族（五类之一）及其下的指标。"""
+    id: str
+    title: str
+    summary: str = ""
+    metrics: List[ScoreboardMetric] = Field(default_factory=list)
+
+
+class ScoreboardContext(BaseModel):
+    """课程状态带。没有它，今天的数字和昨天的没法比：
+    penalty_gate 会重标所有“晚期惩罚”的强度，地形/阶段决定了当前在考哪一关。"""
+    phase: str = ""
+    command_mode: str = ""
+    active_dirs: str = ""
+    terrain_mean: Optional[float] = None
+    terrain_max: Optional[float] = None
+    penalty_gate: Optional[float] = None
+    dr_level: Optional[float] = None
+    note: str = ""
+
+
+class ScoreboardTension(BaseModel):
+    """两个指标互相拆台：改一个更好，另一个通常会更差。"""
+    a: str
+    b: str
+    reason: str = ""
+
+
+class ScoreboardCoverage(BaseModel):
+    """覆盖自检：如实报告记分牌的盲区，而不是假装数全了。
+
+    unmapped_reward_terms 是“遥测里正在被优化、却还没上板”的奖励项——它让板子
+    自己暴露遗漏。这是对“要求很多很杂、总有遗漏”的正面回答：把遗漏显示出来。"""
+    mapped_reward_terms: List[str] = Field(default_factory=list)
+    unmapped_reward_terms: List[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class Scoreboard(BaseModel):
+    """目标记分牌整体：若干目标族 + 课程状态带 + 全局拆台关系表 + 覆盖自检。
+
+    目标族不锁死为五类：这五类不是全集，会按代码与验收规范持续补充；缺的部分由
+    coverage 自检显式列出，绝不假装完整。"""
+    available: bool = False
+    run_id: str = ""
+    generated_at: float = 0.0
+    step: int = 0
+    stale: bool = False
+    status: Literal["ok", "watch", "blocked", "missing", "error"] = "missing"
+    context: ScoreboardContext = Field(default_factory=ScoreboardContext)
+    families: List[ScoreboardFamily] = Field(default_factory=list)
+    tensions: List[ScoreboardTension] = Field(default_factory=list)
+    coverage: ScoreboardCoverage = Field(default_factory=ScoreboardCoverage)
+    notes: List[str] = Field(default_factory=list)

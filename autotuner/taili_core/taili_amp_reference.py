@@ -17,6 +17,7 @@ import math
 
 import torch
 
+from . import taili_geometry as geometry
 from . import taili_symmetry as sym
 
 # ── URDF kinematic constants ─────────────────────────────────────────────────
@@ -68,12 +69,63 @@ def _ik2(tx, tz, iters=40):
     return th_t, th_c
 
 
-# nominal foot (x,z) rel hip at q_default -> X0, H0 ; base_height_ref = H0 (FK-derived)
+# nominal foot (x,z) rel hip at q_default -> X0, H0。H0 是足端球心高度，
+# base 高度还必须加上 URDF 碰撞球半径。
 with torch.no_grad():
     _nx, _nz = _fk2(torch.tensor(Q_DEFAULT_THIGH), torch.tensor(Q_DEFAULT_CALF))
     X0 = float(_nx)
     H0 = -float(_nz)
-BASE_HEIGHT_REF = H0          # derived from FK(q_default); cross-checked ~ nominal_base_h 0.52
+BASE_HEIGHT_REF = geometry.NOMINAL_BASE_HEIGHT
+
+
+def apply_flat_stand_reset(
+    root_state,
+    joint_pos,
+    joint_vel,
+    commands,
+    env_origins,
+    default_joint_pos,
+    flat_mask,
+    *,
+    sole_clearance: float = 0.003,
+):
+    """把平地零命令 RSI 覆盖为静态默认姿态，避免从移动 clip 开始刹车。"""
+    stand_mask = (
+        flat_mask.bool()
+        & (torch.linalg.norm(commands[:, :2], dim=-1) <= 0.05)
+        & (commands[:, 2].abs() <= 0.05)
+    )
+    if not bool(stand_mask.any()):
+        return stand_mask
+
+    root_state[stand_mask, :2] = env_origins[stand_mask, :2]
+    root_state[stand_mask, 2] = (
+        env_origins[stand_mask, 2]
+        + float(geometry.NOMINAL_BASE_HEIGHT)
+        + float(sole_clearance)
+    )
+    root_state[stand_mask, 3:7] = 0.0
+    root_state[stand_mask, 3] = 1.0
+    root_state[stand_mask, 7:13] = 0.0
+    joint_pos[stand_mask] = default_joint_pos[stand_mask]
+    joint_vel[stand_mask] = 0.0
+    return stand_mask
+
+
+def neutralize_reset_velocities(root_state, joint_vel):
+    """保留 RSI 姿态，但清除参考动作携带的免费运动信用。"""
+    root_state[:, 7:13] = 0.0
+    joint_vel.zero_()
+
+
+def preserve_failed_command_targets(sampled_targets, previous_targets, failed_mask):
+    """真实失败后的下一回合重试原命令，timeout 和正常 reset 仍使用新采样。"""
+    mask = failed_mask.to(dtype=torch.bool, device=sampled_targets.device)
+    previous = previous_targets.to(
+        dtype=sampled_targets.dtype,
+        device=sampled_targets.device,
+    )
+    return torch.where(mask[:, None], previous, sampled_targets)
 
 
 def _foot_traj(p, sdx, sdy, clearance):
@@ -81,10 +133,12 @@ def _foot_traj(p, sdx, sdy, clearance):
     stance = p < 0.5
     s_st = p / 0.5
     s_sw = (p - 0.5) / 0.5
-    hsw = -4.0 * s_sw ** 3 + 6.0 * s_sw ** 2 - s_sw
+    smooth5 = s_sw ** 3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
+    hsw = 2.0 * smooth5 - s_sw
     fx = torch.where(stance, X0 + sdx / 2 - sdx * s_st, X0 - sdx / 2 + sdx * hsw)
     fy = torch.where(stance, sdy / 2 - sdy * s_st, -sdy / 2 + sdy * hsw)
-    fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * torch.sin(math.pi * s_sw) ** 2)
+    swing_bump = 64.0 * s_sw ** 3 * (1.0 - s_sw) ** 3
+    fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * swing_bump)
     return fx, fy, fz
 
 
@@ -92,20 +146,26 @@ def period_for_speed(speed, base=0.55, slope=0.075, pmin=0.40):
     return torch.clamp(base - slope * speed, min=pmin, max=base)
 
 
+def clearance_for_speed(speed, clearance_base, clearance_gain):
+    """低速缩短步幅时同步降低平地抬脚高度，避免小步高抬后重落脚。"""
+    speed_ratio = torch.clamp(speed / 0.50, 0.0, 1.0)
+    base_scale = 0.55 + 0.45 * speed_ratio
+    return clearance_base * base_scale + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)
+
+
 def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075,
-                   gait_period_min=0.40, clearance_base=0.07, clearance_gain=0.03,
+                   gait_period_min=0.40, yaw_speed_equiv=0.15,
+                   clearance_base=0.07, clearance_gain=0.03,
                    stance_dx=0.0, iters=40):
     """Analytic trot reference, command-conditioned, terrain-AGNOSTIC.
     commands (M,3) [vx,vy,wz], times (M,). Returns jp,jv,bh,tn,foot_rel."""
     dev = commands.device
     vx, vy, wz = commands[:, 0], commands[:, 1], commands[:, 2]
     speed = torch.norm(commands[:, :2], dim=1)
-    # yaw-aware effective speed for the PERIOD only (0705 D3m): a high-yaw reference gait steps faster
-    # (0.30*|wz| ~ |wz|*r_foot), matching the env air-time target so the style reward doesn't fight the
-    # faster-stepping the yaw-tracking reward asks for. clearance/stride still use the linear speed.
-    period_speed = speed + 0.15 * wz.abs()
+    # yaw 按足端旋转半径折算成等效线速度，只影响步态周期；步幅仍由刚体足端速度公式决定。
+    period_speed = speed + float(yaw_speed_equiv) * wz.abs()
     T = period_for_speed(period_speed, gait_period, gait_period_slope, gait_period_min)
-    clearance = clearance_base + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)
+    clearance = clearance_for_speed(period_speed, clearance_base, clearance_gain)
     # NO roughness term (D: AMP terrain-agnostic).
     # gate clearance by command magnitude -> stand command yields a STATIC planted stance.
     cmd_mag = torch.norm(commands, dim=1)
@@ -166,6 +226,15 @@ def mode_onehot(commands, c_move=0.1, w_move=0.1):
     return torch.nn.functional.one_hot(idx, num_classes=5).to(commands.dtype)
 
 
+def conditioned_frame51(motion, commands):
+    """把 motion43 与可部署命令条件组装成判别器单帧。"""
+    if motion.shape[-1] != 43:
+        raise ValueError(f"AMP motion width must be 43, got {motion.shape[-1]}")
+    if commands.shape[-1] != 3 or motion.shape[:-1] != commands.shape[:-1]:
+        raise ValueError("AMP motion and command batch shapes do not match")
+    return torch.cat([motion, commands, mode_onehot(commands)], dim=-1)
+
+
 def frame51(commands, times, **kw):
     """frame51 = motion43 + command3 + mode_onehot5 (for the conditional discriminator)."""
-    return torch.cat([motion43(commands, times, **kw), commands, mode_onehot(commands)], dim=-1)
+    return conditioned_frame51(motion43(commands, times, **kw), commands)
