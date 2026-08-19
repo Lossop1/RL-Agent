@@ -37,6 +37,8 @@ def build_payload(
     output_dir: Path | None = None,
     stamp: str | None = None,
     keep_build_dir: bool = False,
+    task_bundle: Any | None = None,
+    task_artifacts: Any | None = None,
 ) -> BuildResult:
     contract_data = contract.to_dict() if hasattr(contract, "to_dict") else contract
     if not isinstance(contract_data, Mapping):
@@ -71,6 +73,39 @@ def build_payload(
     contract_target.parent.mkdir(parents=True, exist_ok=True)
     contract.write(contract_target)
     count += 1
+    if task_bundle is not None:
+        bundle_data = task_bundle.to_dict() if hasattr(task_bundle, "to_dict") else task_bundle
+        if not isinstance(bundle_data, Mapping):
+            raise TypeError("task_bundle must expose a mapping representation")
+        bundle_target = build_root / RUNTIME_PACKAGE / "task_contract_bundle.json"
+        bundle_target.write_text(
+            json.dumps(bundle_data, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        count += 1
+        bundle_specs = bundle_data.get("specs") if isinstance(bundle_data.get("specs"), Mapping) else {}
+        for kind, spec in sorted(bundle_specs.items()):
+            spec_target = build_root / RUNTIME_PACKAGE / "task_artifacts" / f"{kind}_spec.json"
+            spec_target.parent.mkdir(parents=True, exist_ok=True)
+            spec_target.write_text(
+                json.dumps(spec, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            count += 1
+    if task_artifacts is not None:
+        artifact_data = task_artifacts.to_dict() if hasattr(task_artifacts, "to_dict") else task_artifacts
+        if not isinstance(artifact_data, Mapping):
+            raise TypeError("task_artifacts must expose a mapping representation")
+        artifact_root = Path(str(artifact_data.get("root") or ""))
+        if not artifact_root.is_dir():
+            raise ValueError("task_artifacts root does not exist")
+        target_root = build_root / RUNTIME_PACKAGE / "task_artifacts"
+        for source in sorted(path for path in artifact_root.rglob("*") if path.is_file()):
+            relative = source.relative_to(artifact_root)
+            target = target_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            count += 1
     runtime_target = build_root / RUNTIME_PACKAGE / "runtime_identity.json"
     runtime_target.write_text(json.dumps(contract.runtime, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     count += 1

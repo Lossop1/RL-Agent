@@ -95,6 +95,8 @@ def test_bundle_exposes_product_neutral_execution_handoff() -> None:
     assert isinstance(spec, DeploymentSpec)
     spec.validate()
     assert spec.runtime_digest == product.runtime["digest"]
+    assert spec.task_contract_ref == "taili-research.taili@1"
+    assert spec.task_bundle_digest == bundle.bundle_digest
 
 
 def test_draft_contract_cannot_create_execution_handoff() -> None:

@@ -16,6 +16,24 @@ from .task_contract import (
     TaskContractError,
     TaskRequest,
     compile_task_bundle,
+    revise_task_bundle,
+)
+from .task_materializer import (
+    ARTIFACT_KINDS,
+    MATERIALIZER_VERSION,
+    MaterializedArtifact,
+    MaterializedFile,
+    MaterializedTaskBundle,
+    TASK_ARTIFACT_SCHEMA,
+    TaskBundleMaterializer,
+    materialize_task_bundle,
+)
+from .task_store import STORE_SCHEMA, StoredTaskContract, TaskContractStore
+from .task_pipeline import (
+    TASK_PIPELINE_SCHEMA,
+    TaskExecutionPipeline,
+    TaskPipelineError,
+    TaskPipelineResult,
 )
 from .payload import ProductPayload, ProductPayloadError, build_product_payload, make_deployment_spec
 from .adapter import (
@@ -66,6 +84,22 @@ __all__ = [
     "TaskContractError",
     "TaskRequest",
     "compile_task_bundle",
+    "revise_task_bundle",
+    "ARTIFACT_KINDS",
+    "MATERIALIZER_VERSION",
+    "MaterializedArtifact",
+    "MaterializedFile",
+    "MaterializedTaskBundle",
+    "TASK_ARTIFACT_SCHEMA",
+    "TaskBundleMaterializer",
+    "materialize_task_bundle",
+    "STORE_SCHEMA",
+    "StoredTaskContract",
+    "TaskContractStore",
+    "TASK_PIPELINE_SCHEMA",
+    "TaskExecutionPipeline",
+    "TaskPipelineError",
+    "TaskPipelineResult",
     "build_product_payload",
     "call_product_plugin",
     "get_product",

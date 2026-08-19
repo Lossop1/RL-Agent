@@ -5,7 +5,13 @@ from types import SimpleNamespace
 
 from autotuner.llm_gateway.schemas import TaskSpecVocabulary, validate_task_spec
 from autotuner.locomotion_console import ops_state
-from autotuner.product import ProductRegistry, load_product_plugin, resolve_product_contract
+from autotuner.product import (
+    ProductRegistry,
+    TaskBundleMaterializer,
+    TaskContractCompiler,
+    load_product_plugin,
+    resolve_product_contract,
+)
 from autotuner.product.runtime import ProductRuntimeView
 
 
@@ -20,7 +26,11 @@ def test_virtual_product_owns_intake_framework_diagnostics_and_plugins(tmp_path,
         "    return {'product': 'beta', 'query': query}\n"
         "\n"
         "def get_playbook(task='', gate='', robot=''):\n"
-        "    return {'product': 'beta', 'task': task, 'gate': gate, 'robot': robot}\n",
+        "    return {'product': 'beta', 'task': task, 'gate': gate, 'robot': robot}\n"
+        "\n"
+        "def materialize_task_bundle(bundle=None, output_dir=None):\n"
+        "    kinds = ('training', 'telemetry', 'diagnostics', 'simulation', 'deployment')\n"
+        "    return {'artifacts': {kind: {'virtual_product': 'beta'} for kind in kinds}}\n",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -77,6 +87,7 @@ def test_virtual_product_owns_intake_framework_diagnostics_and_plugins(tmp_path,
         },
         "runtime": {"training_process_pattern": "beta_train"},
         "plugins": {
+            "materializer": {"task_bundle": "virtual_plugins:materialize_task_bundle"},
             "knowledge": {"context_pack": "virtual_plugins:build_context_pack"},
             "playbook": {"get_playbook": "virtual_plugins:get_playbook"},
         },
@@ -116,3 +127,16 @@ def test_virtual_product_owns_intake_framework_diagnostics_and_plugins(tmp_path,
     assert task.robot_id == "robot.beta"
     assert load_product_plugin(contract, "knowledge", "context_pack")(query="x")["product"] == "beta"
     assert load_product_plugin(contract, "playbook", "get_playbook")(task="verify")["product"] == "beta"
+
+    bundle = TaskContractCompiler().compile_bundle(
+        contract,
+        {"task": {"instance_id": "beta-task", "objective": "verify virtual materializer"}},
+    )
+    materialized = TaskBundleMaterializer().materialize(
+        bundle,
+        tmp_path / "beta-artifacts",
+        product=contract,
+    )
+    assert materialized.artifacts
+    training = (materialized.root / "artifacts" / "training.json").read_text(encoding="utf-8")
+    assert "virtual_product" in training

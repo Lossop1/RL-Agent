@@ -32,10 +32,13 @@ from autotuner.llm_gateway.schemas import (
 from autotuner.product import (
     ProductRegistry,
     ResolvedProductContract,
+    TaskBundleMaterializer,
+    TaskContractStore,
     TaskContractBundle,
     TaskContractCompiler,
     TaskContractError,
     TaskRequest,
+    TaskExecutionPipeline,
     resolve_product_contract,
 )
 
@@ -118,6 +121,9 @@ class DynamicTaskIntakeResult:
     confidence: float
     model: str
     error: str = ""
+    contract_ref: str = ""
+    materialization_manifest: str = ""
+    pipeline: Any | None = None
 
     @property
     def ready(self) -> bool:
@@ -241,8 +247,25 @@ def translate_dynamic(
             approved=approved,
         )
         bundle = TaskContractCompiler().compile_bundle(contract, request)
+        contract_ref = ""
+        materialization_manifest = ""
+        pipeline_result = None
         if output_root is not None:
-            bundle.write(output_root)
+            output_path = Path(output_root)
+            # 保留旧的直接输出布局，同时把同一 bundle 纳入版本仓库，避免
+            # 旧工具和新系统分别生成两份无法对齐的合同。
+            bundle.write(output_path)
+            pipeline_result = TaskExecutionPipeline(
+                output_path,
+                contract_store=TaskContractStore(output_path / "contract_store"),
+            ).prepare(
+                contract,
+                bundle,
+                run_id=f"intake-{bundle.contract.contract_id}-{bundle.contract.contract_version}",
+                actor="llm_task_intake",
+            )
+            contract_ref = pipeline_result.stored_contract.ref
+            materialization_manifest = str(pipeline_result.materialized.manifest)
     except (TaskContractError, TypeError, ValueError) as exc:
         return _dynamic_fallback(contract, f"schema_or_contract:{exc}")
     return DynamicTaskIntakeResult(
@@ -252,6 +275,9 @@ def translate_dynamic(
         clarifications=clarifications,
         confidence=confidence,
         model=response.model,
+        contract_ref=contract_ref,
+        materialization_manifest=materialization_manifest,
+        pipeline=pipeline_result,
     )
 
 

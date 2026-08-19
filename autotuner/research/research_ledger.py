@@ -15,7 +15,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal, Type
+from typing import Any, Iterable, Literal, Mapping, Type
 
 from pydantic import BaseModel, Field
 
@@ -92,6 +92,12 @@ class EffectiveRunSnapshot(LedgerRecord):
     launch_command_redacted: list[str] = Field(default_factory=list)
     seeds: dict[str, Any] = Field(default_factory=dict)
     runtime_manifest_ref: str = ""
+    task_contract_ref: str = ""
+    task_contract_digest: str = ""
+    task_bundle_digest: str = ""
+    task_artifact_manifest_ref: str = ""
+    runtime_digest: str = ""
+    payload_digest: str = ""
 
 
 class PolicyDeploymentContract(LedgerRecord):
@@ -135,6 +141,15 @@ class ResumeEdge(LedgerRecord):
     restored: dict[str, bool] = Field(default_factory=dict)
     reset_reason: dict[str, Any] = Field(default_factory=dict)
     compatibility_report_ref: str = ""
+    parent_task_contract_ref: str = ""
+    child_task_contract_ref: str = ""
+    parent_task_contract_digest: str = ""
+    child_task_contract_digest: str = ""
+    parent_bundle_digest: str = ""
+    child_bundle_digest: str = ""
+    parent_payload_digest: str = ""
+    child_payload_digest: str = ""
+    proof: dict[str, Any] = Field(default_factory=dict)
     status: Literal["complete", "partial", "weights_only", "invalid", "unknown"] = "unknown"
 
 
@@ -392,6 +407,25 @@ def record_digest(record: BaseModel | dict[str, Any]) -> str:
 
 def snapshot_from_runtime_manifest(manifest: dict[str, Any], manifest_path: str = "") -> EffectiveRunSnapshot:
     run = manifest.get("run") if isinstance(manifest.get("run"), dict) else {}
+    execution = manifest.get("execution") if isinstance(manifest.get("execution"), dict) else {}
+    task_contract_ref = str(
+        execution.get("task_contract_ref")
+        or manifest.get("contract_bundle_ref")
+        or manifest.get("task_contract_ref")
+        or ""
+    )
+    task_bundle_digest = str(
+        execution.get("task_bundle_digest")
+        or manifest.get("task_bundle_digest")
+        or ""
+    )
+    task_artifact_manifest_ref = str(
+        execution.get("task_artifact_manifest_ref")
+        or manifest.get("task_artifact_manifest_ref")
+        or ""
+    )
+    runtime_digest = str(execution.get("runtime_digest") or "")
+    payload_digest = str(execution.get("payload_digest") or "")
     run_id = str(run.get("run_id") or manifest.get("run_id") or "")
     return EffectiveRunSnapshot(
         id=f"run:{run_id or manifest_path or uuid.uuid4().hex}",
@@ -408,6 +442,12 @@ def snapshot_from_runtime_manifest(manifest: dict[str, Any], manifest_path: str 
         launch_command_redacted=list((manifest.get("launch") or {}).get("command") or []) if isinstance(manifest.get("launch"), dict) else [],
         seeds={"seed": run.get("seed")} if "seed" in run else {},
         runtime_manifest_ref=str(manifest_path),
+        task_contract_ref=task_contract_ref,
+        task_contract_digest=str(execution.get("task_contract_digest") or ""),
+        task_bundle_digest=task_bundle_digest,
+        task_artifact_manifest_ref=task_artifact_manifest_ref,
+        runtime_digest=runtime_digest,
+        payload_digest=payload_digest,
         source="runtime_manifest",
     )
 
@@ -419,6 +459,9 @@ def resume_edge_from_runtime_manifest(manifest: dict[str, Any], manifest_path: s
     run = manifest.get("run") if isinstance(manifest.get("run"), dict) else {}
     run_id = str(run.get("run_id") or manifest.get("run_id") or "")
     restored = edge.get("restored") if isinstance(edge.get("restored"), dict) else {}
+    execution = manifest.get("execution") if isinstance(manifest.get("execution"), dict) else {}
+    lineage = manifest.get("lineage") if isinstance(manifest.get("lineage"), dict) else {}
+    status = str(edge.get("status") or "")
     return ResumeEdge(
         id=f"resume:{run_id or uuid.uuid4().hex}",
         parent_checkpoint_ref=str(edge.get("parent_checkpoint_ref")),
@@ -426,7 +469,25 @@ def resume_edge_from_runtime_manifest(manifest: dict[str, Any], manifest_path: s
         restored={str(key): bool(value) for key, value in restored.items()},
         reset_reason=edge.get("reset_reason") if isinstance(edge.get("reset_reason"), dict) else {},
         compatibility_report_ref=str(edge.get("parent_manifest") or manifest_path),
-        status="complete" if edge.get("status") == "proven" else "partial",
+        parent_task_contract_ref=str(edge.get("parent_task_contract_ref") or ""),
+        child_task_contract_ref=str(
+            edge.get("child_task_contract_ref")
+            or execution.get("task_contract_ref")
+            or manifest.get("task_contract_ref")
+            or ""
+        ),
+        parent_task_contract_digest=str(edge.get("parent_task_contract_digest") or ""),
+        child_task_contract_digest=str(
+            edge.get("child_task_contract_digest")
+            or execution.get("task_contract_digest")
+            or ""
+        ),
+        parent_bundle_digest=str(edge.get("parent_bundle_digest") or ""),
+        child_bundle_digest=str(edge.get("child_bundle_digest") or execution.get("task_bundle_digest") or ""),
+        parent_payload_digest=str(edge.get("parent_payload_digest") or ""),
+        child_payload_digest=str(edge.get("child_payload_digest") or execution.get("payload_digest") or ""),
+        proof=edge.get("proof") if isinstance(edge.get("proof"), dict) else {},
+        status="complete" if status == "proven" else "partial",
         source="runtime_manifest",
     )
 
@@ -591,6 +652,56 @@ class ResearchLedgerStore:
 
     def events(self, *, verify: bool = True) -> list[LedgerEvent]:
         return self._read_events(verify=verify)
+
+    def record_resume_proof(
+        self,
+        candidate_manifest: str | os.PathLike[str] | Mapping[str, Any],
+        *,
+        parent_manifest: str | os.PathLike[str] | Mapping[str, Any],
+        checkpoint_inventory: Mapping[str, Any],
+        runtime_preflight: Mapping[str, Any],
+        restored: Mapping[str, Any],
+        actor: str = "resume-proof",
+    ) -> LedgerEvent:
+        """仅凭运行时回执升级 resume edge；无法证明时保持 partial。"""
+        from autotuner.execution.compatibility import evaluate_resume_proof
+
+        def load(value: str | os.PathLike[str] | Mapping[str, Any]) -> dict[str, Any]:
+            if isinstance(value, Mapping):
+                return dict(value)
+            return json.loads(Path(value).read_text(encoding="utf-8"))
+
+        candidate = load(candidate_manifest)
+        parent = load(parent_manifest)
+        edge = resume_edge_from_runtime_manifest(candidate, str(candidate_manifest))
+        if edge is None:
+            raise LedgerValidationError([
+                LedgerValidationIssue(
+                    code="resume.edge_missing",
+                    message="candidate runtime manifest has no resume edge",
+                )
+            ])
+        proof = evaluate_resume_proof(
+            parent,
+            candidate,
+            checkpoint=checkpoint_inventory,
+            runtime_preflight=runtime_preflight,
+            restored=restored,
+        )
+        current = self.latest("resume_edge", edge.id)
+        if current is not None and current.get("status") == "complete" and not proof.proven:
+            raise LedgerValidationError([
+                LedgerValidationIssue(
+                    code="resume.proven_immutable",
+                    message="a proven resume edge cannot be downgraded by a later incomplete receipt",
+                )
+            ])
+        updated = edge.model_copy(update={
+            "status": "complete" if proof.proven else "partial",
+            "proof": proof.to_dict(),
+            "compatibility_report_ref": "resume-proof",
+        })
+        return self.append("resume_edge", updated, actor=actor, event_type="supersede")
 
     def latest(self, record_type: str, record_id: str) -> dict[str, Any] | None:
         matches = [event for event in self._read_events() if event.record_type == record_type and event.record_id == record_id]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from autotuner.llm_gateway.client import LLMResponse
 from autotuner.llm_gateway import task_intake
 
@@ -47,6 +49,8 @@ def test_dynamic_intake_compiles_against_selected_product(monkeypatch, tmp_path)
     assert result.bundle.contract.status == "draft"
     assert result.bundle.contract.constraints["actor_observation"] == "proprioceptive_only"
     assert (tmp_path / "task_contract.json").is_file()
+    assert result.contract_ref
+    assert Path(result.materialization_manifest).is_file()
 
 
 def test_dynamic_intake_never_accepts_llm_approval(monkeypatch) -> None:

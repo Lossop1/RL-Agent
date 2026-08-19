@@ -6,7 +6,7 @@ IsaacLab 专用分支，因此新机器人只需提供自己的清单和构建�
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import importlib
 import inspect
 from pathlib import Path
@@ -30,6 +30,9 @@ class ProductPayload:
     payload_digest: str
     file_count: int = 0
     root_name: str = ""
+    task_contract_ref: str = ""
+    task_bundle_digest: str = ""
+    task_artifact_manifest_ref: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -88,6 +91,8 @@ def build_product_payload(
     contract: ResolvedProductContract | Mapping[str, Any],
     *,
     output_dir: str | Path | None = None,
+    task_bundle: Any | None = None,
+    task_artifacts: Any | None = None,
 ) -> ProductPayload:
     """调用产品清单声明的构建器，并在返回前完成本地归档校验。"""
     data = _contract_data(contract)
@@ -103,6 +108,10 @@ def build_product_payload(
         raise ProductPayloadError(f"payload builder must accept the resolved product contract: {builder_name!r}")
     if output_dir is not None and ("output_dir" in parameters or accepts_kwargs):
         kwargs["output_dir"] = Path(output_dir)
+    if task_bundle is not None and ("task_bundle" in parameters or accepts_kwargs):
+        kwargs["task_bundle"] = task_bundle
+    if task_artifacts is not None and ("task_artifacts" in parameters or accepts_kwargs):
+        kwargs["task_artifacts"] = task_artifacts
     result = _normalise_result(builder(**kwargs))
     payload_manifest = load_payload_manifest(result.manifest)
     payload_manifest.validate(require_digest=True)
@@ -123,6 +132,30 @@ def build_product_payload(
         raise ProductPayloadError("payload runtime identity does not match the resolved contract")
     if payload_manifest.payload_digest != result.payload_digest:
         raise ProductPayloadError("builder result digest does not match its manifest")
+    if task_bundle is not None:
+        bundle_data = task_bundle.to_dict() if hasattr(task_bundle, "to_dict") else task_bundle
+        if not isinstance(bundle_data, Mapping):
+            raise ProductPayloadError("task bundle must expose a mapping representation")
+        contract_id = str(bundle_data.get("contract_id") or bundle_data.get("contract_ref") or "")
+        version = bundle_data.get("contract_version")
+        result = replace(
+            result,
+            task_contract_ref=contract_id + (f"@{version}" if version is not None else ""),
+            task_bundle_digest=str(bundle_data.get("bundle_digest") or ""),
+        )
+    if task_artifacts is not None:
+        artifact_data = task_artifacts.to_dict() if hasattr(task_artifacts, "to_dict") else task_artifacts
+        if not isinstance(artifact_data, Mapping):
+            raise ProductPayloadError("task artifacts must expose a mapping representation")
+        result = replace(
+            result,
+            task_artifact_manifest_ref=str(
+                artifact_data.get("manifest_ref")
+                or artifact_data.get("manifest")
+                or artifact_data.get("manifest_path")
+                or ""
+            ),
+        )
     return result
 
 
@@ -132,6 +165,8 @@ def make_deployment_spec(
     *,
     run_id: str,
     run_manifest: Mapping[str, Any] | str | Path,
+    task_bundle: Any | None = None,
+    task_artifacts: Any | None = None,
 ) -> Any:
     """将产品产物绑定到无产品知识的执行层。"""
     from autotuner.execution import DeploymentSpec
@@ -141,6 +176,25 @@ def make_deployment_spec(
     runtime_digest = str(runtime.get("digest") or "")
     if not runtime_digest:
         raise ProductPayloadError("resolved product contract has no runtime digest")
+    task_contract_ref = payload.task_contract_ref
+    task_bundle_digest = payload.task_bundle_digest
+    task_artifact_manifest_ref = payload.task_artifact_manifest_ref
+    if task_bundle is not None:
+        bundle_data = task_bundle.to_dict() if hasattr(task_bundle, "to_dict") else task_bundle
+        if isinstance(bundle_data, Mapping):
+            contract_id = str(bundle_data.get("contract_id") or bundle_data.get("contract_ref") or "")
+            version = bundle_data.get("contract_version")
+            task_contract_ref = contract_id + (f"@{version}" if version is not None else "")
+            task_bundle_digest = str(bundle_data.get("bundle_digest") or "")
+    if task_artifacts is not None:
+        artifact_data = task_artifacts.to_dict() if hasattr(task_artifacts, "to_dict") else task_artifacts
+        if isinstance(artifact_data, Mapping):
+            task_artifact_manifest_ref = str(
+                artifact_data.get("manifest_ref")
+                or artifact_data.get("manifest")
+                or artifact_data.get("manifest_path")
+                or ""
+            )
     return DeploymentSpec(
         runtime=runtime,
         runtime_digest=runtime_digest,
@@ -149,6 +203,9 @@ def make_deployment_spec(
         run_id=run_id,
         run_manifest=run_manifest,
         payload_digest=payload.payload_digest,
+        task_contract_ref=task_contract_ref,
+        task_bundle_digest=task_bundle_digest,
+        task_artifact_manifest_ref=task_artifact_manifest_ref,
     )
 
 

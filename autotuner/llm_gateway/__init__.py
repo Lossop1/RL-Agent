@@ -23,5 +23,27 @@ LLM 可以提出候选配置和新机制，但不能直接执行。合同编译�
 """
 
 from .task_intake import DynamicTaskIntakeResult, translate, translate_dynamic
+from .research_proposal import (
+    AppliedResearchProposal,
+    RESEARCH_PROPOSAL_SCHEMA,
+    ResearchProposal,
+    ResearchProposalError,
+    ResearchProposalRequest,
+    ResearchProposalResult,
+    apply_research_proposal,
+    propose_research_change,
+)
 
-__all__ = ["DynamicTaskIntakeResult", "translate", "translate_dynamic"]
+__all__ = [
+    "AppliedResearchProposal",
+    "DynamicTaskIntakeResult",
+    "RESEARCH_PROPOSAL_SCHEMA",
+    "ResearchProposal",
+    "ResearchProposalError",
+    "ResearchProposalRequest",
+    "ResearchProposalResult",
+    "apply_research_proposal",
+    "propose_research_change",
+    "translate",
+    "translate_dynamic",
+]

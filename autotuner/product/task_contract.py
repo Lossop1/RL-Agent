@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -252,6 +252,26 @@ class ResolvedTaskContract:
         data["goals"] = [dict(goal) for goal in self.goals]
         return data
 
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ResolvedTaskContract":
+        """从持久化 JSON 恢复合同；恢复不是重新编译，不改变任何 digest。"""
+        if not isinstance(value, Mapping):
+            raise TaskContractError("resolved task contract must be a mapping")
+        data = dict(value)
+        data["goals"] = tuple(dict(item) for item in data.get("goals", ()))
+        data["protected_capabilities"] = tuple(data.get("protected_capabilities", ()))
+        required = {
+            "schema_version", "compiler_version", "contract_id", "contract_version",
+            "status", "product_id", "product_contract_digest", "request_digest",
+            "objective", "goals", "constraints", "protected_capabilities", "baseline",
+            "training", "telemetry", "diagnostics", "simulation", "deployment",
+            "runtime", "compatibility", "provenance", "contract_digest",
+        }
+        missing = sorted(field for field in required if field not in data)
+        if missing:
+            raise TaskContractError("persisted task contract is missing: " + ", ".join(missing))
+        return cls(**{field: data[field] for field in required})
+
     def _unsigned(self) -> dict[str, Any]:
         data = self.to_dict()
         data.pop("contract_digest", None)
@@ -291,6 +311,7 @@ class TaskContractBundle:
             "bundle_digest": self.bundle_digest,
             "contract_digest": self.contract.contract_digest,
             "contract_id": self.contract.contract_id,
+            "contract_version": self.contract.contract_version,
             "specs": {key: dict(value) for key, value in self.specs.items()},
         }
 
@@ -323,6 +344,8 @@ class TaskContractBundle:
         run_id: str,
         run_manifest: Mapping[str, Any] | str | Path,
         payload_digest: str = "",
+        task_bundle_ref: str = "",
+        task_artifact_manifest_ref: str = "",
     ) -> Any:
         """把已构建 payload 绑定到通用执行层，不让执行层反向依赖产品。"""
         from autotuner.execution import DeploymentSpec
@@ -336,6 +359,9 @@ class TaskContractBundle:
             run_id=run_id,
             run_manifest=run_manifest,
             payload_digest=payload_digest,
+            task_contract_ref=task_bundle_ref or f"{self.contract.contract_id}@{self.contract.contract_version}",
+            task_bundle_digest=self.bundle_digest,
+            task_artifact_manifest_ref=task_artifact_manifest_ref,
         )
 
 
@@ -392,10 +418,26 @@ class TaskContractCompiler:
         status = "approved" if task.approved else "draft"
         provenance = {
             "compiler": self.compiler_version,
+            "product_version": str(product_data.get("product_version") or ""),
             "product_contract_digest": product_digest,
             "request_digest": task.digest(),
             "approval_required": not task.approved,
+            "approval_source": (
+                str(task.metadata.get("approved_by") or task.metadata.get("approval_ref") or "").strip()
+                if task.approved
+                else ""
+            )
+            or ("explicit_task_request" if task.approved else ""),
             "source": "structured_task_request",
+            # 保留不含原始用户文本的语义快照，后续修订才能基于真实合同而不是猜测恢复。
+            "request_snapshot": {
+                **task.to_dict(),
+                "metadata": {
+                    key: value
+                    for key, value in task.metadata.items()
+                    if str(key) != "raw_user_text"
+                },
+            },
         }
         contract = ResolvedTaskContract(
             schema_version=TASK_CONTRACT_SCHEMA,
@@ -481,6 +523,119 @@ def compile_task_bundle(
     return bundle
 
 
+def revise_task_bundle(
+    product: ResolvedProductContract | Mapping[str, Any],
+    base: TaskContractBundle,
+    approved_change: Mapping[str, Any],
+    *,
+    evidence_refs: tuple[str, ...] | list[str],
+    approved_by: str,
+    contract_version: int | None = None,
+) -> TaskContractBundle:
+    """基于证据和已批准变更创建新合同版本，不覆盖旧版本。
+
+    ``approved_change`` 只描述任务语义的变更，可直接传任务字段，也可包在
+    ``changes`` 或 ``request`` 下。产品字段仍由编译器拒绝，批准者和证据引用
+    由调用方显式提供，避免 LLM 输出伪造授权。
+    """
+    if not isinstance(approved_change, Mapping):
+        raise TaskContractError("approved_change must be a mapping")
+    refs = tuple(dict.fromkeys(str(item).strip() for item in evidence_refs if str(item).strip()))
+    if not refs:
+        raise TaskContractError("at least one evidence reference is required for a revision")
+    approver = str(approved_by or "").strip()
+    if not approver:
+        raise TaskContractError("approved_by is required for a revision")
+
+    product_data = _product_data(product)
+    if base.contract.product_id != str(product_data.get("product_id") or ""):
+        raise TaskContractError("base task contract belongs to another product")
+    if base.contract.product_contract_digest != str(product_data.get("contract_digest") or ""):
+        raise TaskContractError("base task contract was compiled from another product contract")
+
+    changes = approved_change.get("changes", approved_change.get("request", approved_change))
+    if not isinstance(changes, Mapping):
+        raise TaskContractError("approved_change.changes must be a mapping")
+    allowed = {
+        "objective",
+        "goals",
+        "constraints",
+        "protected_capabilities",
+        "baseline",
+        "training",
+        "telemetry",
+        "diagnostics",
+        "simulation",
+        "deployment",
+        "metadata",
+    }
+    unknown = sorted(str(key) for key in changes if str(key) not in allowed)
+    if unknown:
+        raise TaskContractError(f"approved task revision contains unsupported fields: {', '.join(unknown)}")
+
+    snapshot = base.contract.provenance.get("request_snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise TaskContractError("base task contract has no revisionable request snapshot")
+    request_data = {str(key): value for key, value in snapshot.items()}
+    for key, value in changes.items():
+        name = str(key)
+        if isinstance(request_data.get(name), Mapping) and isinstance(value, Mapping):
+            request_data[name] = _deep_merge(request_data[name], value)
+        else:
+            request_data[name] = value
+    request_data["approved"] = True
+    metadata = dict(request_data.get("metadata") or {})
+    metadata.update(
+        {
+            "source": "approved_evidence_revision",
+            "parent_contract_ref": f"{base.contract.contract_id}@{base.contract.contract_version}",
+            "evidence_refs": list(refs),
+            "approved_by": approver,
+        }
+    )
+    request_data["metadata"] = metadata
+
+    next_version = int(contract_version or base.contract.contract_version + 1)
+    if next_version <= base.contract.contract_version:
+        raise TaskContractError("revision contract_version must be newer than the base version")
+    compiled = TaskContractCompiler().compile_bundle(
+        product,
+        TaskRequest.from_mapping(request_data),
+        contract_version=next_version,
+        contract_id=base.contract.contract_id,
+    )
+    provenance = dict(compiled.contract.provenance)
+    provenance["revision"] = {
+        "parent_ref": f"{base.contract.contract_id}@{base.contract.contract_version}",
+        "evidence_refs": list(refs),
+        "approved_by": approver,
+    }
+    contract = replace(compiled.contract, provenance=provenance, contract_digest="").with_digest()
+    shared = {
+        "schema_version": BUNDLE_SCHEMA,
+        "contract_id": contract.contract_id,
+        "contract_digest": contract.contract_digest,
+    }
+    specs = {
+        name: {**shared, "kind": name, "spec": dict(value)}
+        for name, value in (
+            ("training", contract.training),
+            ("telemetry", contract.telemetry),
+            ("diagnostics", contract.diagnostics),
+            ("simulation", contract.simulation),
+            ("deployment", contract.deployment),
+        )
+    }
+    bundle_digest = _digest(
+        {
+            "compiler": COMPILER_VERSION,
+            "contract_digest": contract.contract_digest,
+            "specs": specs,
+        }
+    )
+    return TaskContractBundle(contract=contract, specs=specs, bundle_digest=bundle_digest)
+
+
 __all__ = [
     "BUNDLE_SCHEMA",
     "COMPILER_VERSION",
@@ -491,4 +646,5 @@ __all__ = [
     "TaskContractError",
     "TaskRequest",
     "compile_task_bundle",
+    "revise_task_bundle",
 ]

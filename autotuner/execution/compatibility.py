@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 try:
     from .hashing import canonical_json
-except ImportError:  # payload copy keeps the helper beside this module
+except ImportError:  # payload 副本将辅助函数放在本模块旁边
     from .execution_hashing import canonical_json  # type: ignore
 
 
@@ -49,6 +49,7 @@ def _normal(value: Any) -> Any:
 def _fingerprint(manifest: Mapping[str, Any] | Any) -> dict[str, Any]:
     data = _as_mapping(manifest)
     contract = _as_mapping(data.get("resolved_contract") or data.get("contract") or data)
+    execution = _as_mapping(data.get("execution"))
     training = _as_mapping(contract.get("training"))
     compatibility = _as_mapping(contract.get("compatibility") or data.get("compatibility"))
     runtime = _as_mapping(contract.get("runtime") or data.get("runtime"))
@@ -63,16 +64,20 @@ def _fingerprint(manifest: Mapping[str, Any] | Any) -> dict[str, Any]:
         "network_structure": _first(compatibility, ("network_structure",)) or _first(training, ("network_structure",), ("network",)),
         "normalization": _first(compatibility, ("normalization",)) or _first(training, ("normalization",), ("normalizer",)),
         "physics_timestep": _first(compatibility, ("physics_timestep",), ("timestep",)) or _first(runtime, ("physics_timestep",), ("timestep",)),
-        "runtime_digest": runtime.get("digest") or data.get("runtime_digest"),
+        "runtime_digest": runtime.get("digest")
+        or execution.get("runtime_digest")
+        or data.get("runtime_digest"),
+        "task_contract_digest": execution.get("task_contract_digest"),
+        "task_bundle_digest": execution.get("task_bundle_digest"),
         "config_digest": _first(contract, ("config_digest",)) or _first(configuration, ("effective_config", "sha256")),
         "source_digest": _first(contract, ("source_digest",)),
-        # A contract digest is not a payload digest.  Treating it as a
-        # fallback made a source-only change look resume-compatible with an
-        # otherwise different packaged runtime.
+        # 合同身份与 payload 身份分别记录；不能用合同摘要冒充 payload 摘要。
+        # 否则仅源码变化就会被误判为运行包仍然相同。
         "payload_digest": (
             payload.get("payload_digest")
             or payload.get("digest")
             or data.get("payload_digest")
+            or execution.get("payload_digest")
             or _first(contract, ("payload_digest",))
         ),
     }
@@ -100,8 +105,35 @@ class ResumeCompatibility:
         }
 
 
+@dataclass(frozen=True)
+class ResumeProof:
+    """运行时恢复回执的确定性判定；声明本身不能产生 proven。"""
+
+    proven: bool
+    status: str
+    reasons: tuple[str, ...] = ()
+    compatibility: ResumeCompatibility | None = None
+    checks: Mapping[str, bool] = field(default_factory=dict)
+    state_components: Mapping[str, bool] = field(default_factory=dict)
+    identity: Mapping[str, Any] = field(default_factory=dict)
+    schema_version: str = COMPATIBILITY_SCHEMA
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "proven": self.proven,
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "compatibility": self.compatibility.to_dict() if self.compatibility else {},
+            "checks": dict(self.checks),
+            "state_components": dict(self.state_components),
+            "identity": dict(self.identity),
+        }
+
+
 _REQUIRED = (
     "product",
+    "product_version",
     "task",
     "observation_structure",
     "action_structure",
@@ -112,6 +144,34 @@ _REQUIRED = (
     "config_digest",
     "source_digest",
     "payload_digest",
+)
+
+# 这些字段决定检查点能否被当前运行时安全解释，变化时必须阻断 resume。
+_RESUME_ABI_FIELDS = frozenset(
+    {
+        "product",
+        "product_version",
+        "task",
+        "observation_structure",
+        "action_structure",
+        "network_structure",
+        "normalization",
+        "physics_timestep",
+        "runtime_digest",
+    }
+)
+
+# 这些字段用于谱系和复现实验记录。它们变化并不自动意味着策略状态
+# 无法加载；例如奖励、课程或监控配置变化，可能正是一次合法的 resume
+# 优化。但它们仍然必须存在，并且必须写入 proven proof 的 identity。
+_PROVENANCE_FIELDS = frozenset(
+    {
+        "task_contract_digest",
+        "task_bundle_digest",
+        "config_digest",
+        "source_digest",
+        "payload_digest",
+    }
 )
 
 
@@ -144,8 +204,9 @@ def check_resume_compatibility(
 ) -> ResumeCompatibility:
     """Return a proof-oriented resume decision.
 
-    Missing identity fields are blocking in strict mode.  This prevents a
-    checkpoint from being resumed merely because an actor weight file exists.
+    严格模式下缺少身份字段会阻断 resume。运行时 ABI 变化也会阻断；
+    合同、配置、源码和 payload 摘要的变化则作为谱系差异记录，不被
+    错误地等同为网络结构不兼容。
     """
     current = _fingerprint(candidate)
     current_digest = hashlib.sha256(canonical_json(current).encode("utf-8")).hexdigest()
@@ -159,11 +220,19 @@ def check_resume_compatibility(
         before = previous.get(key)
         after = current.get(key)
         compared[key] = {"parent": before, "candidate": after, "equal": before == after}
+        compared[key]["class"] = (
+            "resume_abi" if key in _RESUME_ABI_FIELDS else "provenance"
+        )
         if before in (None, "", [], {}) or after in (None, "", [], {}):
             if strict and key in _REQUIRED:
                 reasons.append(f"missing compatibility field: {key}")
         elif _normal(before) != _normal(after):
-            reasons.append(f"incompatible {key}: {before!r} != {after!r}")
+            if key in _RESUME_ABI_FIELDS:
+                reasons.append(f"incompatible {key}: {before!r} != {after!r}")
+            elif key in _PROVENANCE_FIELDS:
+                compared[key]["change"] = "recorded_provenance_change"
+            else:
+                reasons.append(f"incompatible {key}: {before!r} != {after!r}")
 
     checkpoint_info = _as_mapping(checkpoint)
     if checkpoint_info:
@@ -188,4 +257,105 @@ def check_resume_compatibility(
     )
 
 
-__all__ = ["COMPATIBILITY_SCHEMA", "ResumeCompatibility", "check_resume_compatibility"]
+def evaluate_resume_proof(
+    parent: Mapping[str, Any] | Any | None,
+    candidate: Mapping[str, Any] | Any,
+    *,
+    checkpoint: Mapping[str, Any] | None,
+    runtime_preflight: Mapping[str, Any] | None,
+    restored: Mapping[str, Any] | None,
+    required_state_components: tuple[str, ...] = (
+        "policy",
+        "value",
+        "optimizer",
+        "normalizer",
+        "curriculum",
+        "rng",
+    ),
+) -> ResumeProof:
+    """把远程回执收敛为 proven/blocked，避免凭日志声明升级恢复状态。"""
+    compatibility = check_resume_compatibility(
+        parent,
+        candidate,
+        checkpoint=checkpoint,
+        requested=True,
+        strict=True,
+    )
+    candidate_data = _as_mapping(candidate)
+    parent_data = _as_mapping(parent)
+    execution = _as_mapping(candidate_data.get("execution"))
+    parent_execution = _as_mapping(parent_data.get("execution"))
+    preflight = _as_mapping(runtime_preflight)
+    restored_values = _as_mapping(restored)
+    state_components = {
+        name: bool(restored_values.get(name, False))
+        for name in required_state_components
+    }
+    checks = {
+        "compatibility": compatibility.compatible,
+        "checkpoint_inventory": str((_as_mapping(checkpoint)).get("status") or "")
+        in {"captured", "proven"},
+        "runtime_preflight": str(preflight.get("status") or "") in {"pass", "proven"},
+        "remote_verification": str(
+            _as_mapping(candidate_data.get("runtime_execution")).get("remote_verification") or ""
+        )
+        in {"proven", "pass"},
+        "contract_digest_present": bool(
+            execution.get("task_contract_digest")
+            and parent_execution.get("task_contract_digest")
+        ),
+        "bundle_digest_present": bool(
+            execution.get("task_bundle_digest")
+            and parent_execution.get("task_bundle_digest")
+        ),
+        "payload_digest_present": bool(
+            execution.get("payload_digest")
+            and parent_execution.get("payload_digest")
+        ),
+        "runtime_digest_present": bool(
+            execution.get("runtime_digest")
+            and parent_execution.get("runtime_digest")
+        ),
+    }
+    reasons = list(compatibility.reasons)
+    reasons.extend(
+        f"resume proof check failed: {name}"
+        for name, passed in checks.items()
+        if not passed and name != "compatibility"
+    )
+    reasons.extend(
+        f"resume state component was not restored: {name}"
+        for name, passed in state_components.items()
+        if not passed
+    )
+    proven = not reasons
+    identity = {
+        "parent_task_contract_ref": parent_execution.get("task_contract_ref", ""),
+        "child_task_contract_ref": execution.get("task_contract_ref", ""),
+        "parent_task_contract_digest": parent_execution.get("task_contract_digest", ""),
+        "child_task_contract_digest": execution.get("task_contract_digest", ""),
+        "parent_bundle_digest": parent_execution.get("task_bundle_digest", ""),
+        "child_bundle_digest": execution.get("task_bundle_digest", ""),
+        "parent_payload_digest": parent_execution.get("payload_digest", ""),
+        "child_payload_digest": execution.get("payload_digest", ""),
+        "parent_runtime_digest": parent_execution.get("runtime_digest", ""),
+        "child_runtime_digest": execution.get("runtime_digest", ""),
+    }
+    return ResumeProof(
+        proven=proven,
+        status="proven" if proven else "blocked",
+        reasons=tuple(dict.fromkeys(reasons)),
+        compatibility=compatibility,
+        checks=checks,
+        state_components=state_components,
+        identity=identity,
+    )
+
+
+__all__ = [
+    "COMPATIBILITY_SCHEMA",
+    "ResumeCompatibility",
+    "ResumeProof",
+    "check_resume_compatibility",
+    "evaluate_resume_proof",
+]

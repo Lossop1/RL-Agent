@@ -118,6 +118,8 @@ adaptation:
       dr_mass_range_2: [-3.0, 6.0]
       dr_mass_range_3: [-3.0, 10.0]
   materialization:
+    # 任务合同只能覆盖这些顶层配置区；reward/gate 机制另由受限 AST artifact 管理。
+    config_overlay_allowlist: [training_recipe, model, env, reward, domain_randomization]
     env_source: products/taili/blind_locomotion/taili_amp_env_cfg.py
     asset_source: products/taili/blind_locomotion/assets/taili.py
     env_fields:
@@ -411,6 +413,8 @@ knowledge:
 
 # 控制台与研究层只依赖这些角色；入口的实现属于 Taili 产品插件。
 plugins:
+  materializer:
+    task_bundle: products.taili.payload.task_materializer:materialize_task_bundle
   playbook:
     get_playbook: products.taili.ops.playbook:get_playbook
   adaptation:

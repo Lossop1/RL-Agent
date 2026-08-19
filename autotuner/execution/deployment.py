@@ -25,7 +25,7 @@ from .payload import PayloadManifest, load_payload_manifest, verify_payload_arch
 
 
 DEPLOYMENT_SCHEMA = "rl-agent.remote-deployment/v1"
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]*$")
 
 
 @runtime_checkable
@@ -113,12 +113,21 @@ class DeploymentSpec:
     run_id: str
     run_manifest: Mapping[str, Any] | str | Path
     payload_digest: str = ""
+    task_contract_ref: str = ""
+    task_bundle_digest: str = ""
+    task_artifact_manifest_ref: str = ""
 
     def validate(self) -> None:
         _id(self.runtime_digest, "runtime_digest")
         _id(self.run_id, "run_id")
         if self.payload_digest:
             _id(self.payload_digest, "payload_digest")
+        if self.task_contract_ref:
+            _id(self.task_contract_ref, "task_contract_ref")
+        if self.task_bundle_digest:
+            _id(self.task_bundle_digest, "task_bundle_digest")
+        if self.task_artifact_manifest_ref and "\x00" in self.task_artifact_manifest_ref:
+            raise ValueError("task_artifact_manifest_ref contains a control character")
         if not isinstance(self.runtime, Mapping) or not self.runtime:
             raise ValueError("deployment runtime identity must be a non-empty mapping")
 
@@ -181,6 +190,9 @@ class VersionedRemoteDeployer:
             run_id=spec.run_id,
             run_manifest=spec.run_manifest,
             payload_digest=spec.payload_digest,
+            task_contract_ref=spec.task_contract_ref,
+            task_bundle_digest=spec.task_bundle_digest,
+            task_artifact_manifest_ref=spec.task_artifact_manifest_ref,
         )
 
     def _mkdir(self, path: str) -> None:
@@ -339,6 +351,9 @@ class VersionedRemoteDeployer:
         *,
         runtime_digest: str,
         payload_digest: str,
+        task_contract_ref: str = "",
+        task_bundle_digest: str = "",
+        task_artifact_manifest_ref: str = "",
     ) -> RemoteArtifact:
         run_identity = _id(run_id, "run_id")
         runtime_identity = _id(runtime_digest, "runtime_digest")
@@ -366,6 +381,12 @@ class VersionedRemoteDeployer:
                 "run_id": run_identity,
             }
         )
+        if task_contract_ref:
+            execution["task_contract_ref"] = task_contract_ref
+        if task_bundle_digest:
+            execution["task_bundle_digest"] = task_bundle_digest
+        if task_artifact_manifest_ref:
+            execution["task_artifact_manifest_ref"] = task_artifact_manifest_ref
         local_path = _temporary_json(f"rl-run-{run_identity}-", data)
         try:
             local_path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -417,6 +438,9 @@ class VersionedRemoteDeployer:
         run_id: str,
         run_manifest: Mapping[str, Any] | str | Path,
         payload_digest: str = "",
+        task_contract_ref: str = "",
+        task_bundle_digest: str = "",
+        task_artifact_manifest_ref: str = "",
     ) -> DeploymentResult:
         trace: list[Mapping[str, Any]] = []
         try:
@@ -430,6 +454,9 @@ class VersionedRemoteDeployer:
                 run_manifest,
                 runtime_digest=runtime_result.identity,
                 payload_digest=payload_identity,
+                task_contract_ref=task_contract_ref,
+                task_bundle_digest=task_bundle_digest,
+                task_artifact_manifest_ref=task_artifact_manifest_ref,
             )
             trace.append({"event": "run", **asdict(run_result)})
             return DeploymentResult("activated", runtime_result, payload_result, run_result, tuple(trace))

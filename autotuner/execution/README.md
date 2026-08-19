@@ -90,5 +90,10 @@ of the new payload deployment contract.
   blocks rollback.
 - A checkpoint without complete identity evidence is `blocked`, not silently
   treated as a valid resume.
+- Resume ABI fields (`product`, `product_version`, `task`, observation/action
+  structure, network structure, normalization, physics timestep, and runtime
+  digest) must match the parent. Contract/config/source/payload digests are
+  provenance fields: a planned change may differ, but the parent and child
+  identities are recorded in the proof and their presence is still required.
 - A payload archive is verified locally before upload and again by remote
   manifest checks.
