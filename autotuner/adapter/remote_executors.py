@@ -16,7 +16,12 @@ from autotuner.adapter.orchestrator import StepResult
 
 
 class RemoteDeployExecutor:
-    """orchestrator deploy step → real deploy.execute over paramiko (gated, backup-then-put+verify)."""
+    """Legacy file-plan deployer kept for existing ConfigSet callers.
+
+    New payload deployments use ``VersionedPayloadDeployExecutor`` below.
+    Keeping this bridge separate prevents the old source-tree path from
+    becoming an implicit dependency of the execution layer.
+    """
 
     def __init__(self, ssh_json: str = "config/ssh.json", do_launch: bool = False):
         self.ssh_json = ssh_json
@@ -44,6 +49,39 @@ class RemoteDeployExecutor:
                           {"items": [(it.remote, it.verified) for it in res.items],
                            "launched": res.launched,
                            "rollback": restore_cmds(plan) if not res.ok else []})
+
+
+class VersionedPayloadDeployExecutor:
+    """Bridge a product-produced ``DeploymentSpec`` to the execution layer."""
+
+    def __init__(self, ssh_json: str = "config/ssh.json", layout=None):
+        self.ssh_json = ssh_json
+        self.layout = layout
+
+    def deploy(self, spec) -> StepResult:
+        from autotuner.execution.deployment import VersionedRemoteDeployer
+        from autotuner.adapter.remote_deploy import from_ssh_json
+
+        try:
+            ssh = from_ssh_json(self.ssh_json)
+        except Exception as exc:  # noqa: BLE001
+            return StepResult("versioned-deploy", False, f"ssh setup failed: {exc}")
+        try:
+            deployer = VersionedRemoteDeployer(ssh, layout=self.layout)
+            result = deployer.deploy_spec(spec)
+            return StepResult(
+                "versioned-deploy",
+                result.status == "activated",
+                result.status,
+                result.to_dict(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return StepResult("versioned-deploy", False, f"deployment raised: {exc}")
+        finally:
+            try:
+                ssh.close()
+            except Exception:
+                pass
 
 
 def launch_training(ssh, train_cmd: str, session: str, log: str) -> StepResult:

@@ -1,15 +1,14 @@
-"""机器人知识源描述符（按 robot_id 索引）。
+"""从产品清单解析机器人知识源描述符。
 
-去 taili 化的关键:所有"机器人专属"的东西——奖励代码在哪个文件、奖励函数/配置类/门控清单
-叫什么、资产 cfg 在哪——集中到这里一条一条描述,按 **激活机器人的 robot_id** 解析。
-推导器逻辑本身通用、不含任何 taili 字样;加一个新机器人 = 在 _ROBOTS 里加一条,不动推导器。
-
-激活机器人从现有的 robot_profile 机制取(get_robot_profile().id),不是写死 taili。
+推导器只消费 ``RobotSources`` 接口；奖励、资产和课程文件的位置由产品
+清单声明，未知产品不会静默套用另一个机器人的描述。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
+
+from autotuner.product import ProductManifestError, get_product
 
 
 @dataclass(frozen=True)
@@ -32,37 +31,67 @@ class RobotSources:
     asset_constant_files: Tuple[Tuple[str, str], ...] = ()
 
 
-_ROBOTS: Dict[str, RobotSources] = {
-    "robot.taili": RobotSources(
-        robot_id="robot.taili",
-        reward_file="autotuner/taili_core/taili_reward.py",
-        reward_func="compute_reward_components",
-        reward_cfg_class="RewardConfig",
-        reward_gate_const="REWARD_GROUP_GATES",
-        reward_group_const="_REWARD_GROUP_OF",
-        env_reward_file="autotuner/blind_locomotion/blind_tp_env.py",
-        asset_file="autotuner/blind_locomotion/assets/taili.py",
-        curriculum_file="autotuner/blind_locomotion/taili_amp_env_cfg.py",
-        asset_cfg_call="ArticulationCfg",
-        asset_constant_files=(("geometry", "autotuner/taili_core/taili_geometry.py"),),
-    ),
-}
-
-
 def active_robot_id() -> str:
-    """当前激活机器人的 id。取自现有 robot_profile 机制(不写死 taili);
-    将来多机器人时,这里按 framework/config-set 解析。"""
-    try:
-        from ..robot_profile import get_robot_profile
-        return get_robot_profile().id
-    except Exception:  # noqa: BLE001
-        return "robot.taili"
+    """返回产品注册表当前选择的机器人 id。"""
+    return get_product().robot.id
+
+
+def _knowledge_value(product, key: str, *source_keys: str) -> str:
+    value = product.knowledge.get(key)
+    if value not in (None, ""):
+        return str(value)
+    for source_key in source_keys:
+        value = product.sources.get(source_key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _constant_files(product) -> Tuple[Tuple[str, str], ...]:
+    raw = product.knowledge.get("asset_constant_files", {})
+    if isinstance(raw, dict):
+        return tuple((str(alias), str(path)) for alias, path in raw.items())
+    if isinstance(raw, (list, tuple)):
+        result: list[Tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                result.append((str(item[0]), str(item[1])))
+        return tuple(result)
+    return ()
+
+
+def _sources_from_product(product) -> RobotSources:
+    knowledge = {
+        "reward_file": _knowledge_value(product, "reward_file", "reward"),
+        "reward_func": _knowledge_value(product, "reward_func"),
+        "reward_cfg_class": _knowledge_value(product, "reward_cfg_class"),
+        "reward_gate_const": _knowledge_value(product, "reward_gate_const"),
+        "reward_group_const": _knowledge_value(product, "reward_group_const"),
+        "env_reward_file": _knowledge_value(product, "env_reward_file", "task_env"),
+        "asset_file": _knowledge_value(product, "asset_file", "asset_config"),
+        "curriculum_file": _knowledge_value(product, "curriculum_file", "task_config"),
+        "asset_cfg_call": _knowledge_value(product, "asset_cfg_call") or "ArticulationCfg",
+    }
+    missing = [key for key, value in knowledge.items() if key != "asset_cfg_call" and not value]
+    if missing:
+        raise ProductManifestError(
+            f"product {product.product_id!r} has no knowledge declarations: {', '.join(missing)}"
+        )
+    return RobotSources(
+        robot_id=product.robot.id,
+        reward_file=knowledge["reward_file"],
+        reward_func=knowledge["reward_func"],
+        reward_cfg_class=knowledge["reward_cfg_class"],
+        reward_gate_const=knowledge["reward_gate_const"],
+        reward_group_const=knowledge["reward_group_const"],
+        env_reward_file=knowledge["env_reward_file"],
+        asset_file=knowledge["asset_file"],
+        curriculum_file=knowledge["curriculum_file"],
+        asset_cfg_call=knowledge["asset_cfg_call"],
+        asset_constant_files=_constant_files(product),
+    )
 
 
 def get_robot_sources(robot_id: Optional[str] = None) -> RobotSources:
-    rid = robot_id or active_robot_id()
-    src = _ROBOTS.get(rid)
-    if src is None:
-        # 未登记的机器人:回退到默认,并留待补描述符(不假装能推导未知机器人)。
-        return _ROBOTS["robot.taili"]
-    return src
+    product = get_product(robot_id)
+    return _sources_from_product(product)

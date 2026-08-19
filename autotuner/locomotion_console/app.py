@@ -1211,6 +1211,7 @@ async def config_active() -> ConfigSetInfo:
         framework=summary(config_set.framework),
         llm=summary(config_set.llm),
         notes=list(config_set.notes),
+        contract=summary(config_set.contract) if config_set.contract is not None else None,
     )
 
 

@@ -38,7 +38,7 @@ from .taili_blind_config import (
     resolve_config_path,
     write_taili_blind_config,
 )
-from .runtime_manifest import initial_manifest, write_manifest
+from .runtime_manifest import initial_manifest, load_payload_manifest, load_product_contract, write_manifest
 
 _DEFAULT_CFG = load_taili_blind_config()
 DEFAULT_TASK = str(_DEFAULT_CFG["task"]["default_id"])
@@ -278,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
         telemetry_interval=args.telemetry_interval,
     )
     run_config = load_taili_blind_config(config_copy)
+    product_contract = load_product_contract(payload_root)
+    payload_manifest = load_payload_manifest(payload_root)
     metadata = {
         "run_id": run_id,
         "run_dir": str(run_dir),
@@ -288,6 +290,12 @@ def main(argv: list[str] | None = None) -> int:
         "effective_config": str(effective_cfg),
         "task": args.task,
         "resume_checkpoint": args.checkpoint,
+        "product_id": str(product_contract.get("product_id") or ""),
+        "product_version": str(product_contract.get("product_version") or ""),
+        "config_digest": str(product_contract.get("config_digest") or ""),
+        "asset_digest": str(product_contract.get("asset_digest") or ""),
+        "payload_digest": str(payload_manifest.get("payload_digest") or ""),
+        "runtime_digest": str(payload_manifest.get("runtime_digest") or product_contract.get("runtime", {}).get("digest", "")),
         "mode": args.mode,
         "training_recipe": get_config_value(run_config, "training_recipe", {}),
         "command": cmd,
@@ -299,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             "tensorboard_dir": str(run_dir),
             "effective_config": str(effective_cfg),
             "runtime_manifest": str(run_dir / "runtime_manifest.json"),
+            "payload_manifest": str(payload_root / "payload_manifest.json"),
         },
         "observability": {
             "telemetry_interval_steps": int(env["TAILI_TELEMETRY_INTERVAL"]),

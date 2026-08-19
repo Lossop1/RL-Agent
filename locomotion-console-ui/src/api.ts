@@ -135,6 +135,7 @@ export interface ConfigSetInfo {
   framework: ProfileSummary;
   llm: ProfileSummary;
   notes: string[];
+  contract?: ProfileSummary;
 }
 
 export interface FrameworkProfileInfo {

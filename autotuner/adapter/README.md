@@ -1,12 +1,19 @@
 # Taili Adapter Backend (`autotuner/adapter/`)
 
-This package is currently kept as a Taili-only dry-run support surface for the console.
+This package is currently kept as a Taili-only dry-run and compatibility surface for the console.
 It derives actuator/geometry/reward-threshold values from the Taili URDF, materializes local
 copies of env/asset files, and produces a deploy plan for review.
 
 It is not the active training deployment strategy. The training path should move to the packaged
 Taili blind runtime payload under `autotuner/training_payloads/taili_blind_runtime/`, so remote
 machines do not depend on a mutable `robot_lab` source tree.
+
+The authoritative artifact deployment API lives in `autotuner.execution`.
+Callers that already have a resolved payload should construct a
+`DeploymentSpec` and use `VersionedRemoteDeployer` (or the
+`VersionedPayloadDeployExecutor` bridge). The legacy `deploy.py` file-plan
+executor remains only to avoid breaking old ConfigSet workflows; it is not a
+second source of truth for runtime or payload identity.
 
 ## Command
 

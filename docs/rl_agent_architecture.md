@@ -275,14 +275,22 @@ permission: { object_class, ops, permission: auto|confirm|manual|forbidden, laye
 - **历史依据**：纠偏全集——"先查原因"、"动无关项"、"奥卡姆"、"全局"、"奖励会被钻空子"。
 
 ### 4.6 执行层 Execution
+- 当前实现入口为 `autotuner/execution/`。它是系统源码层，不属于任何 Taili
+  或其他机器人产品；IsaacLab/Isaac Sim/PhysX 是由 runtime identity 引用的
+  外部不可变运行时，产品 payload 只携带任务适配代码和资产。
 - 接口：
-  - `TrainingController`：fresh/resume/stop/status、检查点选择（依决策规则）
-  - `RemoteOps`：SSH 部署 payload、冷却重连、远程状态核对（"训练还在吗"一键真相）、
-    **远程能力探测与降级**（§6.4）
-  - `ResourceManager`：分两层——**监测与候选生成（工程）**：磁盘监控、占用报告、候选清单、归档动作；
-    **价值决策（研究）**：删/留/归档的判断进决策中心，走 §5.7
-  - `AuthorizationMatrix`：对象×操作×权限（auto/confirm/manual/forbidden），
-    操作确认与干预权分别管理（§6.3）
+  - `RuntimeIdentity` / `PayloadManifest`：为 runtime、产品合同和 payload 生成内容哈希，
+    并在运行 manifest 中记录声明证据与实际观测证据。
+  - `ChangeSet`：配置路径、源码精确补丁和 runtime 替换三类变更；应用前校验 base hash
+    与旧值，失败不写入，提交后保留可验证回滚日志。
+  - `ResumeCompatibility`：比较产品/任务、观测动作结构、网络、归一化、物理步长、
+    runtime 和配置身份；缺少证据时阻断 resume，而不是猜测兼容。
+  - `VersionedRemoteDeployer`：按 digest staging `runtime/payload`，按 run id staging
+    独立运行目录，校验后原子激活；回滚只切换 active 指针。
+  - 当前不把 `TrainingController`、资源清理策略或授权矩阵伪装成执行层实现。
+    进程生命周期、SSH 重连和人工确认仍由 `autotuner/infrastructure/` 及兼容适配器
+    承担；它们通过 `DeploymentSpec` 消费执行层产物，不能反向改变 digest 身份。
+    这些能力完成后再注册为独立接口，不在本次执行层边界内偷偷扩张。
 - **历史依据**：后端重启中断训练、15G 之谜、清理误删风险、SSH 冷却。
 
 ### 4.7 记忆层 Memory

@@ -179,9 +179,29 @@ class TrainingArchive:
         if not isinstance(data, Mapping):
             raise ValueError(f"run manifest must be an object: {path}")
         data = dict(data)
-        data.setdefault("run_dir", str(path.parent))
+        run = data.get("run") if isinstance(data.get("run"), Mapping) else {}
+        product = data.get("product") if isinstance(data.get("product"), Mapping) else {}
+        contract = data.get("resolved_contract") if isinstance(data.get("resolved_contract"), Mapping) else {}
+        payload = data.get("payload") if isinstance(data.get("payload"), Mapping) else {}
+        data.setdefault("run_id", run.get("run_id", ""))
+        data.setdefault("run_dir", run.get("run_dir", str(path.parent)))
+        data.setdefault("task_id", run.get("task", data.get("task", "")))
+        data.setdefault("product_id", product.get("id", ""))
+        data.setdefault("product_version", product.get("version", ""))
+        data.setdefault("config_digest", contract.get("config_digest", ""))
+        data.setdefault("asset_digest", contract.get("asset_digest", ""))
+        data.setdefault(
+            "payload_digest",
+            payload.get("digest") or contract.get("payload_digest") or contract.get("digest", ""),
+        )
+        data.setdefault("parent_checkpoint", data.get("resume_checkpoint", run.get("resume_checkpoint", "")))
+        data.setdefault("status", "unknown")
         record = TrainingRunRecord.from_mapping(data)
         return self.register(record, write_manifest=write_manifest)
+
+    def register_runtime_manifest(self, path: str | Path, *, write_manifest: bool = False) -> TrainingRunRecord:
+        """登记 payload 运行时 manifest，兼容嵌套的运行与合同字段。"""
+        return self.register_manifest(path, write_manifest=write_manifest)
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> TrainingRunRecord:

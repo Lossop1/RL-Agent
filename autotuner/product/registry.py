@@ -17,8 +17,9 @@ DEFAULT_PRODUCT_ROOT = PROJECT_ROOT / "config" / "products"
 
 
 class ProductRegistry:
-    def __init__(self, root: str | Path = DEFAULT_PRODUCT_ROOT):
+    def __init__(self, root: str | Path = DEFAULT_PRODUCT_ROOT, *, workspace_root: str | Path | None = None):
         self.root = Path(root)
+        self.workspace_root = Path(workspace_root) if workspace_root is not None else self.root.parent.parent
 
     def paths(self) -> Iterable[Path]:
         if not self.root.is_dir():
@@ -34,7 +35,7 @@ class ProductRegistry:
                 if not valid_only:
                     continue
                 raise
-            issues = product.validate(PROJECT_ROOT)
+            issues = product.validate(self.workspace_root)
             if valid_only and issues:
                 raise ProductManifestError(f"{path}: " + "; ".join(issues))
             products.append(product)
@@ -59,7 +60,8 @@ class ProductRegistry:
 
 def product_registry(root: str | Path | None = None) -> ProductRegistry:
     configured = root or os.environ.get("LOCOMOTION_PRODUCT_ROOT")
-    return ProductRegistry(configured or DEFAULT_PRODUCT_ROOT)
+    workspace = os.environ.get("LOCOMOTION_PRODUCT_WORKSPACE_ROOT")
+    return ProductRegistry(configured or DEFAULT_PRODUCT_ROOT, workspace_root=workspace)
 
 
 def get_product(product_id: str | None = None) -> ProductManifest:

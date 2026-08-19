@@ -751,6 +751,7 @@ class ConfigSetInfo(BaseModel):
     framework: ProfileSummaryInfo
     llm: ProfileSummaryInfo
     notes: List[str] = Field(default_factory=list)
+    contract: Optional[ProfileSummaryInfo] = None
 
 
 class DiagnosticStageStatus(BaseModel):

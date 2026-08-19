@@ -37,6 +37,9 @@ task:
   framework_id: taili_amp_blind
   train_entrypoint: autotuner.blind_locomotion.launch_taili_train:main
   diagnose_entrypoint: autotuner.blind_locomotion.diagnose_taili:main
+  requirements:
+    actor_observation: proprioceptive_only
+    deployment_requires_privileged_terrain: false
 
 sources:
   config: autotuner/blind_locomotion/taili_blind_config.yaml
@@ -62,3 +65,54 @@ assets:
 build:
   payload_builder: autotuner.training_payloads.taili_blind_runtime.build_payload:build_payload
   payload_package: taili_blind_runtime
+
+telemetry:
+  source: autotuner/blind_locomotion/telemetry_emit.py
+  contract: autotuner/blind_locomotion/telemetry_payloads.py
+
+diagnostics:
+  spec_asset: diagnostic_spec
+  suite_root: tools/isaaclab_quad_diag_observation/suites
+
+deployment:
+  runtime_package: taili_blind_runtime
+  privileged_information_required: false
+
+runtime:
+  backend: isaaclab
+  runtime_id: isaaclab-taili-isaacsim
+  # Product task identity above is logical. These are the concrete Gym IDs
+  # registered by the payload inside the external IsaacLab runtime.
+  task_ids:
+    - RobotLab-Isaac-Taili-Blind-Direct-v0
+    - RobotLab-Isaac-Taili-AMP-Blind-Direct-v0
+  # The remote environment is installed outside the product payload. These
+  # declarations identify the environment; the running payload records the
+  # observed versions in runtime_manifest.json.
+  isaaclab_version: declared-by-remote-runtime
+  isaac_sim_version: declared-by-remote-runtime
+  physx_version: declared-by-remote-runtime
+  python: declared-by-remote-runtime
+  environment: isaaclab
+
+compatibility:
+  # These are execution identities, not reward or curriculum settings. A
+  # product adapter must update them whenever checkpoint structure changes.
+  observation_structure: taili.proprio.command.v1
+  action_structure: taili.joint-position.v1
+  network_structure: taili.amp-policy.v1
+  normalization: taili.observation-normalizer.v1
+  physics_timestep: declared-by-task-runtime
+
+knowledge:
+  reward_file: autotuner/taili_core/taili_reward.py
+  reward_func: compute_reward_components
+  reward_cfg_class: RewardConfig
+  reward_gate_const: REWARD_GROUP_GATES
+  reward_group_const: _REWARD_GROUP_OF
+  env_reward_file: autotuner/blind_locomotion/blind_tp_env.py
+  asset_file: autotuner/blind_locomotion/assets/taili.py
+  curriculum_file: autotuner/blind_locomotion/taili_amp_env_cfg.py
+  asset_cfg_call: ArticulationCfg
+  asset_constant_files:
+    geometry: autotuner/taili_core/taili_geometry.py

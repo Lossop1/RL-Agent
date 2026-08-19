@@ -85,6 +85,8 @@ class LocomotionConsoleSettings:
     run_filter: str = os.environ.get("LOCOMOTION_CONSOLE_RUN", "")
     # Active framework profile. The default is the current non-teacher draft framework.
     framework_id: str = os.environ.get("LOCOMOTION_CONSOLE_FRAMEWORK", DEFAULT_FRAMEWORK_ID)
+    # Active product id. Empty means the product registry may select its only product.
+    product_id: str = os.environ.get("LOCOMOTION_PRODUCT_ID", "")
     # Remote log path the real source tails (the training pipe). Overridable per box.
     remote_log_path: str = os.environ.get("LOCOMOTION_CONSOLE_REMOTE_LOG", "")
     # Log format key under config/log_formats/ used by parse_log.
@@ -132,6 +134,7 @@ def get_settings() -> LocomotionConsoleSettings:
         poll_interval_s=float(os.environ.get("LOCOMOTION_CONSOLE_POLL_S", "1.0")),
         run_filter=os.environ.get("LOCOMOTION_CONSOLE_RUN", ""),
         framework_id=framework_id,
+        product_id=os.environ.get("LOCOMOTION_PRODUCT_ID", ""),
         remote_log_path=_remote_or_env(remote_cfg, "LOCOMOTION_CONSOLE_REMOTE_LOG", "remote_log_path", ""),
         log_format=_remote_or_env(remote_cfg, "LOCOMOTION_CONSOLE_LOG_FORMAT", "log_format", "skrl"),
         ui_origin=os.environ.get("LOCOMOTION_CONSOLE_UI_ORIGIN", "http://localhost:5173"),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import argparse
 import shutil
@@ -16,6 +17,8 @@ from .payload_manifest import (
     iter_payload_files,
     validate_manifest,
 )
+from autotuner.execution.payload import build_payload_manifest, verify_payload_archive
+from autotuner.product import resolve_product_contract
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,8 @@ class BuildResult:
     build_dir: Path
     root_name: str
     file_count: int
+    payload_digest: str
+    manifest: Path
 
 
 def build_payload(
@@ -53,12 +58,26 @@ def build_payload(
         target.write_text(text, encoding="utf-8", newline="\n")
         count += 1
 
+    contract = resolve_product_contract("taili", root=ROOT)
+    contract_target = build_root / RUNTIME_PACKAGE / "product_contract.json"
+    contract_target.parent.mkdir(parents=True, exist_ok=True)
+    contract.write(contract_target)
+    count += 1
+    runtime_target = build_root / RUNTIME_PACKAGE / "runtime_identity.json"
+    runtime_target.write_text(json.dumps(contract.runtime, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    count += 1
+
     for src, dst in iter_payload_files(ROOT):
         target = build_root / dst
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, target)
         count += 1
 
+    payload_manifest = build_payload_manifest(build_root, contract=contract)
+    embedded_manifest = build_root / "payload_manifest.json"
+    payload_manifest.write(embedded_manifest)
+    count += 1
+    archive = output_dir / f"{RUNTIME_PACKAGE}_{stamp}_{payload_manifest.payload_digest[:12]}.tar.gz"
     if archive.exists():
         archive.unlink()
     with tarfile.open(archive, "w:gz") as tar:
@@ -66,7 +85,23 @@ def build_payload(
             if path.is_file():
                 tar.add(path, arcname=path.relative_to(build_root))
 
-    result = BuildResult(archive=archive, build_dir=build_root, root_name=archive.name[:-7], file_count=count)
+    archive_errors = verify_payload_archive(archive, payload_manifest)
+    if archive_errors:
+        archive.unlink(missing_ok=True)
+        shutil.rmtree(build_root, ignore_errors=True)
+        raise RuntimeError("payload archive failed post-build verification:\n" + "\n".join(archive_errors))
+
+    manifest_path = output_dir / f"{RUNTIME_PACKAGE}_{stamp}_{payload_manifest.payload_digest[:12]}.manifest.json"
+    payload_manifest.write(manifest_path)
+
+    result = BuildResult(
+        archive=archive,
+        build_dir=build_root,
+        root_name=archive.name[:-7],
+        file_count=count,
+        payload_digest=payload_manifest.payload_digest,
+        manifest=manifest_path,
+    )
     if not keep_build_dir:
         shutil.rmtree(build_root, ignore_errors=True)
     return result

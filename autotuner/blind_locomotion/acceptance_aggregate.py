@@ -15,7 +15,13 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, List
 
-from autotuner.blind_locomotion import acceptance_score as ACC
+try:
+    from . import acceptance_score as ACC
+except ImportError:
+    try:
+        import acceptance_score as ACC
+    except ImportError:
+        from autotuner.blind_locomotion import acceptance_score as ACC
 
 # matches a scorecard line: leading gate key, PASS/FAIL, then detail
 _LINE = re.compile(r"^\s*([A-Z]\d?(?:\[[^\]]+\])?)\s+(PASS|FAIL)\s+(.*?)\s*$")

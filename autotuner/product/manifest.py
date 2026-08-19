@@ -103,6 +103,16 @@ class ProductManifest:
     payload_builder: str = ""
     payload_package: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Logical task identity is product-owned. Runtime registration IDs are
+    # kept separately because an IsaacLab/Gym process may expose aliases.
+    runtime_task_ids: tuple[str, ...] = ()
+    task_requirements: Mapping[str, Any] = field(default_factory=dict)
+    telemetry: Mapping[str, Any] = field(default_factory=dict)
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    deployment: Mapping[str, Any] = field(default_factory=dict)
+    runtime: Mapping[str, Any] = field(default_factory=dict)
+    compatibility: Mapping[str, Any] = field(default_factory=dict)
+    knowledge: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ProductManifest":
@@ -111,6 +121,7 @@ class ProductManifest:
         task = _mapping(data.get("task"), "task")
         build = _mapping(data.get("build"), "build")
         sources = _mapping(data.get("sources"), "sources")
+        runtime = _mapping(data.get("runtime"), "runtime")
 
         robot_id = _string(robot_data.get("id"), "robot.id")
         robot = RobotProfile(
@@ -150,6 +161,7 @@ class ProductManifest:
             status=_string(product.get("status", "draft"), "product.status"),
             robot=robot,
             task_id=_string(task.get("id"), "task.id"),
+            runtime_task_ids=_tuple_strings(runtime.get("task_ids"), "runtime.task_ids"),
             task_family=_string(task.get("family"), "task.family"),
             framework_id=_string(task.get("framework_id"), "task.framework_id"),
             train_entrypoint=_string(task.get("train_entrypoint"), "task.train_entrypoint"),
@@ -157,9 +169,16 @@ class ProductManifest:
             config_path=_string(sources.get("config"), "sources.config"),
             source_roots=_tuple_strings(sources.get("roots"), "sources.roots"),
             sources={str(key): _string(value, f"sources.{key}") for key, value in sources.items() if key != "roots"},
+            task_requirements=dict(_mapping(task.get("requirements"), "task.requirements")),
             assets=assets,
             payload_builder=_string(build.get("payload_builder", ""), "build.payload_builder", required=False),
             payload_package=_string(build.get("payload_package", ""), "build.payload_package", required=False),
+            telemetry=dict(_mapping(data.get("telemetry"), "telemetry")),
+            diagnostics=dict(_mapping(data.get("diagnostics"), "diagnostics")),
+            deployment=dict(_mapping(data.get("deployment"), "deployment")),
+            runtime=dict(runtime),
+            compatibility=dict(_mapping(data.get("compatibility"), "compatibility")),
+            knowledge=dict(_mapping(data.get("knowledge"), "knowledge")),
             metadata=dict(_mapping(data.get("metadata"), "metadata")),
         )
         return manifest
@@ -179,6 +198,9 @@ class ProductManifest:
         ):
             if not _ID_RE.fullmatch(value):
                 issues.append(f"{name} has unsafe id: {value!r}")
+        for runtime_task_id in self.runtime_task_ids:
+            if not _ID_RE.fullmatch(runtime_task_id):
+                issues.append(f"runtime_task_id has unsafe id: {runtime_task_id!r}")
         if self.robot.dof <= 0:
             issues.append("robot.dof must be positive")
         if self.robot.dof != len(self.robot.joint_order):

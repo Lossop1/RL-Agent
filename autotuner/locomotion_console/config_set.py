@@ -14,7 +14,7 @@ from typing import Literal
 from .config import LocomotionConsoleSettings
 from .config_manager import effective_remote_config, llm_profile
 from .framework_profile import FrameworkProfile, get_framework_profile
-from .robot_profile import get_robot_profile
+from autotuner.product import ContractResolutionError, ProductManifest, get_product, resolve_product_contract
 
 
 ProfileStatus = Literal["draft", "validated", "reference", "missing", "configured"]
@@ -39,6 +39,7 @@ class ConfigSet:
     framework: ProfileSummary
     llm: ProfileSummary
     notes: tuple[str, ...] = field(default_factory=tuple)
+    contract: ProfileSummary | None = None
 
 
 def _load_json(path: Path) -> dict:
@@ -73,13 +74,35 @@ def _llm_summary(settings: LocomotionConsoleSettings) -> ProfileSummary:
     )
 
 
-def _robot_summary() -> ProfileSummary:
-    profile = get_robot_profile()
+def _robot_summary(product: ProductManifest) -> ProfileSummary:
+    profile = product.robot_profile()
     return ProfileSummary(
         id=profile.id,
         label=profile.label,
         status=profile.status,
         detail=f"{profile.dof} DoF; diagnostic spec {profile.diagnostic_spec}; {profile.note}",
+    )
+
+
+def _contract_summary(product: ProductManifest) -> ProfileSummary:
+    try:
+        contract = resolve_product_contract(product)
+    except (ContractResolutionError, OSError, ValueError) as exc:
+        return ProfileSummary(
+            id=f"contract:{product.product_id}",
+            label="Resolved product contract",
+            status="missing",
+            detail=str(exc),
+        )
+    return ProfileSummary(
+        id=f"contract:{product.product_id}:{contract.contract_digest[:12]}",
+        label="Resolved product contract",
+        status="validated" if not contract.issues else "draft",
+        detail=(
+            f"config={contract.config_digest[:12] or 'missing'}; "
+            f"assets={contract.asset_digest[:12]}; "
+            f"contract={contract.contract_digest[:12]}"
+        ),
     )
 
 
@@ -93,21 +116,24 @@ def _framework_summary(profile: FrameworkProfile) -> ProfileSummary:
 
 
 def get_active_config_set(settings: LocomotionConsoleSettings) -> ConfigSet:
+    product = get_product(settings.product_id)
     framework = get_framework_profile(settings.framework_id)
+    contract = _contract_summary(product)
     return ConfigSet(
-        id=f"taili-default:{framework.id}",
-        label="Taili 默认框架适配工作区",
-        status="draft",
+        id=f"{product.product_id}:{framework.id}",
+        label=f"{product.label} product workspace",
+        status="validated" if contract.status == "validated" else "draft",
         task_goal=(
-            "构建 Taili 运动框架适配闭环：用框架组件承载能力，"
-            "由 Adapter 派生机器人专属配置，再用检查点诊断和可视化验证交付。"
+            f"为 {product.label} 解析产品资产和任务要求，生成训练、监控、诊断与部署合同，"
+            "再由确定性运行链执行并记录可追溯证据。"
         ),
         remote=_remote_summary(settings),
-        robot=_robot_summary(),
+        robot=_robot_summary(product),
         framework=_framework_summary(framework),
         llm=_llm_summary(settings),
+        contract=contract,
         notes=(
             "LLM 只负责建议、发现和叙述；确定性代码负责执行、守门和验证。",
-            "当前框架仍是 draft 档案；诊断以 checkpoint 为中心，也可能包含 reference checkpoint。",
+            "产品特定配置和诊断必须通过 resolved contract 绑定，不能由控制台猜测。",
         ),
     )

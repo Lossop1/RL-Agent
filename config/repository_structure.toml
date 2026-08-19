@@ -68,6 +68,14 @@ structure_check = "python tools/check_repository_structure.py"
 "autotuner.training" = [
   "autotuner.locomotion_console",
 ]
+"autotuner.execution" = [
+  "autotuner.product",
+  "autotuner.locomotion_console",
+  "autotuner.blind_locomotion",
+  "autotuner.taili_core",
+  "autotuner.taili_ops",
+  "autotuner.training",
+]
 
 [compatibility]
 modules = [
@@ -91,4 +99,3 @@ modules = [
   "autotuner.locomotion_console.gate_calibration",
   "autotuner.locomotion_console.campaign_journal",
 ]
-

@@ -7,13 +7,26 @@ available in the Python environment and on this payload being on PYTHONPATH.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import random
 import sys
 import traceback
+from typing import Any, Mapping
 
 from isaaclab.app import AppLauncher
+
+try:
+    # Prefer the compatibility checker shipped inside the payload.  Falling
+    # back to a remote/source-tree package would make resume identity depend
+    # on an unrelated checkout.
+    from .resume_compatibility import check_resume_compatibility  # type: ignore
+except ImportError:  # source-tree compatibility: the helper lives in execution/
+    try:
+        from autotuner.execution.compatibility import check_resume_compatibility
+    except ImportError:
+        check_resume_compatibility = None  # type: ignore
 
 if __name__ == "__main__" and __package__:
     # ``python -m taili_blind_runtime.train_taili`` executes as ``__main__``;
@@ -25,6 +38,7 @@ try:
         REQUIRED_OPTIMIZATION_FIELDS,
         capture_optimization_state,
         capture_runtime_execution,
+        capture_runtime_identity,
         checkpoint_inventory,
         initial_manifest,
         update_manifest,
@@ -35,6 +49,7 @@ except ImportError:  # payload package is also executed as a top-level module.
         REQUIRED_OPTIMIZATION_FIELDS,
         capture_optimization_state,
         capture_runtime_execution,
+        capture_runtime_identity,
         checkpoint_inventory,
         initial_manifest,
         update_manifest,
@@ -76,26 +91,86 @@ def _state_ready(snapshot: dict) -> bool:
     return all(isinstance(fields.get(name), dict) and fields[name].get("status") in accepted for name in REQUIRED_OPTIMIZATION_FIELDS)
 
 
+def _load_parent_manifest(checkpoint: str) -> tuple[Path, dict]:
+    """Load the immutable parent run evidence without touching the agent."""
+    parent_run = Path(checkpoint).resolve().parent.parent
+    manifest_path = parent_run / "runtime_manifest.json"
+    try:
+        parent = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        parent = {}
+    return manifest_path, parent if isinstance(parent, dict) else {}
+
+
+def _resume_identity_preflight(
+    checkpoint: str,
+    inventory: dict,
+    current_manifest: dict,
+) -> dict:
+    """Prove checkpoint identity compatibility before ``agent.load``.
+
+    Loading a mismatched checkpoint can fail with a low-level tensor-shape
+    error or, worse, partially mutate an agent before the error is raised.
+    Identity comparison is therefore a separate preflight stage. Complete
+    optimizer/curriculum/RNG restoration is checked later, after loading.
+    """
+    if not checkpoint:
+        return {
+            "status": "proven",
+            "decision": "fresh",
+            "compatible": True,
+            "compatibility": {"decision": "fresh", "compatible": True},
+        }
+    manifest_path, parent = _load_parent_manifest(checkpoint)
+    if check_resume_compatibility is None:
+        return {
+            "status": "blocked",
+            "decision": "blocked",
+            "compatible": False,
+            "parent_manifest": str(manifest_path),
+            "reasons": ["resume compatibility implementation is unavailable"],
+            "compatibility": {"decision": "blocked", "compatible": False},
+        }
+    decision = check_resume_compatibility(
+        parent,
+        current_manifest,
+        checkpoint=inventory,
+        requested=True,
+        strict=True,
+    )
+    return {
+        "status": "proven" if decision.compatible else "blocked",
+        "decision": decision.decision,
+        "compatible": decision.compatible,
+        "parent_manifest": str(manifest_path),
+        "reasons": list(decision.reasons),
+        "compatibility": decision.to_dict(),
+    }
+
+
 def _resume_parity(
     checkpoint: str,
     inventory: dict,
     snapshot: dict,
+    *,
+    current_manifest: dict | None = None,
+    identity_preflight: Mapping[str, Any] | None = None,
 ) -> tuple[bool, dict]:
     """Require a parent runtime manifest before calling a resume complete."""
     if not checkpoint:
         ready = _state_ready(snapshot)
         return ready, {"mode": "fresh", "status": "proven" if ready else "blocked", "restored": {}}
 
-    parent_run = Path(checkpoint).resolve().parent.parent
-    parent_manifest_path = parent_run / "runtime_manifest.json"
-    parent: dict = {}
-    try:
-        import json
-
-        parent = json.loads(parent_manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError):
-        parent = {}
-    checkpoint_keys = set(str(item) for item in inventory.get("keys", []))
+    parent_manifest_path, parent = _load_parent_manifest(checkpoint)
+    parent_run = parent_manifest_path.parent
+    raw_keys = inventory.get("keys", []) if isinstance(inventory, dict) else []
+    raw_key_paths = inventory.get("key_paths", []) if isinstance(inventory, dict) else []
+    raw_keys = raw_keys if isinstance(raw_keys, (list, tuple, set)) else []
+    raw_key_paths = raw_key_paths if isinstance(raw_key_paths, (list, tuple, set)) else []
+    checkpoint_keys = {
+        str(item).lower().replace("\\", ".")
+        for item in (*raw_keys, *raw_key_paths)
+    }
     # skrl checkpoint naming is version-dependent; accept the known aliases but
     # never infer optimizer/curriculum/RNG restoration from actor weights alone.
     key_aliases = {
@@ -106,7 +181,7 @@ def _resume_parity(
         "amp": {"amp", "discriminator"},
     }
     restored = {
-        name: bool(any(alias in checkpoint_keys for alias in aliases))
+        name: bool(any(alias == key or alias in key for alias in aliases for key in checkpoint_keys))
         for name, aliases in key_aliases.items()
     }
     parent_state = parent.get("optimization_state") if isinstance(parent, dict) else None
@@ -127,6 +202,19 @@ def _resume_parity(
         "rng": bool(parent_complete and parent_fields.get("rng")),
     })
     parity = bool(inventory.get("status") == "captured" and parent_complete and current_complete and all(restored.values()))
+    compatibility: dict[str, Any] = {"status": "not_evaluated"}
+    if identity_preflight is not None:
+        compatibility = dict(identity_preflight.get("compatibility") or {})
+    elif current_manifest is not None and check_resume_compatibility is not None:
+        decision = check_resume_compatibility(
+            parent,
+            current_manifest,
+            checkpoint=inventory,
+            requested=True,
+            strict=True,
+        )
+        compatibility = decision.to_dict()
+        parity = parity and decision.compatible
     return parity, {
         "mode": "resume",
         "status": "proven" if parity else "blocked",
@@ -134,6 +222,7 @@ def _resume_parity(
         "parent_manifest": str(parent_manifest_path),
         "checkpoint_inventory": inventory,
         "restored": restored,
+        "compatibility": compatibility,
     }
 
 
@@ -244,9 +333,12 @@ def main(argv: list[str] | None = None) -> None:
             args.agent_yaml,
         ),
     )
+    current_before_execution = json.loads(runtime_path.read_text(encoding="utf-8")) if runtime_path.is_file() else {}
+    runtime_evidence = capture_runtime_identity(current_before_execution.get("runtime", {}))
     update_manifest(
         runtime_path,
         runtime_execution=runtime_execution,
+        runtime_evidence=runtime_evidence,
         run={"seed": experiment_cfg.get("seed"), "skrl_version": skrl.__version__},
     )
     run_dir = Path(os.environ.get("TAILI_RUN_DIR", runtime_path.parent))
@@ -257,6 +349,26 @@ def main(argv: list[str] | None = None) -> None:
             "path": "",
             "keys": [],
         }
+        current_manifest = json.loads(runtime_path.read_text(encoding="utf-8"))
+        identity_preflight = _resume_identity_preflight(args.checkpoint, inventory, current_manifest)
+        update_manifest(runtime_path, resume_preflight=identity_preflight)
+        if args.checkpoint and identity_preflight.get("status") != "proven":
+            _write_preflight(
+                runtime_path,
+                {
+                    "schema_version": "rl-agent.runtime-preflight/v1",
+                    "status": "blocked",
+                    "runtime_execution_status": runtime_execution.get("status"),
+                    "resume_identity_status": identity_preflight.get("status"),
+                    "checkpoint": args.checkpoint,
+                    "reason": "checkpoint identity is incompatible; agent.load was not attempted",
+                    "reasons": identity_preflight.get("reasons", []),
+                },
+            )
+            raise RuntimeError(
+                "Taili resume blocked before checkpoint load; inspect "
+                f"{run_dir / 'runtime_preflight.json'}"
+            )
         if args.checkpoint:
             runner.agent.load(args.checkpoint)
             if hasattr(runner.agent, "set_running_mode"):
@@ -272,7 +384,13 @@ def main(argv: list[str] | None = None) -> None:
             parity_check=False,
             resume=bool(args.checkpoint),
         )
-        parity, resume_edge = _resume_parity(args.checkpoint, inventory, snapshot)
+        parity, resume_edge = _resume_parity(
+            args.checkpoint,
+            inventory,
+            snapshot,
+            current_manifest=current_manifest,
+            identity_preflight=identity_preflight,
+        )
         snapshot["parity_check"] = parity
         snapshot["status"] = "proven" if _state_ready(snapshot) and parity else snapshot.get("status", "missing")
         update_manifest(
@@ -281,14 +399,20 @@ def main(argv: list[str] | None = None) -> None:
             resume_edge=resume_edge,
         )
         write_manifest(run_dir / "optimization_state.json", snapshot)
+        runtime_evidence_status = str(runtime_evidence.get("status") or "unknown")
+        runtime_evidence_ok = runtime_evidence_status not in {"mismatch", "invalid"}
         preflight = {
             "schema_version": "rl-agent.runtime-preflight/v1",
-            "status": "pass" if runtime_execution.get("status") == "proven" and snapshot.get("status") == "proven" else "blocked",
+            # ``observed`` is intentionally not reported as ``matched``:
+            # package observations cannot prove an immutable remote image.
+            "status": "pass" if runtime_execution.get("status") == "proven" and snapshot.get("status") == "proven" and runtime_evidence_ok else "blocked",
             "runtime_execution_status": runtime_execution.get("status"),
+            "runtime_evidence_status": runtime_evidence_status,
+            "runtime_identity_proven": runtime_evidence_status == "matched",
             "optimization_state_status": snapshot.get("status"),
             "resume_status": resume_edge.get("status"),
             "checkpoint": args.checkpoint,
-            "reason": "" if runtime_execution.get("status") == "proven" and snapshot.get("status") == "proven" else "runtime source or optimization/resume evidence is incomplete",
+            "reason": "" if runtime_execution.get("status") == "proven" and snapshot.get("status") == "proven" and runtime_evidence_ok else "runtime source, runtime identity, or optimization/resume evidence is incomplete",
         }
         _write_preflight(runtime_path, preflight)
         if preflight["status"] != "pass" and not args.allow_unverified_runtime:

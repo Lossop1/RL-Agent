@@ -1,20 +1,21 @@
 """Taili 盲态运行 payload 的清单和静态检查。"""
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import tempfile
 from typing import Iterable
 
+from autotuner.product import ContractResolutionError, get_product, resolve_product_contract
 from autotuner.taili_core import taili_geometry
 
 
 RUNTIME_PACKAGE = "taili_blind_runtime"
-TASK_IDS = (
-    "RobotLab-Isaac-Taili-Blind-Direct-v0",
-    "RobotLab-Isaac-Taili-AMP-Blind-Direct-v0",
-)
+PRODUCT = get_product("taili")
+PRODUCT_ID = PRODUCT.product_id
+TASK_IDS = PRODUCT.runtime_task_ids
 
 ROOT = Path(__file__).resolve().parents[3]
 PAYLOAD_DIR = Path(__file__).resolve().parent
@@ -37,6 +38,9 @@ STATIC_FILES: tuple[tuple[str, str], ...] = (
     ("autotuner/blind_locomotion/telemetry_emit.py", f"{RUNTIME_PACKAGE}/telemetry_emit.py"),
     ("autotuner/blind_locomotion/telemetry_payloads.py", f"{RUNTIME_PACKAGE}/telemetry_payloads.py"),
     ("autotuner/blind_locomotion/runtime_manifest.py", f"{RUNTIME_PACKAGE}/runtime_manifest.py"),
+    ("autotuner/execution/runtime.py", f"{RUNTIME_PACKAGE}/runtime_identity.py"),
+    ("autotuner/execution/hashing.py", f"{RUNTIME_PACKAGE}/execution_hashing.py"),
+    ("autotuner/execution/compatibility.py", f"{RUNTIME_PACKAGE}/resume_compatibility.py"),
     ("autotuner/blind_locomotion/launch_taili_train.py", f"{RUNTIME_PACKAGE}/launch_taili_train.py"),
     ("autotuner/blind_locomotion/train_taili.py", f"{RUNTIME_PACKAGE}/train_taili.py"),
     ("autotuner/blind_locomotion/calibrate_taili_gates.py", f"{RUNTIME_PACKAGE}/calibrate_taili_gates.py"),
@@ -144,7 +148,13 @@ def iter_payload_files(root: Path = ROOT) -> Iterable[tuple[Path, str]]:
 
 def validate_manifest(root: Path = ROOT) -> ValidationReport:
     report = ValidationReport(generated=dict(GENERATED_FILES))
+    report.generated[f"{RUNTIME_PACKAGE}/product_contract.json"] = "resolved from product manifest"
     seen_dest: set[str] = set()
+
+    try:
+        resolve_product_contract(PRODUCT, root=root)
+    except (ContractResolutionError, OSError, ValueError) as exc:
+        report.errors.append(f"product contract invalid: {exc}")
 
     for src, dst in iter_payload_files(root):
         report.files.append((src, dst))
@@ -223,6 +233,32 @@ def _validate_yaml_contract(root: Path, report: ValidationReport) -> None:
 def _validate_registration_contract(root: Path, report: ValidationReport) -> None:
     init_py = root / "autotuner" / "blind_locomotion" / "__init__.py"
     text = init_py.read_text(encoding="utf-8", errors="replace")
+    if not TASK_IDS:
+        report.errors.append("product manifest must declare at least one runtime task ID")
+    else:
+        try:
+            tree = ast.parse(text, filename=str(init_py))
+            source_task_ids: tuple[str, ...] | None = None
+            for node in tree.body:
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                    value = node.value
+                elif isinstance(node, ast.AnnAssign):
+                    targets = [node.target]
+                    value = node.value
+                else:
+                    continue
+                if any(isinstance(target, ast.Name) and target.id == "TASK_IDS" for target in targets):
+                    literal = ast.literal_eval(value)
+                    source_task_ids = tuple(str(item) for item in literal)
+                    break
+            if source_task_ids != tuple(TASK_IDS):
+                report.errors.append(
+                    "product runtime.task_ids do not match the adapter's registered TASK_IDS"
+                )
+        except (SyntaxError, ValueError, TypeError) as exc:
+            report.errors.append(f"cannot validate adapter TASK_IDS: {type(exc).__name__}: {exc}")
     if ".blind_tp_env:TailiBlindTPEnv" not in text:
         report.errors.append("task entry point must resolve to package-local blind_tp_env:TailiBlindTPEnv")
     if ".taili_blind_env_cfg:TailiBlindEnvCfg" not in text:

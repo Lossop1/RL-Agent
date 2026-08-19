@@ -22,6 +22,13 @@ import sys
 import time
 from typing import Any, Iterable, Mapping
 
+try:
+    # Prefer the copy shipped beside the payload.  An unrelated remote
+    # ``autotuner`` checkout must not shadow the payload's runtime identity.
+    from .runtime_identity import capture_runtime_identity  # type: ignore
+except ImportError:  # source-tree compatibility: the helper lives in execution/
+    from autotuner.execution.runtime import capture_runtime_identity
+
 
 SCHEMA_VERSION = "rl-agent.runtime-manifest/v1"
 REQUIRED_OPTIMIZATION_FIELDS = (
@@ -86,6 +93,37 @@ def file_digest(path: str | os.PathLike[str], *, root: Path | None = None) -> di
     if candidate.is_file():
         item["sha256"] = sha256_file(candidate)
     return item
+
+
+def load_product_contract(payload_root: str | os.PathLike[str]) -> dict[str, Any]:
+    """读取 payload 构建时生成的产品合同，不依赖仓库源码。"""
+    root = Path(payload_root)
+    candidates = (
+        root / "taili_blind_runtime" / "product_contract.json",
+        root / "product_contract.json",
+    )
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(data, Mapping):
+            return dict(data)
+    return {}
+
+
+def load_payload_manifest(payload_root: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read the content-addressed payload manifest without importing system code."""
+    root = Path(payload_root)
+    candidates = (root / "payload_manifest.json", root / "taili_blind_runtime" / "payload_manifest.json")
+    for path in candidates:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if isinstance(data, Mapping):
+            return dict(data)
+    return {}
 
 
 def _json_safe(value: Any, *, depth: int = 0, limit: int = 32) -> Any:
@@ -324,11 +362,23 @@ def checkpoint_inventory(path: str | os.PathLike[str], *, torch_module: Any = No
     try:
         payload = torch_module.load(str(candidate), map_location="cpu", weights_only=False)
         keys = sorted(str(key) for key in payload) if isinstance(payload, Mapping) else []
+        key_paths: list[str] = []
+
+        def collect(value: Any, prefix: str = "", depth: int = 0) -> None:
+            if depth > 3 or not isinstance(value, Mapping):
+                return
+            for key, child in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                key_paths.append(path)
+                collect(child, path, depth + 1)
+
+        collect(payload)
         return {
             "status": "captured",
             "path": str(candidate),
             **file_digest(candidate),
             "keys": keys,
+            "key_paths": sorted(set(key_paths)),
         }
     except Exception as exc:  # pragma: no cover - depends on checkpoint version
         return {
@@ -336,6 +386,7 @@ def checkpoint_inventory(path: str | os.PathLike[str], *, torch_module: Any = No
             "path": str(candidate),
             **file_digest(candidate),
             "keys": [],
+            "key_paths": [],
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -411,10 +462,18 @@ def initial_manifest(
     run_path = Path(run_dir)
     telemetry_path = os.environ.get("TAILI_TELEMETRY_JSONL") or str(run_path / "train.telemetry.jsonl")
     checkpoint_path = os.environ.get("TAILI_CHECKPOINT_DIR") or str(run_path / "checkpoints")
+    product_contract = load_product_contract(payload_root)
+    payload_manifest = load_payload_manifest(payload_root)
+    product_data = {
+        "id": str(product_contract.get("product_id") or ""),
+        "version": str(product_contract.get("product_version") or ""),
+        "digest": str(product_contract.get("contract_digest") or ""),
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": utc_now(),
         "program_id": "taili_blind_locomotion",
+        "product": product_data,
         "status": "running",
         "run": {
             "run_id": str(run_id),
@@ -441,6 +500,25 @@ def initial_manifest(
             "effective_config": file_digest(effective_config),
             "agent_config": file_digest(agent_config),
         },
+        "resolved_contract": {
+            "status": "captured" if product_contract else "missing",
+            "path": str(Path(payload_root) / "taili_blind_runtime" / "product_contract.json"),
+            "digest": str(product_contract.get("contract_digest") or ""),
+            "contract_digest": str(product_contract.get("contract_digest") or ""),
+            "config_digest": str(product_contract.get("config_digest") or ""),
+            "asset_digest": str(product_contract.get("asset_digest") or ""),
+            "source_digest": str(product_contract.get("source_digest") or ""),
+            "payload_digest": str(payload_manifest.get("payload_digest") or ""),
+        },
+        "payload": {
+            "status": "captured" if payload_manifest else "missing",
+            "path": str(Path(payload_root) / "payload_manifest.json"),
+            "digest": str(payload_manifest.get("payload_digest") or ""),
+            "runtime_digest": str(payload_manifest.get("runtime_digest") or ""),
+        },
+        "runtime": product_contract.get("runtime", {}),
+        "compatibility": product_contract.get("compatibility", {}),
+        "runtime_evidence": capture_runtime_identity(product_contract.get("runtime", {})),
         "policy_contract_ref": os.environ.get("TAILI_POLICY_CONTRACT_REF", ""),
         "distribution_manifest_ref": os.environ.get("TAILI_DISTRIBUTION_MANIFEST_REF", ""),
         "contract_bundle_ref": os.environ.get("TAILI_CONTRACT_BUNDLE_REF", ""),
@@ -510,6 +588,8 @@ __all__ = [
     "checkpoint_inventory",
     "file_digest",
     "initial_manifest",
+    "load_product_contract",
+    "load_payload_manifest",
     "sha256_file",
     "update_manifest",
     "utc_now",

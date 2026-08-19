@@ -1,70 +1,40 @@
-"""Robot profile registry for locomotion console configuration.
+"""控制台的机器人档案兼容入口。
 
-V0 keeps Taili as a typed profile instead of a hardcoded paragraph. The profile
-is intentionally conservative: identity and mapping are inspectable and
-validatable, but not arbitrary-editable until the framework/profile contract is
-stable enough to protect users from broken body mappings.
+真正的产品档案由 ``autotuner.product`` 管理。保留本模块是为了兼容旧的
+控制台导入路径，但这里不再保存任何具体机器人的默认结构。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Literal
+
+from autotuner.product import RobotProfile, get_product
 
 
 RobotProfileStatus = Literal["draft", "validated", "missing"]
 
 
-@dataclass(frozen=True)
-class RobotProfile:
-    id: str
-    label: str
-    status: RobotProfileStatus
-    dof: int
-    base_link: str
-    joint_order: tuple[str, ...]
-    leg_order: tuple[str, ...]
-    foot_links: tuple[str, ...]
-    diagnostic_spec: str
-    capabilities: tuple[str, ...] = field(default_factory=tuple)
-    note: str = ""
+def get_robot_profile(robot_id: str | None = None) -> RobotProfile:
+    """返回显式或当前产品的机器人档案。"""
+    return get_product(robot_id).robot_profile()
 
 
-TAILI_PROFILE = RobotProfile(
-    id="robot.taili",
-    label="Taili quadruped",
-    status="draft",
-    dof=12,
-    base_link="base",
-    joint_order=(
-        "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
-        "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
-        "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
-    ),
-    leg_order=("FL", "FR", "RL", "RR"),
-    foot_links=("FL_foot", "FR_foot", "RL_foot", "RR_foot"),
-    diagnostic_spec="taili.yaml",
-    capabilities=("quadruped_12dof", "blind_actor", "amp_reference"),
-    note="URDF/asset mapping is usable for diagnostics, but still marked draft until hardware mapping is fully audited.",
-)
-
-
-def get_robot_profile(robot_id: str = "robot.taili") -> RobotProfile:
-    if robot_id != TAILI_PROFILE.id:
-        raise ValueError(f"Unknown robot profile: {robot_id}")
-    return TAILI_PROFILE
-
-
-def validate_robot_profile(profile: RobotProfile = TAILI_PROFILE) -> list[str]:
+def validate_robot_profile(profile: RobotProfile | None = None) -> list[str]:
+    """只校验通用本体契约，不假设腿数、DoF 或传感器类型。"""
+    if profile is None:
+        profile = get_robot_profile()
     issues: list[str] = []
+    if not profile.id.strip():
+        issues.append("robot id is required")
+    if profile.dof <= 0:
+        issues.append("dof must be positive")
     if profile.dof != len(profile.joint_order):
         issues.append(f"dof={profile.dof} but joint_order has {len(profile.joint_order)} joints")
-    if len(profile.leg_order) != 4:
-        issues.append("quadruped profile must define four legs")
-    if len(profile.foot_links) != 4:
-        issues.append("quadruped profile must define four foot links")
-    missing_caps = {"quadruped_12dof"} - set(profile.capabilities)
-    if missing_caps:
-        issues.append(f"missing capabilities: {', '.join(sorted(missing_caps))}")
-    if not profile.diagnostic_spec:
-        issues.append("diagnostic_spec is required")
+    if len(set(profile.joint_order)) != len(profile.joint_order):
+        issues.append("joint_order contains duplicates")
+    if not profile.base_link.strip():
+        issues.append("base_link is required")
+    if len(set(profile.foot_links)) != len(profile.foot_links):
+        issues.append("foot_links contains duplicates")
+    if len(set(profile.leg_order)) != len(profile.leg_order):
+        issues.append("leg_order contains duplicates")
     return issues
