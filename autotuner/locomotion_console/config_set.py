@@ -117,7 +117,10 @@ def _framework_summary(profile: FrameworkProfile) -> ProfileSummary:
 
 def get_active_config_set(settings: LocomotionConsoleSettings) -> ConfigSet:
     product = get_product(settings.product_id)
-    framework = get_framework_profile(settings.framework_id)
+    framework = get_framework_profile(
+        settings.framework_id,
+        product_id=settings.product_id or None,
+    )
     contract = _contract_summary(product)
     return ConfigSet(
         id=f"{product.product_id}:{framework.id}",

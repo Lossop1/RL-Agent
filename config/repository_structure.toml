@@ -5,6 +5,7 @@ schema_version = 1
 [source]
 roots = [
   "autotuner",
+  "products",
   "tools/isaaclab_quad_diag_observation/isaaclab_quad_diag",
   "locomotion-console-ui/src",
   "locomotion-console-ui/public",
@@ -15,9 +16,9 @@ roots = [
 roots = [
   "output",
   "frontend/dist",
-  "autotuner/training_payloads/taili_blind_runtime/.build",
-  "autotuner/training_payloads/taili_blind_runtime/dist",
-  "autotuner/training_payloads/taili_blind_runtime/archive",
+  "products/taili/payload/.build",
+  "products/taili/payload/dist",
+  "products/taili/payload/archive",
 ]
 
 [history]
@@ -30,9 +31,9 @@ roots = [
 [entrypoints]
 backend = "python -m autotuner.locomotion_console"
 frontend = "locomotion-console-ui"
-training_config = "autotuner/blind_locomotion/taili_blind_config.yaml"
-payload_manifest = "python -m autotuner.training_payloads.taili_blind_runtime.payload_manifest"
-payload_builder = "python -m autotuner.training_payloads.taili_blind_runtime.build_payload"
+training_config = "products/taili/blind_locomotion/taili_blind_config.yaml"
+payload_manifest = "python -m products.taili.payload.payload_manifest"
+payload_builder = "python -m products.taili.payload.build_payload"
 structure_check = "python tools/check_repository_structure.py"
 
 [dependency_rules]
@@ -44,6 +45,7 @@ structure_check = "python tools/check_repository_structure.py"
   "autotuner.taili_ops",
   "autotuner.training",
   "autotuner.adapter",
+  "products",
 ]
 "autotuner.research" = [
   "autotuner.locomotion_console",
@@ -52,17 +54,30 @@ structure_check = "python tools/check_repository_structure.py"
   "autotuner.taili_ops",
   "autotuner.training",
   "autotuner.adapter",
+  "products",
 ]
-"autotuner.taili_core" = [
+"autotuner.product" = [
+  "products",
+]
+"autotuner.framework_library" = [
+  "products",
+]
+"autotuner.adapter" = [
+  "products",
+]
+"autotuner.locomotion_console" = [
+  "products",
+]
+"products.taili.core" = [
   "autotuner.locomotion_console",
-  "autotuner.blind_locomotion",
-  "autotuner.taili_ops",
+  "products.taili.blind_locomotion",
+  "products.taili.ops",
   "autotuner.training",
   "autotuner.adapter",
 ]
-"autotuner.blind_locomotion" = [
+"products.taili.blind_locomotion" = [
   "autotuner.locomotion_console",
-  "autotuner.taili_ops",
+  "products.taili.ops",
   "autotuner.training",
 ]
 "autotuner.training" = [
@@ -75,9 +90,16 @@ structure_check = "python tools/check_repository_structure.py"
   "autotuner.taili_core",
   "autotuner.taili_ops",
   "autotuner.training",
+  "products",
 ]
 
 [compatibility]
+packages = [
+  "autotuner.blind_locomotion",
+  "autotuner.taili_core",
+  "autotuner.taili_ops",
+  "autotuner.training_payloads.taili_blind_runtime",
+]
 modules = [
   "autotuner.training.remote",
   "autotuner.training.acceptance_run",

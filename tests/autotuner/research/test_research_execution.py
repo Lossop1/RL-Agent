@@ -86,7 +86,7 @@ def test_command_backend_streams_large_output_to_workspace_log(tmp_path: Path):
         "max_seconds": 10,
     })
     environment = dict(os.environ)
-    environment["TAILI_MECHANISM_BUNDLE"] = str(tmp_path / "candidate" / "mechanisms.json")
+    environment["RL_MECHANISM_BUNDLE"] = str(tmp_path / "candidate" / "mechanisms.json")
     handle = backend.start(plan, tmp_path, environment)
     deadline = time.time() + 10
     status = backend.poll(handle)
@@ -97,7 +97,7 @@ def test_command_backend_streams_large_output_to_workspace_log(tmp_path: Path):
     assert (tmp_path / "training.log").stat().st_size > 200000
 
     evaluator = _plan(evaluation_plan={
-        "command": [sys.executable, "-c", "import json,os; print(json.dumps({'success': os.getenv('TAILI_MECHANISM_BUNDLE') is not None}))"],
+        "command": [sys.executable, "-c", "import json,os; print(json.dumps({'success': os.getenv('RL_MECHANISM_BUNDLE') is not None}))"],
     })
     assert backend.evaluate(evaluator, tmp_path)["success"] is True
 

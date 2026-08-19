@@ -51,7 +51,7 @@ DR 不是替代前三项的得分项；质量、执行器、摩擦、质心、�
 
 > **Status.** This document is the single source of truth for what "Taili passes" means.
 > It is the human-readable contract; the machine-enforced contract is
-> `autotuner/blind_locomotion/acceptance_score.py` (pure, unit-testable, no sim). Every
+> `products/taili/blind_locomotion/acceptance_score.py` (pure, unit-testable, no sim). Every
 > threshold below is the exact value that scorer enforces — when the two disagree, the scorer
 > wins and this document is the bug. The scorer is what `physeval_blind.py` /
 > `physeval_blind_e.py` feed measured statistics into, and what `acceptance_aggregate.py`
@@ -177,5 +177,5 @@ The training mechanisms that target each gate, and where each is measured, are e
 `autotuner/locomotion_console/spec_coverage.py` (the coverage ledger the console/LLM read).
 The reward/gate/curriculum design that implements these targets is documented in
 [`taili_strategy_decisions.md`](./taili_strategy_decisions.md). The single editable strategy
-contract is `autotuner/blind_locomotion/taili_blind_config.yaml`; all runtime artifacts
+contract is `products/taili/blind_locomotion/taili_blind_config.yaml`; all runtime artifacts
 (`agent.skrl.yaml`, `effective_config.yaml`) are generated from it per run.

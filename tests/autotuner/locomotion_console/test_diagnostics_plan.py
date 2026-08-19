@@ -8,6 +8,18 @@ from autotuner.locomotion_console.diagnostics import (
     _normalize_plan,
 )
 from autotuner.locomotion_console.schemas import DiagnosticCheckpoint, DiagnosticRunRequest
+from autotuner.product import resolve_product_runtime
+
+
+def _taili_controller() -> DiagnosticsController:
+    """构造显式绑定 Taili 合同的窄测试控制器，不依赖系统 fallback。"""
+    controller = object.__new__(DiagnosticsController)
+    controller.settings = SimpleNamespace(
+        product_id="taili",
+        diagnostic_tool_root="/root/gpufree-data/tools/diag",
+    )
+    controller.runtime = resolve_product_runtime("taili", check_files=False)
+    return controller
 
 
 def test_dr_plan_preserves_population_profile_and_factor_selectors():
@@ -82,8 +94,13 @@ def test_checkpoint_catalog_retains_extended_history_per_framework(monkeypatch):
         type("Framework", (), {"id": "current"})(),
         type("Framework", (), {"id": "reference"})(),
     ]
-    monkeypatch.setattr(diagnostics_module, "list_framework_profiles", lambda: frameworks)
+    monkeypatch.setattr(
+        diagnostics_module,
+        "list_framework_profiles",
+        lambda product_id=None: frameworks,
+    )
     controller = object.__new__(DiagnosticsController)
+    controller.settings = SimpleNamespace(product_id="taili")
     observed_limits = []
 
     def fake_recent(_remote, framework, limit):
@@ -109,8 +126,7 @@ def test_checkpoint_catalog_retains_extended_history_per_framework(monkeypatch):
 
 
 def test_payload_shell_prefers_checkpoint_run_metadata():
-    controller = object.__new__(DiagnosticsController)
-    controller.settings = SimpleNamespace(diagnostic_tool_root="/root/gpufree-data/tools/diag")
+    controller = _taili_controller()
 
     shell = controller._payload_root_shell(
         "/root/gpufree-data/taili_runs/example/checkpoints/agent_20000.pt"
@@ -124,8 +140,7 @@ def test_payload_shell_prefers_checkpoint_run_metadata():
 
 
 def test_payload_shell_fallback_includes_recovered_payloads():
-    controller = object.__new__(DiagnosticsController)
-    controller.settings = SimpleNamespace(diagnostic_tool_root="/root/gpufree-data/tools/diag")
+    controller = _taili_controller()
 
     shell = controller._payload_root_shell()
 
@@ -135,8 +150,13 @@ def test_payload_shell_fallback_includes_recovered_payloads():
 
 def test_active_run_latest_checkpoint_is_the_default(monkeypatch):
     framework = type("Framework", (), {"id": "current"})()
-    monkeypatch.setattr(diagnostics_module, "list_framework_profiles", lambda: [framework])
+    monkeypatch.setattr(
+        diagnostics_module,
+        "list_framework_profiles",
+        lambda product_id=None: [framework],
+    )
     controller = object.__new__(DiagnosticsController)
+    controller.settings = SimpleNamespace(product_id="taili")
     controller.source = SimpleNamespace(
         _newest_run_with_checkpoint=lambda _remote: "/runs/current_run"
     )
@@ -172,8 +192,13 @@ def test_active_run_latest_checkpoint_is_the_default(monkeypatch):
 
 def test_active_run_history_is_not_evicted_by_other_run_latest_checkpoints(monkeypatch):
     framework = type("Framework", (), {"id": "current"})()
-    monkeypatch.setattr(diagnostics_module, "list_framework_profiles", lambda: [framework])
+    monkeypatch.setattr(
+        diagnostics_module,
+        "list_framework_profiles",
+        lambda product_id=None: [framework],
+    )
     controller = object.__new__(DiagnosticsController)
+    controller.settings = SimpleNamespace(product_id="taili")
     controller.source = SimpleNamespace(
         _newest_run_with_checkpoint=lambda _remote: "/runs/current_run"
     )

@@ -10,9 +10,9 @@
 
 当前链路：
 
-1. 本地编辑 `autotuner/blind_locomotion/taili_blind_config.yaml` 和相关 Python 源码。
-2. `autotuner/training_payloads/taili_blind_runtime/payload_manifest.py` 校验打包边界。
-3. `autotuner/training_payloads/taili_blind_runtime/build_payload.py` 生成 `taili_blind_runtime_*.tar.gz`。
+1. 本地编辑 `products/taili/blind_locomotion/taili_blind_config.yaml` 和相关 Python 源码。
+2. `products/taili/payload/payload_manifest.py` 校验打包边界。
+3. `products/taili/payload/build_payload.py` 生成 `taili_blind_runtime_*.tar.gz`。
 4. 控制台或手工流程上传 payload 到远端。
 5. 远端把 payload 解压成 `taili_blind_runtime` 包，并把目录加入 `PYTHONPATH`。
 6. payload 根目录的 `sitecustomize.py` 自动导入 `taili_blind_runtime`。
@@ -24,11 +24,11 @@
 
 单一可编辑策略配置：
 
-- `autotuner/blind_locomotion/taili_blind_config.yaml`
+- `products/taili/blind_locomotion/taili_blind_config.yaml`
 
 配置加载与转发：
 
-- `autotuner/blind_locomotion/taili_blind_config.py`
+- `products/taili/blind_locomotion/taili_blind_config.py`
 
 关键函数：
 
@@ -48,11 +48,11 @@
 
 当前主要环境类：
 
-- `autotuner/blind_locomotion/taili_amp_env.py`
-- `autotuner/blind_locomotion/blind_tp_env.py`
-- `autotuner/blind_locomotion/taili_amp_env_cfg.py`
-- `autotuner/blind_locomotion/blind_tp_env_cfg.py`
-- `autotuner/blind_locomotion/taili_blind_env_cfg.py`
+- `products/taili/blind_locomotion/taili_amp_env.py`
+- `products/taili/blind_locomotion/blind_tp_env.py`
+- `products/taili/blind_locomotion/taili_amp_env_cfg.py`
+- `products/taili/blind_locomotion/blind_tp_env_cfg.py`
+- `products/taili/blind_locomotion/taili_blind_env_cfg.py`
 
 当前职责划分：
 
@@ -72,7 +72,7 @@
 
 唯一共享奖励实现：
 
-- `autotuner/taili_core/taili_reward.py`
+- `products/taili/core/taili_reward.py`
 
 核心对象：
 
@@ -100,10 +100,10 @@
 
 相关文件：
 
-- `autotuner/blind_locomotion/terrain_perceiver_policy.py`
-- `autotuner/blind_locomotion/terrain_perceiver_aux_patch.py`
-- `autotuner/taili_core/taili_obs.py`
-- `autotuner/taili_core/taili_terrain_labels.py`
+- `products/taili/blind_locomotion/terrain_perceiver_policy.py`
+- `products/taili/blind_locomotion/terrain_perceiver_aux_patch.py`
+- `products/taili/core/taili_obs.py`
+- `products/taili/core/taili_terrain_labels.py`
 
 当前观测契约：
 
@@ -128,8 +128,8 @@
 
 本地源码：
 
-- `autotuner/blind_locomotion/launch_taili_train.py`
-- `autotuner/blind_locomotion/train_taili.py`
+- `products/taili/blind_locomotion/launch_taili_train.py`
+- `products/taili/blind_locomotion/train_taili.py`
 
 payload 内入口：
 
@@ -154,8 +154,8 @@ python -m taili_blind_runtime.launch_taili_train
 
 本地源码：
 
-- `autotuner/blind_locomotion/diagnose_taili.py`
-- `autotuner/blind_locomotion/diagnose_taili_cases.py`
+- `products/taili/blind_locomotion/diagnose_taili.py`
+- `products/taili/blind_locomotion/diagnose_taili_cases.py`
 - `tools/isaaclab_quad_diag_observation/`
 
 payload 会打包诊断工具和 suites：
@@ -175,11 +175,11 @@ payload 会打包诊断工具和 suites：
 
 打包定义：
 
-- `autotuner/training_payloads/taili_blind_runtime/payload_manifest.py`
+- `products/taili/payload/payload_manifest.py`
 
 打包器：
 
-- `autotuner/training_payloads/taili_blind_runtime/build_payload.py`
+- `products/taili/payload/build_payload.py`
 
 payload 包名：
 
@@ -189,7 +189,7 @@ payload 包名：
 
 - 任务注册与环境：`__init__.py`、`taili_amp_env.py`、`blind_tp_env.py`、env cfg 文件。
 - 策略配置：`taili_blind_config.py`、`taili_blind_config.yaml`。
-- 奖励与核心工具：`autotuner/taili_core/*.py`。
+- 奖励与核心工具：`products/taili/core/*.py`。
 - terrain perceiver：`terrain_perceiver_policy.py`、`terrain_perceiver_aux_patch.py`。
 - 训练遥测：`telemetry_emit.py`、`telemetry_payloads.py`。
 - 训练与诊断入口：`launch_taili_train.py`、`train_taili.py`、`diagnose_taili.py`、`diagnose_taili_cases.py`。
@@ -238,8 +238,8 @@ manifest 同时做静态检查：
 整理后验证：
 
 ```powershell
-python -m autotuner.training_payloads.taili_blind_runtime.payload_manifest
-python -m pytest tests/autotuner/blind_locomotion/test_curriculum_config.py tests/autotuner/blind_locomotion/test_telemetry_contract.py tests/autotuner/taili_core/test_taili_reward.py
+python -m products.taili.payload.payload_manifest
+python -m pytest tests/products/taili/blind_locomotion/test_curriculum_config.py tests/products/taili/blind_locomotion/test_telemetry_contract.py tests/products/taili/core/test_taili_reward.py
 ```
 
 如果 payload 边界变化，还要打包并检查 tar 内容。

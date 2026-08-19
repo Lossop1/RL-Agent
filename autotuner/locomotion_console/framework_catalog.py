@@ -13,7 +13,7 @@ from typing import Dict, List
 
 from pydantic import BaseModel
 
-from autotuner.framework_library import CATALOG, COMPOSITIONS, adapt_plan
+from autotuner.framework_library import CATALOG, adapt_plan, get_compositions
 
 
 class FrameworkComponentInfo(BaseModel):
@@ -42,7 +42,7 @@ class FrameworkCatalogInfo(BaseModel):
     compositions: List[FrameworkCompositionInfo]
 
 
-def build_framework_catalog() -> FrameworkCatalogInfo:
+def build_framework_catalog(product_id: str | None = None) -> FrameworkCatalogInfo:
     components = [
         FrameworkComponentInfo(
             id=c.id, label=c.label, role=c.role, adapt_kind=c.adapt_kind,
@@ -56,6 +56,6 @@ def build_framework_catalog() -> FrameworkCatalogInfo:
             id=k.id, label=k.label, status=k.status,
             component_ids=list(k.component_ids), adapt_plan=adapt_plan(k), note=k.note,
         )
-        for k in COMPOSITIONS.values()
+        for k in get_compositions(product_id).values()
     ]
     return FrameworkCatalogInfo(components=components, compositions=compositions)

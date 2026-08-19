@@ -330,10 +330,15 @@ class RemoteSSH:
                 best = line
         return best
 
-    def list_recent_run_dirs(self, framework: str = "rsl_rl",
-                              experiment_name: str = "taili_amp",
-                              limit: int = 5) -> list:
+    def list_recent_run_dirs(
+        self,
+        framework: str = "rsl_rl",
+        experiment_name: str = "",
+        limit: int = 5,
+    ) -> list:
         """Return paths to N most recently modified run dirs under logs/<framework>/<experiment_name>/."""
+        if not experiment_name:
+            raise ValueError("experiment_name is required; it belongs to the active product contract")
         base = f"{self.cfg.work_dir}/logs/{framework}/{experiment_name}"
         # ls -t sorts by mtime desc
         out = self.exec_out(f"ls -1t {base} 2>/dev/null | head -{limit}", timeout=15)

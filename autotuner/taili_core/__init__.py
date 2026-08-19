@@ -1,5 +1,11 @@
-"""taili_core — neutral, single-source robot conventions for Taili.
+"""兼容入口；Taili 核心实现已迁至 products.taili.core。"""
+from __future__ import annotations
 
-Holds the canonical L/R mirror (taili_symmetry): actor, TerrainPerceiver, AMP, log_std,
-tests and data-augmentation all import from here. No duplication (taili_strategy_decisions.md / E).
-"""
+from products.taili import core as _implementation
+
+__path__ = _implementation.__path__
+__all__ = getattr(_implementation, "__all__", ())
+
+
+def __getattr__(name: str):
+    return getattr(_implementation, name)

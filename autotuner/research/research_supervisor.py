@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -31,7 +32,7 @@ from .research_ledger import (
 
 
 _EXPERIMENT_ENV_EXACT = frozenset({"CUDA_VISIBLE_DEVICES"})
-_EXPERIMENT_ENV_PREFIXES = ("TAILI_", "RL_RESEARCH_")
+_EXPERIMENT_ENV_PREFIXES = ("RL_",)
 
 
 def _now_epoch() -> float:
@@ -323,12 +324,25 @@ class ResearchSupervisor:
         return results
 
     @staticmethod
-    def _environment(overrides: Mapping[str, str] | None) -> dict[str, str]:
+    def _environment(
+        overrides: Mapping[str, str] | None,
+        plan: ExperimentPlan,
+    ) -> dict[str, str]:
+        declaration = plan.training_window.get("environment_policy", {})
+        declaration = declaration if isinstance(declaration, Mapping) else {}
+        raw_prefixes = declaration.get("prefixes", ("RL_",))
+        raw_exact = declaration.get("exact", ("CUDA_VISIBLE_DEVICES",))
+        prefixes = tuple(str(item).strip() for item in raw_prefixes) if isinstance(raw_prefixes, (list, tuple)) else ()
+        exact = tuple(str(item).strip() for item in raw_exact) if isinstance(raw_exact, (list, tuple)) else ()
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*_", item) for item in prefixes):
+            raise ValueError("training_window.environment_policy.prefixes must be safe names ending in '_'")
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item) for item in exact):
+            raise ValueError("training_window.environment_policy.exact must contain safe names")
         supplied = {str(key): str(value) for key, value in (overrides or {}).items()}
         invalid = sorted(
             key for key in supplied
-            if key not in _EXPERIMENT_ENV_EXACT
-            and not key.startswith(_EXPERIMENT_ENV_PREFIXES)
+            if key not in exact
+            and not key.startswith(prefixes)
         )
         if invalid:
             raise ValueError(f"experiment environment keys are not allowlisted: {', '.join(invalid)}")
@@ -381,13 +395,13 @@ class ResearchSupervisor:
             handle: BackendHandle | None = None
             status = BackendStatus("failed", message="not started")
             stop_reason = ""
-            env = self._environment(environment)
+            env = self._environment(environment, plan)
             env["RL_RESEARCH_EXPERIMENT_REF"] = plan.id
             env["RL_RESEARCH_CANDIDATE_ROOT"] = str(candidate)
             mechanism_bundle = candidate / "mechanisms.json"
             if not mechanism_bundle.is_file():
                 raise FileNotFoundError(f"candidate mechanism bundle is missing: {mechanism_bundle}")
-            env["TAILI_MECHANISM_BUNDLE"] = str(mechanism_bundle)
+            env["RL_MECHANISM_BUNDLE"] = str(mechanism_bundle)
             handle = self.backend.start(plan, workspace, env)
             max_seconds = float(plan.training_window.get("max_seconds", plan.resource_budget.get("max_seconds", 3600.0)))
             started = _now_epoch()

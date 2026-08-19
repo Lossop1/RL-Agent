@@ -2,7 +2,7 @@
 
 ## 目标
 
-仓库同时承载训练运行时、研究编排、诊断验收、远程部署和操作界面。整理后的核心原则是：
+仓库同时承载训练运行时、研究编排、诊断验收、远程部署和操作界面。产品合同是系统与一次具体机器人任务之间的边界；`taili` 只是当前产品实例。整理后的核心原则是：
 
 1. 每个职责只有一个可执行权威实现。
 2. 研究逻辑不依赖 Web 控制台，训练核心不依赖 UI 或旧编排器。
@@ -18,11 +18,11 @@
 | 研究 | `autotuner/research/` | 状态、台账、证据、候选、实验周期、监督和结果学习 |
 | 基础设施 | `autotuner/infrastructure/` | SSH、进程和远程执行等可替换能力 |
 | 执行层 | `autotuner/execution/` | runtime 身份、payload/run 哈希、ChangeSet、resume 判定、远程 staging 与原子激活 |
-| 任务核心 | `autotuner/taili_core/` | Taili 几何、观测、奖励数学、模型和课程纯逻辑 |
-| IsaacLab 适配 | `autotuner/blind_locomotion/` | Taili 任务注册、环境、训练入口、运行遥测和物理验收适配 |
-| Taili 运维 | `autotuner/taili_ops/` | 旧式 Taili 验收与调参 CLI，逐步被研究层替代 |
+| 产品任务核心 | `products/<product>/core/` | 该产品的几何、观测、奖励数学、模型和课程纯逻辑 |
+| 仿真/训练适配 | `products/<product>/<task>/` | 任务注册、环境、训练入口、运行遥测和物理验收适配 |
+| 产品运维插件 | `products/<product>/ops/` | 产品特有的知识、playbook、验收和调参插件 |
 | 控制台适配 | `autotuner/locomotion_console/` | FastAPI、数据源、UI API、LLM 工具和研究/远程适配 |
-| 机器人适配 | `autotuner/adapter/` | URDF/几何导入和部署计划的 Taili 适配 |
+| 机器人适配 | `autotuner/adapter/` | 按产品合同消费机器人资产，生成通用部署计划；不保存某个机器人实现 |
 | 诊断库 | `tools/isaaclab_quad_diag_observation/` | 可独立打包的诊断度量、记录和报告协议 |
 
 执行层的唯一交付链是：
@@ -35,18 +35,20 @@ config/products/<product>.yaml
     -> runtimes/<runtime_digest> + payloads/<payload_digest> + runs/<run_id>
 ```
 
-`config/products/` 是产品输入，`autotuner/blind_locomotion/` 是当前 Taili
-适配器，`autotuner/execution/` 是不依赖具体机器人的系统源码；三者不能
-互相替代。`output/`、`strategy_backups/` 和 `docs/archive/` 是运行或历史
-产物，不能作为 Python import 源。
+`config/products/<product>.yaml` 是产品合同入口，`products/<product>/` 是该产品
+由机器人资产与任务要求得到的实现产物，`autotuner/` 是不依赖具体机器人的系统源码。
+系统通过合同中的 entrypoint、插件角色和运行声明接入产品；不能因为当前只有 Taili
+就把产品实现搬回系统目录。`output/`、`strategy_backups/` 和 `docs/archive/` 是运行
+或历史产物，不能作为 Python import 源。
 
 ## 关键入口
 
-- 训练配置唯一编辑源：`autotuner/blind_locomotion/taili_blind_config.yaml`
+- 产品合同：`config/products/<product>.yaml`
+- 训练配置示例：`products/taili/blind_locomotion/taili_blind_config.yaml`（仅是 Taili 产品实现）
 - 本地控制台：`python -m autotuner.locomotion_console`
-- Taili 训练入口：`autotuner/blind_locomotion/launch_taili_train.py`
-- payload 清单：`autotuner/training_payloads/taili_blind_runtime/payload_manifest.py`
-- payload 构建：`python -m autotuner.training_payloads.taili_blind_runtime.build_payload`
+- Taili 训练入口：`products/taili/blind_locomotion/launch_taili_train.py`
+- payload 清单：`products/taili/payload/payload_manifest.py`
+- payload 构建：`python -m products.taili.payload.build_payload`
 - 结构门：`python tools/check_repository_structure.py`
 - 前端源码：`locomotion-console-ui/`
 
@@ -54,18 +56,17 @@ config/products/<product>.yaml
 
 依赖方向从底到顶：
 
-`mechanisms -> research -> infrastructure / execution / task adapters -> console`
+`mechanisms -> research -> infrastructure / execution / product adapters -> console`
 
-这不是严格的单链：`taili_core` 可以依赖机制运行时，`blind_locomotion` 可以依赖
-`taili_core`，控制台可以依赖研究层和基础设施。但以下反向依赖被禁止：机制/研究不能
-导入控制台；执行层不能导入产品、任务或控制台；Taili 核心不能导入控制台或旧训练包；
-环境不能导入控制台。
+这不是严格的单链：产品核心可以依赖机制运行时，产品任务可以依赖产品核心，控制台
+可以依赖研究层和基础设施。但以下反向依赖被禁止：机制/研究不能导入控制台；执行层
+不能导入产品、任务或控制台；产品核心不能导入控制台或旧训练包；环境不能导入控制台。
 
 ## 源码与产物
 
 | 类型 | 位置 | 处理规则 |
 |---|---|---|
-| 可审查源码 | `autotuner/`、`tools/.../isaaclab_quad_diag/`、UI `src/public` | 进入版本控制，必须有测试或入口说明 |
+| 可审查源码 | `autotuner/`、`products/<product>/`、`tools/.../isaaclab_quad_diag/`、UI `src/public` | 进入版本控制，必须有测试或入口说明 |
 | 测试源码 | `tests/` | 与权威包镜像，禁止写入源码目录 |
 | payload 源映射 | `payload_manifest.py` | 唯一来源；不得手工维护第二份运行代码 |
 | 运行输出 | `output/`、`frontend/dist/` | 可重建、默认忽略，不作为源码引用 |

@@ -134,8 +134,8 @@ def _tool_search_knowledge(src: RealDataSource, query: str = "") -> Dict[str, An
     return knowledge.search(query)
 
 
-def _tool_get_taili_context_pack(src: RealDataSource, query: str = "") -> Dict[str, Any]:
-    """Read-only Taili strategy/spec/YAML context pack from a local allowlist.
+def _tool_get_context_pack(src: RealDataSource, query: str = "") -> Dict[str, Any]:
+    """读取当前产品声明的只读策略/spec/YAML context pack。
 
     Use this before strategy/config/tuning answers. It gives the LLM the same
     project-specific background the operator expects: spec, strategy decisions,
@@ -143,24 +143,34 @@ def _tool_get_taili_context_pack(src: RealDataSource, query: str = "") -> Dict[s
     """
     from . import knowledge
 
-    return knowledge.build_taili_context_pack(query=query, include_docs=True)
+    return knowledge.build_context_pack(
+        query=query,
+        include_docs=True,
+        product_id=getattr(src.settings, "product_id", "") or None,
+    )
 
 
-def _tool_get_campaign_journal(src: RealDataSource, robot: str = "taili", limit: int = 30) -> Dict[str, Any]:
+# 旧工具名只保留一层别名，不再形成第二套实现。
+_tool_get_taili_context_pack = _tool_get_context_pack
+
+
+def _tool_get_campaign_journal(src: RealDataSource, robot: str = "", limit: int = 30) -> Dict[str, Any]:
     """The campaign's durable decision memory: best-so-far score, the (gate::lever) pairs already tried and
     ROLLED BACK (the NO-REPEAT guard must reject these), and recent iterations. Read this BEFORE proposing a
     lever (step 3 of run_tuning_loop) so you never repeat a failed experiment or claim a stale best."""
     from autotuner.research.campaign_journal import read_journal
+    robot = robot or getattr(src.settings, "product_id", "") or "product"
     return read_journal(robot=robot, limit=limit)
 
 
-def _tool_record_campaign_iteration(src: RealDataSource, robot: str = "taili", target_gate: str = "",
+def _tool_record_campaign_iteration(src: RealDataSource, robot: str = "", target_gate: str = "",
                                     lever: str = "", decision: str = "", score_before: str = "",
                                     score_after: str = "", config_diff: str = "", result_run: str = "",
                                     evidence: str = "", note: str = "") -> Dict[str, Any]:
     """Append this iteration's outcome to the campaign journal (decision in {kept, rolled_back, pending}).
     Do this at step 7 (decide) so the NO-REPEAT/DECIDE guards have the memory next iteration."""
     from autotuner.research.campaign_journal import record_iteration
+    robot = robot or getattr(src.settings, "product_id", "") or "product"
     try:
         import datetime as _dt
         ts = _dt.datetime.now().timestamp()
@@ -179,18 +189,25 @@ def _tool_get_playbook(src: RealDataSource, task: str = "", gate: str = "", robo
     the system owner — obey each step's guard, never advance on a guess. `robot` selects the profile (a new
     robot = a new profile, same workflow)."""
     from .playbook import get_playbook
-    return get_playbook(task=task, gate=gate, robot=robot)
+    return get_playbook(
+        task=task,
+        gate=gate,
+        robot=robot,
+        product_id=getattr(src.settings, "product_id", "") or None,
+    )
 
 
 def _tool_get_spec_coverage(src: RealDataSource) -> Dict[str, Any]:
-    """Read-only taili_spec acceptance ledger: spec rows vs training/evaluation coverage."""
+    """Read-only active-product acceptance ledger: spec rows vs training/evaluation coverage."""
     from .spec_coverage import build_spec_coverage_report
 
-    return build_spec_coverage_report().model_dump()
+    return build_spec_coverage_report(
+        product_id=getattr(src.settings, "product_id", "") or None,
+    ).model_dump()
 
 
 def _compact_acceptance_for_llm(verdict: Dict[str, Any]) -> Dict[str, Any]:
-    """Shape the measured taili_spec §2 verdict for grounding: per-family present/ok plus the exact
+    """Shape the measured active-product verdict for grounding: per-family present/ok plus the exact
     failing sub-gates with their measured stat-vs-band, so the copilot cites 'A1[fwd05] med=0.14>0.10'
     instead of narrating the hand-authored spec_coverage status."""
     if not isinstance(verdict, dict) or not verdict.get("available"):
@@ -215,7 +232,7 @@ def _compact_acceptance_for_llm(verdict: Dict[str, Any]) -> Dict[str, Any]:
         "families": families,
         "failing_gates": failing_gates,
         "scorecards_read": verdict.get("scorecards_read"),
-        "instruction": ("This is the MEASURED metric the product is graded on (taili_spec §2). Ground "
+        "instruction": ("This is the MEASURED metric the product is graded on. Ground "
                         "every tuning hypothesis in these gates: cite the failing gate and its stat vs "
                         "band. missing_families were never evaluated (e.g. run terrain/push physeval)."),
     }
@@ -244,14 +261,19 @@ def _tool_get_tuning_state(src: RealDataSource) -> Dict[str, Any]:
     is currently running. Check before proposing tune/train actions."""
     out: Dict[str, Any] = {}
     try:
-        from autotuner.taili_ops.strategy_edit import rollback_stack
+        from autotuner.product import load_product_plugin
+
+        rollback_stack = load_product_plugin(src._product_contract(), "strategy", "rollback_stack")
         out["rollback_stack"] = rollback_stack()[-5:]
     except Exception as e:  # noqa: BLE001
         out["rollback_stack_error"] = str(e)
     try:
         import json as _json
         remote = src._get_remote()
-        raw = remote.exec_out("cat /root/gpufree-data/taili_runs/BEST_CHECKPOINT.json 2>/dev/null")
+        import shlex as _shlex
+
+        registry = f"{src._product_adapter().runs_root}/BEST_CHECKPOINT.json"
+        raw = remote.exec_out(f"cat {_shlex.quote(registry)} 2>/dev/null")
         out["best_checkpoint"] = _json.loads(raw) if raw.strip() else None
         out["training_running"] = bool(src._is_running(remote))
     except Exception as e:  # noqa: BLE001
@@ -265,17 +287,24 @@ def _tool_analyze_acceptance(src: RealDataSource) -> Dict[str, Any]:
     gates skipped, unstable levers capped), and propose the next concrete apply_tuning change.
     Use this to DRIVE the loop yourself: run_acceptance → analyze_acceptance → propose apply_tuning
     → deploy_payload + resume_training → run_acceptance again."""
-    from autotuner.blind_locomotion.taili_blind_config import get_config_value, load_taili_blind_config
-    from autotuner.taili_ops.tune_orchestrator import GATE_LEVERS, SKIP_FAMILIES, analyze_gaps, propose_change
+    from autotuner.product import load_product_plugin
+
+    contract = src._product_contract()
+    get_config_value = load_product_plugin(contract, "strategy", "config_value")
+    load_config = load_product_plugin(contract, "strategy", "load_config")
+    gate_levers = load_product_plugin(contract, "tuning", "gate_levers")
+    skip_families = load_product_plugin(contract, "tuning", "skip_families")
+    analyze_gaps = load_product_plugin(contract, "tuning", "analyze_gaps")
+    propose_change = load_product_plugin(contract, "tuning", "propose_change")
 
     verdict = src.get_acceptance()
     if not verdict.get("available"):
         return {"available": False, "reason": verdict.get("reason", "no measured verdict"),
                 "instruction": "Run an acceptance measurement first (run_acceptance), then analyze."}
     gaps = analyze_gaps(verdict)
-    cfg = load_taili_blind_config()
+    cfg = load_config()
     current = {}
-    for levers in GATE_LEVERS.values():
+    for levers in gate_levers.values():
         for key, _step, _cap in levers:
             val = get_config_value(cfg, f"reward.{key}")
             if val is not None:
@@ -288,10 +317,10 @@ def _tool_analyze_acceptance(src: RealDataSource) -> Dict[str, Any]:
         "ranked_gaps": [
             {"gate": g.gate, "family": g.family, "measured": g.measured, "threshold": g.threshold,
              "margin": g.margin, "levers": [{"key": k, "step": s, "cap": cap, "current": current.get(k)}
-                                            for k, s, cap in GATE_LEVERS.get(g.family, [])]}
+                                            for k, s, cap in gate_levers.get(g.family, [])]}
             for g in gaps[:8]
         ],
-        "skipped_metric_artifact_families": sorted(SKIP_FAMILIES),
+        "skipped_metric_artifact_families": sorted(skip_families),
         "next_proposal": proposal or None,
         "instruction": ("ranked_gaps = failing gates worst-first with their reward levers (step size and "
                         "HARD cap — never exceed caps, they encode training-stability limits). "
@@ -302,7 +331,7 @@ def _tool_analyze_acceptance(src: RealDataSource) -> Dict[str, Any]:
 
 
 def _tool_get_acceptance(src: RealDataSource) -> Dict[str, Any]:
-    """Read-only MEASURED taili_spec §2 acceptance verdict for the newest run, scored from persisted
+    """Read-only MEASURED active-product acceptance verdict for the newest run, scored from persisted
     physeval logs. Never launches physeval (separate isolated path). This is the single source of
     truth for 'how far from benchmark' — prefer it over spec_coverage status strings for any tuning,
     root-cause, or 'which gates fail' question. Returns available:False when no physeval scored yet."""
@@ -310,25 +339,31 @@ def _tool_get_acceptance(src: RealDataSource) -> Dict[str, Any]:
 
 
 def _tool_get_code_knowledge(src: RealDataSource, query: str = "") -> Dict[str, Any]:
-    """Read-only allowlisted Taili implementation evidence.
+    """Read-only allowlisted implementation evidence for the active product.
 
     Use for questions like: where is this metric calculated, is this YAML key consumed,
     does telemetry really reflect the reward/diagnostic mechanism, or is this a dead key.
     """
     from .code_knowledge import search_code_knowledge
 
-    return search_code_knowledge(query=query)
+    return search_code_knowledge(
+        query=query,
+        product_id=getattr(src.settings, "product_id", "") or None,
+    )
 
 
 def _tool_get_signal_map(src: RealDataSource, query: str = "") -> Dict[str, Any]:
     """Read-only spec/YAML/code/telemetry/diagnostic mapping."""
     from .code_knowledge import build_signal_map
 
-    return build_signal_map(query=query)
+    return build_signal_map(
+        query=query,
+        product_id=getattr(src.settings, "product_id", "") or None,
+    )
 
 
 def _tool_get_reward_model(src: RealDataSource, query: str = "", term: str = "") -> Dict[str, Any]:
-    """奖励模型知识库(只读):奖励项结构从 taili_reward.py AST 推导(核类型/权重参数/门控/
+    """奖励模型知识库(只读):奖励项结构从当前产品源代码 AST 推导(核类型/权重参数/门控/
     代码位置/相互拆台),当前权重值从本次 run 的 effective_config 现读、经边拼上。
 
     答"某奖励怎么算 / 权重现在多少 / 动它牵动哪个"用它——durable 结构不会过时,现值现读带出处,
@@ -345,7 +380,12 @@ def _tool_get_reward_model(src: RealDataSource, query: str = "", term: str = "")
             effective_config_text = getattr(telemetry, "effective_config_text", "") or ""
         except Exception:  # noqa: BLE001 — 拿不到现值就回退代码默认(带标注),不因此失败
             effective_config_text = ""
-    return get_reward_model(query=query, term=term, effective_config_text=effective_config_text).model_dump()
+    return get_reward_model(
+        query=query,
+        term=term,
+        effective_config_text=effective_config_text,
+        robot_id=getattr(src.settings, "product_id", "") or None,
+    ).model_dump()
 
 
 def _tool_get_robot_model(src: RealDataSource) -> Dict[str, Any]:
@@ -356,12 +396,14 @@ def _tool_get_robot_model(src: RealDataSource) -> Dict[str, Any]:
     """
     from .knowledge_model import get_robot_model
 
-    return get_robot_model().model_dump()
+    return get_robot_model(
+        robot_id=getattr(src.settings, "product_id", "") or None,
+    ).model_dump()
 
 
 def _tool_get_curriculum_model(src: RealDataSource, query: str = "") -> Dict[str, Any]:
     """阶段门控阈值知识库(只读):各阶段推进门槛(进展/地形/摔倒率)、惩罚渐入、阶段间隔、地形等级数等,
-    代码默认从 taili_amp_env_cfg.py AST 推导,当前 run 真值从 effective_config 现读、配对呈现(带出处)。
+    代码默认从产品课程源 AST 推导,当前 run 真值从 effective_config 现读、配对呈现(带出处)。
 
     答"现在各阶段门控阈值是多少 / 惩罚怎么渐入"用它——不拿手抄的旧值。
     """
@@ -376,7 +418,10 @@ def _tool_get_curriculum_model(src: RealDataSource, query: str = "") -> Dict[str
             effective_config_text = getattr(telemetry, "effective_config_text", "") or ""
         except Exception:  # noqa: BLE001 — 拿不到现值就只给代码默认(带标注),不因此失败
             effective_config_text = ""
-    return get_curriculum_model(effective_config_text=effective_config_text).model_dump()
+    return get_curriculum_model(
+        effective_config_text=effective_config_text,
+        robot_id=getattr(src.settings, "product_id", "") or None,
+    ).model_dump()
 
 
 def _tool_get_research_audit(src: RealDataSource, manifest: str = "", checkpoint_root: str = "",
@@ -451,15 +496,21 @@ def _tool_validate_research_mechanism(
 
 
 def _tool_run_decision_replay(src: RealDataSource, split: str = "holdout") -> Dict[str, Any]:
-    """Run the deterministic blind historical decision benchmark."""
-    from .config import PROJECT_ROOT
+    """运行当前产品声明的确定性历史决策回放。"""
+    from pathlib import Path
     from autotuner.research.decision_replay import DecisionReplayRunner, GlobalResearchDecisionPolicy, load_replay_cases
 
     selected = str(split or "holdout").strip().lower()
     if selected not in {"train", "holdout", "all"}:
         return {"error": "split must be train, holdout, or all"}
+    from autotuner.product import resolve_product_runtime
+    product_id = getattr(getattr(src, "settings", None), "product_id", "") or None
+    runtime = resolve_product_runtime(product_id)
+    declared = runtime.training.get("knowledge", {}).get("decision_replay_cases", "")
+    if not declared:
+        return {"error": "current product does not declare decision replay cases"}
     cases = load_replay_cases(
-        PROJECT_ROOT / "config" / "decision_replay" / "taili_core_cases.jsonl",
+        Path(__file__).resolve().parents[2] / str(declared),
         split="" if selected == "all" else selected,
     )
     report = DecisionReplayRunner().run(cases, GlobalResearchDecisionPolicy())
@@ -572,7 +623,7 @@ def _tool_get_operator_context(
     """One-shot read-only context for high-quality answers.
 
     This bundles the facts the operator expects the LLM to know without giving
-    it arbitrary filesystem or shell access: controlled Taili docs/YAML,
+    it arbitrary filesystem or shell access: controlled product docs/YAML,
     current telemetry, remote machine status, workspace config, definitions,
     and recent diagnostic history.
     """
@@ -600,12 +651,16 @@ def _tool_get_operator_context(
 
     context: Dict[str, Any] = {
         "permission_boundary": (
-            "Read-only bundle. Sources: controlled local Taili docs/YAML allowlist, "
+            "Read-only bundle. Sources: controlled active-product docs/YAML allowlist, "
             "current telemetry API, remote status API, config-set registry, definition registry, "
             "and local diagnostic history. No arbitrary local scan, no arbitrary remote path scan, no execution."
         ),
         "query": query,
-        "taili_context_pack": knowledge.build_taili_context_pack(query=query, include_docs=True),
+        "product_context_pack": knowledge.build_context_pack(
+            query=query,
+            include_docs=True,
+            product_id=getattr(src.settings, "product_id", "") or None,
+        ),
         "spec_coverage": _tool_get_spec_coverage(src),
         "training_telemetry": _dump(telemetry),
         "remote_status": _dump(remote_status),
@@ -768,16 +823,20 @@ def _tool_get_evidence_context(
             _gap("train_log", f"{type(exc).__name__}: {exc}",
                  impact="cannot cite recent log tail")
 
-    if "taili_context" in source_ids:
-        pack = knowledge.build_taili_context_pack(query=operator_query, include_docs=True)
-        compact = _compact_taili_context_pack_for_llm(pack)
-        evidence["taili_context"] = _status_block(
+    if "product_context" in source_ids:
+        pack = knowledge.build_context_pack(
+            query=operator_query,
+            include_docs=True,
+            product_id=getattr(src.settings, "product_id", "") or None,
+        )
+        compact = _compact_product_context_pack_for_llm(pack)
+        evidence["product_context"] = _status_block(
             "ok" if compact.get("yaml", {}).get("available", True) else "missing",
             compact,
-            summary="Taili YAML/spec/strategy allowlist loaded",
+            summary="Active product YAML/spec/strategy allowlist loaded",
         )
         if compact.get("yaml", {}).get("available") is False:
-            _gap("taili_context", str(compact.get("yaml", {}).get("error") or "Taili YAML unavailable"),
+            _gap("product_context", str(compact.get("yaml", {}).get("error") or "Product YAML unavailable"),
                  impact="cannot make project-specific YAML/config claims")
 
     if "spec_coverage" in source_ids:
@@ -1150,7 +1209,7 @@ def _compact_remote_status_for_llm(remote: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _compact_taili_context_pack_for_llm(pack: Dict[str, Any]) -> Dict[str, Any]:
+def _compact_product_context_pack_for_llm(pack: Dict[str, Any]) -> Dict[str, Any]:
     yaml_summary = pack.get("yaml") if isinstance(pack.get("yaml"), dict) else {}
     search_hits = pack.get("search_hits") if isinstance(pack.get("search_hits"), dict) else {}
     return {
@@ -1484,13 +1543,13 @@ def _compact_operator_context_for_llm(context: Dict[str, Any]) -> Dict[str, Any]
     The full context intentionally contains auditable raw structures for API/UI consumers. The
     chat loop needs the decisive facts, not 1MB+ of telemetry history and doc previews.
     """
-    taili = context.get("taili_context_pack") if isinstance(context.get("taili_context_pack"), dict) else {}
+    product = context.get("product_context_pack") if isinstance(context.get("product_context_pack"), dict) else {}
     telemetry = context.get("training_telemetry") if isinstance(context.get("training_telemetry"), dict) else {}
     remote = context.get("remote_status") if isinstance(context.get("remote_status"), dict) else {}
     latest = telemetry.get("latest") if isinstance(telemetry.get("latest"), dict) else {}
     snapshot = telemetry.get("snapshot") if isinstance(telemetry.get("snapshot"), dict) else {}
-    yaml_summary = taili.get("yaml") if isinstance(taili.get("yaml"), dict) else {}
-    search_hits = taili.get("search_hits") if isinstance(taili.get("search_hits"), dict) else {}
+    yaml_summary = product.get("yaml") if isinstance(product.get("yaml"), dict) else {}
+    search_hits = product.get("search_hits") if isinstance(product.get("search_hits"), dict) else {}
 
     def _first_dict_items(value: Any, limit: int) -> Dict[str, Any]:
         if not isinstance(value, dict):
@@ -1537,8 +1596,8 @@ def _compact_operator_context_for_llm(context: Dict[str, Any]) -> Dict[str, Any]
     return {
         "permission_boundary": context.get("permission_boundary"),
         "query": context.get("query"),
-        "taili_strategy": {
-            "sources": taili.get("sources"),
+        "product_strategy": {
+            "sources": product.get("sources"),
             "yaml": {
                 "profile": yaml_summary.get("profile"),
                 "task_default_id": yaml_summary.get("task_default_id"),
@@ -1764,7 +1823,7 @@ def _tool_list_frameworks(src: RealDataSource) -> Dict[str, Any]:
                 "desired": profile.id == desired_id,
                 "note": profile.note,
             }
-            for profile in list_framework_profiles()
+            for profile in list_framework_profiles(product_id=settings.product_id or None)
         ],
     }
 
@@ -1950,7 +2009,9 @@ TOOLS = {
     "get_config": _tool_get_config,
     "get_asset": _tool_get_asset,
     "search_knowledge": _tool_search_knowledge,
-    "get_taili_context_pack": _tool_get_taili_context_pack,
+    "get_context_pack": _tool_get_context_pack,
+    # 旧工具名是公开兼容入口，内部实现使用 get_context_pack。
+    "get_taili_context_pack": _tool_get_context_pack,
     "get_spec_coverage": _tool_get_spec_coverage,
     "get_acceptance": _tool_get_acceptance,
     "analyze_acceptance": _tool_analyze_acceptance,
@@ -1991,7 +2052,7 @@ _TOOLS_DOC = """Available tools (read-only):
                                    It selects only allowlisted sources, collects them, marks missing
                                    or stale evidence as gaps, and leaves the final wording flexible.
 - get_operator_context(query="", include_diagnostics=true)
-                                -> legacy one-shot controlled context for high-quality answers: Taili
+                                -> legacy one-shot controlled context for high-quality answers: active product
                                    spec/strategy/YAML pack, live training telemetry, remote GPU/RAM/
                                    disk/tmux state, active workspace config, definitions, and recent
                                    diagnostic history. Use only if get_evidence_context is unavailable
@@ -2000,7 +2061,7 @@ _TOOLS_DOC = """Available tools (read-only):
                                    curriculum/gates, health, checkpoint, JSONL/log provenance
 - get_reward_model(query="", term="") -> reward-model knowledge base. Each reward term's STRUCTURE
                                    (kernel kind / weight param(s) / gates / code location / trade-offs)
-                                   is DERIVED from taili_reward.py; the current weight VALUE is read LIVE
+                                   is DERIVED from the active product reward source; the current weight VALUE is read LIVE
                                    from this run's effective_config. Use for "how is reward X computed /
                                    what is its weight now / what does X trade off against". Durable
                                    structure cannot go stale, live weight carries provenance, and it
@@ -2011,7 +2072,7 @@ _TOOLS_DOC = """Available tools (read-only):
                                    robot_profile (surfaces drift the profile's own self-check can't).
                                    Use for "how many DOF / nominal height / joints / actuators".
 - get_curriculum_model(query="") -> phase-gate / curriculum thresholds. Code DEFAULTS derived from
-                                   taili_amp_env_cfg.py AST; the CURRENT run values read live from
+                                   the product curriculum AST; the CURRENT run values read live from
                                    effective_config, paired with provenance (never a hand-copied number).
                                    Use for "what are the current phase-gate thresholds / penalty ramp".
 - get_research_audit(manifest="", checkpoint_root="", strict=false) -> LOCAL read-only RL Agent
@@ -2044,9 +2105,9 @@ _TOOLS_DOC = """Available tools (read-only):
                                    train.telemetry.jsonl / console.log / checkpoint_dir paths,
                                    presence, sizes, line counts, and discovery evidence
 - explain_definition(query="")  -> definition registry for reward/curriculum/diagnostic terms
-- get_signal_map(query="")      -> curated spec/YAML/code/telemetry/diagnostic map for Taili
+- get_signal_map(query="")      -> curated spec/YAML/code/telemetry/diagnostic map for the active product
                                    signals. Use to avoid missing a source layer.
-- get_code_knowledge(query="")  -> allowlisted Taili implementation evidence: source snippets,
+- get_code_knowledge(query="")  -> allowlisted active-product implementation evidence: source snippets,
                                    file/line windows, and YAML key consumption checks. Use for
                                    "where is this computed?", "is this field consumed?", "dead key",
                                    or YAML-code alignment questions.
@@ -2063,13 +2124,13 @@ _TOOLS_DOC = """Available tools (read-only):
                                    key params); optional grep regex to focus
 - get_asset()                   -> read-only view of the robot asset (actuator stiffness/damping/
                                    effort/mass) - for actuator/hardware-root-cause diagnosis
-- get_taili_context_pack(query="")
-                                -> controlled local knowledge pack: Taili spec, strategy decisions,
-                                   system architecture notes, and the current Taili YAML contract.
+- get_context_pack(query="")
+                                -> controlled local knowledge pack: active product spec, strategy decisions,
+                                   system architecture notes, and the current product contract.
                                    Use before strategy/config/tuning questions.
-- get_spec_coverage()           -> taili_spec acceptance ledger: each spec row mapped to current
+- get_spec_coverage()           -> active-product acceptance ledger: each spec row mapped to current
                                    training mechanism, evaluation coverage, gaps, and next actions.
-- get_acceptance()              -> MEASURED taili_spec §2 verdict for the newest run (scored from
+- get_acceptance()              -> MEASURED active-product verdict for the newest run (scored from
                                    physeval logs; never launches physeval): passed, per-family
                                    present/ok, and failing sub-gates with stat-vs-band. THE metric
                                    the product is graded on — prefer over get_spec_coverage for any
@@ -2095,7 +2156,7 @@ _TOOLS_DOC = """Available tools (read-only):
                                    job_id means latest restorable job
 - search_knowledge(query="")    -> allowlisted project docs search over spec / strategy /
                                    architecture notes. Use it for focused supporting evidence
-                                   after get_taili_context_pack when needed."""
+                                   after get_context_pack when needed. get_taili_context_pack remains a legacy alias."""
 
 _ACTIONS_DOC = """Permission model:
 - read-only: status, training telemetry, logs, TensorBoard-derived curves, diagnostics reports,
@@ -2107,14 +2168,14 @@ _ACTIONS_DOC = """Permission model:
 
 Actions you may PROPOSE (you must NEVER execute these yourself - propose, and
 the operator confirms before anything runs):
-- deploy_payload                  build local Taili payload, upload to remote data disk, extract, and verify
-- start_training                  start a new payload-first Taili training run from the newest deployed payload
+- deploy_payload                  build the active product payload, upload to remote data disk, extract, and verify
+- start_training                  start a new payload-first active-product training run from the newest deployed payload
 - run_diagnostic                  run an allowlisted diagnostic preset against a selected/latest checkpoint
 - kill_training                   stop the currently-running training
 - resume_training                 resume payload-first training from the latest checkpoint when available
 - run_physeval                    legacy only; use run_diagnostic for the payload-first runtime
 - run_acceptance {terrains,checkpoint}
-                                  MEASURE the policy vs taili_spec §2 (physeval -> scored verdict).
+                                  MEASURE the policy against the active product specification (physeval -> scored verdict).
                                   Self-refuses if training is active. Read the result afterwards with
                                   get_acceptance. This is the copilot's own measure step of the loop.
 - edit_config {key, value}        change ONE env_cfg field's value (auto-backs-up first;
@@ -2323,10 +2384,10 @@ Rules:
   and synthesizes a decisive conclusion + next_action, all grounded on shared evidence. Read its
   synthesis and answer from it (cite survived_verification vs total). Do NOT use run_workflow for
   routine status/definition/"is it stuck" questions — it costs many LLM calls; answer those directly.
-- For narrow strategy/config/YAML questions that do not need live state, call get_taili_context_pack.
+- For narrow strategy/config/YAML questions that do not need live state, call get_context_pack.
   For a specific metric/formula, call explain_definition. For YAML-code alignment, call
   get_signal_map/get_code_knowledge. Ground advice in the spec/YAML/strategy/code evidence
-  and cite the source names (taili_spec, taili_strategy_decisions, taili_blind_config.yaml,
+  and cite the source names from the active product contract and its declared strategy/spec files,
   and source file paths when relevant).
   If the pack has nothing relevant, say so plainly.
 - Diagnosis -> fix: once your grounded diagnosis points to a fix, decide its TYPE:
@@ -3063,7 +3124,9 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
             # edit the LOCAL strategy contract (reward weights / curriculum gates) with allowlist +
             # bounds + a rollback-stack push; deploy_payload then ships it to the box. This is the
             # copilot's own "tune" step of the measure->tune->retrain loop.
-            from autotuner.taili_ops.strategy_edit import apply_weight_changes
+            from autotuner.product import load_product_plugin
+
+            apply_weight_changes = load_product_plugin(src._product_contract(), "strategy", "apply")
             changes = args.get("changes") if isinstance(args.get("changes"), dict) else {}
             res = await asyncio.to_thread(apply_weight_changes, changes, note=str(args.get("note", "")))
             if res["ok"]:
@@ -3082,7 +3145,9 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
             )
             return {"ok": r.ok, "detail": r.message}
         if name == "rollback_tuning":
-            from autotuner.taili_ops.strategy_edit import rollback_last
+            from autotuner.product import load_product_plugin
+
+            rollback_last = load_product_plugin(src._product_contract(), "strategy", "rollback")
             res = await asyncio.to_thread(rollback_last)
             if res["ok"]:
                 diffs = ", ".join(f"{a['key']}->{a['new']}" for a in res.get("restored", []))

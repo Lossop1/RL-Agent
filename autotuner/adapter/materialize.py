@@ -1,27 +1,12 @@
-"""Materialize an adapted config into local editable copies.
-
-This uses the Locomotion Console guarded-edit discipline: backup, replace,
-read back, and roll back on mismatch. It operates on local copies with Python
-regexes, leaving remote deployment to deploy.py.
-"""
+"""把适配结果写入产品声明的本地配置副本。"""
 from __future__ import annotations
 
 import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
-
-# AdaptedConfig.reward_thresholds field -> env_cfg dataclass field.
-_ENVCFG_MAP = {
-    "stand_height": "stand_height", "base_clearance": "base_clearance",
-    "clr_rough_bonus_max": "clr_rough_bonus_max", "air_time_min": "air_time_min",
-    "torque_limit_frac": "torque_limit_frac",
-    "cmd_fwd_range": "cmd_fwd_range", "cmd_back_range": "cmd_back_range",
-    "cmd_lat_range": "cmd_lat_range", "cmd_yaw_range": "cmd_yaw_range",
-    "dr_mass_range_1": "dr_mass_range_1", "dr_mass_range_2": "dr_mass_range_2",
-    "dr_mass_range_3": "dr_mass_range_3",
-}
+from typing import Any
 
 
 @dataclass
@@ -31,144 +16,191 @@ class Edit:
     old: str
     new: str
     changed: bool
-    kind: str            # "scalar" | "tuple" | "asset_dict" | "flagged_advisory"
+    kind: str
     applied: bool = True
 
 
-def _fmt(v) -> str:
-    if isinstance(v, (tuple, list)):
-        return "(" + ", ".join(_fmt(x) for x in v) + ")"
-    if isinstance(v, float):
-        return repr(round(v, 6))
-    return str(v)
+def _mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return value
 
 
-def _nums(s) -> tuple:
-    """从字符串/值里抽出数字元组,用于数值相等比较(去掉 0.30 vs 0.3 / 320 vs 320.0 假阳性)。"""
-    if isinstance(s, (tuple, list)):
-        return tuple(float(x) for x in s)
-    return tuple(float(x) for x in re.findall(r"-?\d+\.?\d*", str(s)))
+def _fmt(value: Any) -> str:
+    if isinstance(value, (tuple, list)):
+        return "(" + ", ".join(_fmt(item) for item in value) + ")"
+    if isinstance(value, float):
+        return repr(round(value, 6))
+    return str(value)
 
 
-def _numeric_changed(old_str: str, new_val) -> bool:
-    a, b = _nums(old_str), _nums(new_val)
-    if len(a) != len(b):
+def _nums(value: Any) -> tuple[float, ...]:
+    if isinstance(value, (tuple, list)):
+        return tuple(float(item) for item in value)
+    return tuple(float(item) for item in re.findall(r"-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?", str(value)))
+
+
+def _numeric_changed(old_value: str, new_value: Any) -> bool:
+    old_numbers, new_numbers = _nums(old_value), _nums(new_value)
+    if len(old_numbers) != len(new_numbers):
         return True
-    return any(abs(x - y) > 1e-6 for x, y in zip(a, b))
+    return any(abs(old - new) > 1e-6 for old, new in zip(old_numbers, new_numbers))
 
 
-def _edit_field(text: str, field: str, new_val: str):
-    """替换 `<indent>FIELD<:anno>= VALUE<comment>` 的 VALUE,保留缩进/注解/注释。返回 (text, old)。"""
-    pat = re.compile(rf"^(?P<pre>\s*{re.escape(field)}\s*(:[^=\n]*)?=\s*)(?P<val>[^#\n]*?)(?P<post>\s*(#.*)?)$",
-                     re.MULTILINE)
-    m = pat.search(text)
-    if not m:
+def _edit_field(text: str, field: str, new_value: str) -> tuple[str, str | None]:
+    pattern = re.compile(
+        rf"^(?P<pre>\s*{re.escape(field)}\s*(:[^=\n]*)?=\s*)(?P<value>[^#\n]*?)(?P<post>\s*(#.*)?)$",
+        re.MULTILINE,
+    )
+    match = pattern.search(text)
+    if match is None:
         return text, None
-    old = m.group("val").strip()
-    new_text = text[:m.start("val")] + new_val + (" " if not m.group("post").startswith(" ") else "") \
-        + text[m.end("val"):]
-    return new_text, old
+    old = match.group("value").strip()
+    separator = " " if not match.group("post").startswith(" ") else ""
+    result = text[: match.start("value")] + new_value + separator + text[match.end("value") :]
+    return result, old
 
 
-def _edit_asset_dict_value(text: str, block: str, joint_key: str, new_val: str):
-    """改 asset 里 `block={ ... "joint_key": VALUE, ...}` 内某关节的 VALUE(块作用域,避免撞另一块同关节)。"""
-    bm = re.search(rf"{block}\s*=\s*\{{(.*?)\}}", text, re.DOTALL)
-    if not bm:
+def _edit_asset_dict_value(
+    text: str,
+    block: str,
+    joint_pattern: str,
+    new_value: str,
+) -> tuple[str, str | None]:
+    block_match = re.search(rf"{re.escape(block)}\s*=\s*\{{(.*?)\}}", text, re.DOTALL)
+    if block_match is None:
         return text, None
-    blk = bm.group(1)
-    jm = re.search(rf'("{re.escape(joint_key)}"\s*:\s*)([\d.]+)', blk)
-    if not jm:
+    body = block_match.group(1)
+    joint_match = re.search(
+        rf'("{re.escape(joint_pattern)}"\s*:\s*)(-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)',
+        body,
+    )
+    if joint_match is None:
         return text, None
-    old = jm.group(2)
-    new_blk = blk[:jm.start(2)] + new_val + blk[jm.end(2):]
-    return text[:bm.start(1)] + new_blk + text[bm.end(1):], old
+    old = joint_match.group(2)
+    updated = body[: joint_match.start(2)] + new_value + body[joint_match.end(2) :]
+    return text[: block_match.start(1)] + updated + text[block_match.end(1) :], old
 
 
-def materialize(adapted: dict, env_cfg_src: str, asset_src: str, work_dir: str) -> List[Edit]:
-    """AdaptedConfig → 副本上的改动集。返回 Edit 列表(含 no-op,便于审计"哪些==proven")。"""
-    wd = Path(work_dir); wd.mkdir(parents=True, exist_ok=True)
-    env_dst = wd / Path(env_cfg_src).name
-    asset_dst = wd / Path(asset_src).name
-    shutil.copy2(env_cfg_src, env_dst)
-    shutil.copy2(asset_src, asset_dst)
+def materialize(
+    adapted: Mapping[str, Any],
+    env_cfg_src: str,
+    asset_src: str,
+    work_dir: str,
+    *,
+    spec: Mapping[str, Any],
+) -> list[Edit]:
+    """按产品字段映射写入副本，返回包含未命中项的完整审计记录。"""
+    env_fields = _mapping(spec.get("env_fields"), "materialization.env_fields")
+    actuator_blocks = _mapping(spec.get("actuator_blocks"), "materialization.actuator_blocks")
+    joint_patterns = _mapping(
+        spec.get("actuator_joint_patterns"),
+        "materialization.actuator_joint_patterns",
+    )
+    baseline = _mapping(spec.get("advisory_baseline", {}), "materialization.advisory_baseline")
+    advisory_roles = spec.get("advisory_roles", ())
+    if not isinstance(advisory_roles, (list, tuple)):
+        raise ValueError("materialization.advisory_roles must be a list")
 
-    edits: List[Edit] = []
-    rt = adapted["reward_thresholds"]
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    env_destination = work / Path(env_cfg_src).name
+    asset_destination = work / Path(asset_src).name
+    shutil.copy2(env_cfg_src, env_destination)
+    shutil.copy2(asset_src, asset_destination)
+    edits: list[Edit] = []
 
-    # ── env_cfg dataclass 字段 ──
-    text = env_dst.read_text(encoding="utf-8")
-    for key, field in _ENVCFG_MAP.items():
-        if key not in rt:
+    reward_thresholds = _mapping(adapted.get("reward_thresholds"), "adapted.reward_thresholds")
+    env_text = env_destination.read_text(encoding="utf-8")
+    for key, raw_field in env_fields.items():
+        if key not in reward_thresholds:
             continue
-        newv = _fmt(rt[key])
-        text, old = _edit_field(text, field, newv)
+        field = str(raw_field)
+        value = reward_thresholds[key]
+        rendered = _fmt(value)
+        env_text, old = _edit_field(env_text, field, rendered)
         if old is None:
-            edits.append(Edit(env_dst.name, field, "(not found)", newv, False, "scalar", applied=False))
+            edits.append(Edit(env_destination.name, field, "(not found)", rendered, False, "field", False))
             continue
-        kind = "tuple" if isinstance(rt[key], (tuple, list)) else "scalar"
-        changed = _numeric_changed(old, rt[key])   # 数值比较,不被 0.30 vs 0.3 假阳性
-        edits.append(Edit(env_dst.name, field, old, newv, changed, kind))
-    env_dst.write_text(text, encoding="utf-8")
+        edits.append(
+            Edit(
+                env_destination.name,
+                field,
+                old,
+                rendered,
+                _numeric_changed(old, value),
+                "tuple" if isinstance(value, (tuple, list)) else "scalar",
+            )
+        )
+    env_destination.write_text(env_text, encoding="utf-8")
 
-    # ── asset 执行器 per-joint(effort/velocity)──
-    atext = asset_dst.read_text(encoding="utf-8")
-    act = adapted["actuator"]
-    jmap = {"hip": ".*_hip_joint", "thigh": ".*_thigh_joint", "calf": ".*_calf_joint"}
-    for block, src in (("effort_limit", act["effort"]), ("velocity_limit", act["velocity"])):
-        for role, jk in jmap.items():
-            newv = _fmt(src[role])
-            atext, old = _edit_asset_dict_value(atext, block, jk, newv)
-            if old is None:
+    actuator = _mapping(adapted.get("actuator"), "adapted.actuator")
+    asset_text = asset_destination.read_text(encoding="utf-8")
+    for block, source_name in actuator_blocks.items():
+        source = _mapping(actuator.get(str(source_name)), f"adapted.actuator.{source_name}")
+        for role, raw_pattern in joint_patterns.items():
+            if role not in source:
                 continue
-            changed = _numeric_changed(old, src[role])
-            edits.append(Edit(asset_dst.name, f"{block}[{role}]", old, newv, changed, "asset_dict"))
-    asset_dst.write_text(atext, encoding="utf-8")
+            value = source[role]
+            rendered = _fmt(value)
+            asset_text, old = _edit_asset_dict_value(asset_text, str(block), str(raw_pattern), rendered)
+            if old is None:
+                edits.append(
+                    Edit(asset_destination.name, f"{block}[{role}]", "(not found)", rendered, False, "asset_dict", False)
+                )
+                continue
+            edits.append(
+                Edit(
+                    asset_destination.name,
+                    f"{block}[{role}]",
+                    old,
+                    rendered,
+                    _numeric_changed(old, value),
+                    "asset_dict",
+                )
+            )
+    asset_destination.write_text(asset_text, encoding="utf-8")
 
-    # ── stiffness/damping:Adapter 派生 per-joint,proven 用共享标量 → flagged advisory(不自动改结构,§8.1)──
-    for role in ("hip", "thigh", "calf"):
-        edits.append(Edit(asset_dst.name, f"Kp[{role}]", "shared 120.0", str(act["Kp"][role]),
-                          True, "flagged_advisory", applied=False))
-        edits.append(Edit(asset_dst.name, f"Kd[{role}]", "shared 10.0", str(act["Kd"][role]),
-                          True, "flagged_advisory", applied=False))
-
+    for role in (str(item) for item in advisory_roles):
+        for field in ("Kp", "Kd"):
+            values = _mapping(actuator.get(field), f"adapted.actuator.{field}")
+            if role not in values:
+                continue
+            edits.append(
+                Edit(
+                    asset_destination.name,
+                    f"{field}[{role}]",
+                    str(baseline.get(field, "undeclared")),
+                    str(values[role]),
+                    True,
+                    "flagged_advisory",
+                    False,
+                )
+            )
     return edits
 
 
-def roundtrip_verify(adapted: dict, env_materialized: str) -> List[str]:
-    """重读 materialized env_cfg,核对 reward_thresholds 字段确实写进去了。返回不符项(空=PASS)。"""
+def roundtrip_verify(
+    adapted: Mapping[str, Any],
+    env_materialized: str,
+    *,
+    spec: Mapping[str, Any],
+) -> list[str]:
+    """重读物化副本，确认合同声明的奖励字段已准确写入。"""
+    env_fields = _mapping(spec.get("env_fields"), "materialization.env_fields")
+    thresholds = _mapping(adapted.get("reward_thresholds"), "adapted.reward_thresholds")
     text = Path(env_materialized).read_text(encoding="utf-8")
-    rt = adapted["reward_thresholds"]
-    bad = []
-    for key, field in _ENVCFG_MAP.items():
-        if key not in rt:
+    bad: list[str] = []
+    for key, raw_field in env_fields.items():
+        if key not in thresholds:
             continue
-        m = re.search(rf"^\s*{field}\s*(:[^=\n]*)?=\s*([^#\n]*)", text, re.MULTILINE)
-        got = re.sub(r"\s", "", m.group(2)) if m else "(missing)"
-        want = re.sub(r"\s", "", _fmt(rt[key]))
-        if got != want:
-            bad.append(f"{field}: got {got} want {want}")
+        field = str(raw_field)
+        match = re.search(rf"^\s*{re.escape(field)}\s*(:[^=\n]*)?=\s*([^#\n]*)", text, re.MULTILINE)
+        actual = re.sub(r"\s", "", match.group(2)) if match else "(missing)"
+        expected = re.sub(r"\s", "", _fmt(thresholds[key]))
+        if actual != expected:
+            bad.append(f"{field}: got {actual} want {expected}")
     return bad
 
 
-if __name__ == "__main__":
-    import tempfile
-    from autotuner.adapter.adapt import adapt, _DEFAULT_URDF
-
-    env_src = "autotuner/blind_locomotion/env_edit/taili_amp_env_cfg.py"
-    asset_src = "autotuner/blind_locomotion/assets/taili.py"
-    wd = tempfile.mkdtemp(prefix="adapter_materialize_")
-    cfg = adapt(_DEFAULT_URDF)
-    edits = materialize(cfg, env_src, asset_src, wd)
-
-    print(f"落盘到副本: {wd}  (原文件未碰)\n")
-    print(f"{'file':22} {'field':22} {'old':>14} → {'new':<14} {'kind':16} {'changed'}")
-    for e in edits:
-        flag = "★FIX/NEW" if e.changed and e.applied else ("flag" if not e.applied else "")
-        print(f"{e.file:22} {e.field:22} {str(e.old)[:14]:>14} → {str(e.new)[:14]:<14} {e.kind:16} {flag}")
-
-    bad = roundtrip_verify(cfg, str(Path(wd) / Path(env_src).name))
-    nchg = sum(1 for e in edits if e.changed and e.applied)
-    nflag = sum(1 for e in edits if not e.applied)
-    print(f"\nenv_cfg round-trip: {'PASS' if not bad else 'FAIL: ' + str(bad)}")
-    print(f"应用改动(真实): {nchg}  · flagged advisory(per-motor,§8.1): {nflag}  · 其余 = no-op(==proven)")
-    print("Taili 身份:env_cfg 应全 no-op(复现 proven);asset calf velocity 应已是 URDF 8.27。")
+__all__ = ["Edit", "materialize", "roundtrip_verify"]

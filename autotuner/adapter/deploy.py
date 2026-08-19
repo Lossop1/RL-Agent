@@ -61,7 +61,7 @@ class DeployPlan:
 
 _ROLE_BY_HINT = (
     ("env_cfg", "env_cfg"), ("_cfg", "env_cfg"),
-    ("asset", "asset"), ("taili.py", "asset"),
+    ("asset", "asset"),
     (".npz", "reference_clip"), ("clip", "reference_clip"),
 )
 
@@ -218,29 +218,14 @@ def execute(plan: DeployPlan, ssh: SSH, *, confirm: bool = False, do_launch: boo
     return res
 
 
-if __name__ == "__main__":
-    # DRY-RUN self-check: adapt → materialize → build_plan → render. Pure local, no SSH.
-    import tempfile
-    from autotuner.adapter.adapt import adapt, _DEFAULT_URDF
-    from autotuner.adapter.materialize import materialize
-
-    env_src = "autotuner/blind_locomotion/env_edit/taili_amp_env_cfg.py"
-    asset_src = "autotuner/blind_locomotion/assets/taili.py"
-    wd = tempfile.mkdtemp(prefix="adapter_deploy_")
-    cfg = adapt(_DEFAULT_URDF)
-    materialize(cfg, env_src, asset_src, wd)
-
-    remote_base = ("/root/gpufree-data/robot_lab/source/robot_lab/robot_lab/tasks/"
-                   "direct/taili_amp")
-    remote_map = {
-        Path(env_src).name:   f"{remote_base}/{Path(env_src).name}",
-        Path(asset_src).name: "/root/gpufree-data/robot_lab/.../asset/taili.py",
-    }
-    plan = build_plan(wd, remote_map, stamp="20260629-231500",
-                      launch_cmd="/opt/conda/envs/isaaclab/bin/python3 /root/tp_train_real.py",
-                      require_refs=True)
-    print(render_plan(plan))
-    print("\nrollback recipe:")
-    for c in restore_cmds(plan):
-        print("  " + c)
-    print("\n(DRY-RUN only — execute(confirm=True) is required to touch the remote.)")
+__all__ = [
+    "DeployItem",
+    "DeployPlan",
+    "DeployResult",
+    "ItemResult",
+    "SSH",
+    "build_plan",
+    "execute",
+    "render_plan",
+    "restore_cmds",
+]

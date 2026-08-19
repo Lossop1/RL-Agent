@@ -90,7 +90,7 @@ def test_compiler_emits_immutable_verified_artifact(tmp_path):
 
 
 def test_remote_payload_contains_safe_mechanism_runtime():
-    from autotuner.training_payloads.taili_blind_runtime.payload_manifest import iter_payload_files
+    from products.taili.payload.payload_manifest import iter_payload_files
 
     destinations = {destination for _, destination in iter_payload_files()}
     assert "taili_blind_runtime/taili_core/mechanism_specs.py" in destinations

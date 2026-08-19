@@ -31,7 +31,7 @@ class BoxProfile(BaseModel):
 
     # run layout (discovered structure; runtime resolves the newest instance)
     framework: str = "skrl"
-    experiment: str = "taili_amp"
+    experiment: str = ""
     runs_glob: str = ""                       # e.g. /root/robot_lab/logs/skrl/taili_amp/*/
     tfevents_glob: str = "events.out.tfevents.*"
     checkpoints_subdir: str = "checkpoints"
@@ -48,7 +48,7 @@ class BoxProfile(BaseModel):
     # liveness + actions (commands run on the box)
     train_running_probe: str = "pgrep -fa 'train.*\\.py' | grep -v pgrep"
     kill_cmd: str = "pkill -9 -f train.py"
-    task_id: str = "RobotLab-Isaac-Taili-AMP-Direct-v0"
+    task_id: str = ""
     # full shell command templates discovered from the box (env setup + flags), with a literal
     # {checkpoint} placeholder the locomotion console substitutes at run time.
     physeval_cmd: str = ""

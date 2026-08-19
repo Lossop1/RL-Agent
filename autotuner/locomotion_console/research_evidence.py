@@ -15,6 +15,8 @@ import math
 from pathlib import Path
 from typing import Any, Iterable
 
+from autotuner.product import resolve_product_runtime
+
 import yaml
 
 from autotuner.research.gate_calibration import (
@@ -233,7 +235,16 @@ def distribution_manifest_from_telemetry(
     }
 
 
-def _scorecard_keys(paths: Iterable[Path]) -> tuple[set[str], list[str]]:
+def _scorecard_keys(
+    paths: Iterable[Path],
+    *,
+    product_id: str | None = None,
+    contract: Any = None,
+) -> tuple[set[str], list[str]]:
+    from autotuner.product import load_product_plugin, resolve_product_contract
+
+    product = contract or resolve_product_contract(product_id)
+    parse_scorecard = load_product_plugin(product, "acceptance", "parse_scorecard")
     keys: set[str] = set()
     evidence: list[str] = []
     for path in paths:
@@ -241,10 +252,7 @@ def _scorecard_keys(paths: Iterable[Path]) -> tuple[set[str], list[str]]:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        # acceptance_aggregate's parser is deliberately reused so the
-        # evidence assembler and the console interpret scorecard lines alike.
-        from autotuner.blind_locomotion.acceptance_aggregate import parse_scorecard
-
+        # 证据汇编与控制台必须使用同一产品解析器，避免同一日志产生两种语义。
         parsed = parse_scorecard(text)
         if parsed:
             keys.update(parsed)
@@ -268,8 +276,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-_CONFIG_ARTIFACT_NAMES = {
-    "source_config": "taili_blind_config.yaml",
+_GENERIC_CONFIG_ARTIFACT_NAMES = {
+    "source_config": "source_config.yaml",
     "effective_config": "effective_config.yaml",
     "agent_config": "agent.skrl.yaml",
 }
@@ -288,11 +296,35 @@ def _file_ref(path: Path) -> dict[str, Any]:
     return item
 
 
-def configuration_artifact_parity(run_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+def _configuration_artifact_names(product_id: str | None = None) -> dict[str, str]:
+    """读取产品合同声明的运行配置文件名；没有产品时只使用通用命名。"""
+    if not product_id:
+        return dict(_GENERIC_CONFIG_ARTIFACT_NAMES)
+    try:
+        deployment = resolve_product_runtime(product_id).deployment
+        declared = deployment.get("configuration_artifacts", {})
+    except Exception:
+        return {}
+    if not isinstance(declared, dict):
+        return {}
+    result = {
+        str(key): str(value).strip().lstrip("/")
+        for key, value in declared.items()
+        if str(key).strip() and isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", value.strip())
+    }
+    return result
+
+
+def configuration_artifact_parity(
+    run_path: Path,
+    manifest: dict[str, Any],
+    *,
+    product_id: str | None = None,
+) -> dict[str, Any]:
     """Pair downloaded configuration files with the runtime-recorded digests."""
     remote_config = manifest.get("configuration") if isinstance(manifest.get("configuration"), dict) else {}
     result: dict[str, Any] = {}
-    for key, filename in _CONFIG_ARTIFACT_NAMES.items():
+    for key, filename in _configuration_artifact_names(product_id).items():
         remote = remote_config.get(key) if isinstance(remote_config.get(key), dict) else {}
         local = _file_ref(run_path / filename)
         remote_hash = str(remote.get("sha256") or "")
@@ -467,8 +499,14 @@ def metric_alignment_from_scorecards(
     *,
     telemetry_source: str,
     alignment_evidence: str | Path | None = None,
+    product_id: str | None = None,
+    contract: Any = None,
 ) -> list[dict[str, Any]]:
-    keys, scorecard_evidence = _scorecard_keys(scorecard_paths)
+    keys, scorecard_evidence = _scorecard_keys(
+        scorecard_paths,
+        product_id=product_id,
+        contract=contract,
+    )
     sidecar = Path(alignment_evidence).resolve() if alignment_evidence else None
     sidecar_rows = _alignment_rows(sidecar)
     out: list[dict[str, Any]] = []
@@ -562,11 +600,16 @@ def assemble_manifest(
     metric_alignment: str | Path | None = None,
     gate_calibration: str | Path | None = None,
     checkpoint_capabilities: str | Path | None = None,
+    product_id: str | None = None,
 ) -> Path:
     run_path = Path(run_dir).resolve()
     manifest_path = run_path / "runtime_manifest.json"
     manifest = _read_json(manifest_path)
-    manifest["configuration_artifacts"] = configuration_artifact_parity(run_path, manifest)
+    manifest["configuration_artifacts"] = configuration_artifact_parity(
+        run_path,
+        manifest,
+        product_id=product_id,
+    )
     telemetry_path = run_path / "train.telemetry.jsonl"
     if not telemetry_path.is_file():
         candidates = sorted(run_path.glob("*.telemetry.jsonl"))
@@ -584,6 +627,7 @@ def assemble_manifest(
             [Path(item) for item in scorecards],
             telemetry_source=str(telemetry_path) if telemetry_rows else "",
             alignment_evidence=metric_alignment,
+            product_id=product_id,
         )
         manifest.setdefault("evidence", {}).setdefault("scorecards", []).extend(str(item) for item in scorecards)
         if metric_alignment:
@@ -620,7 +664,7 @@ def time_iso() -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Assemble persisted Taili evidence into runtime_manifest.json")
+    parser = argparse.ArgumentParser(description="Assemble persisted product evidence into runtime_manifest.json")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--output", default="")
     parser.add_argument("--scorecard", action="append", default=[])
@@ -631,6 +675,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-scenario-contract", default="")
     parser.add_argument("--minimum-gate-samples", type=int, default=3)
     parser.add_argument("--checkpoint-capabilities", default="")
+    parser.add_argument("--product-id", default="")
     return parser
 
 
@@ -653,6 +698,7 @@ def main(argv: list[str] | None = None) -> int:
         metric_alignment=args.metric_alignment or None,
         gate_calibration=gate_calibration,
         checkpoint_capabilities=args.checkpoint_capabilities or None,
+        product_id=args.product_id or None,
     )
     print(path)
     return 0

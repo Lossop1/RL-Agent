@@ -43,6 +43,19 @@ def test_strategy_view_exposes_tuning_settings():
     assert v["amp"]["style_reward_weight"] == 1.00
 
 
+def test_fast_probe_script_uses_only_product_process_pattern():
+    from autotuner.locomotion_console.app import _build_fast_training_probe_script
+
+    script = _build_fast_training_probe_script(
+        "/runs/*/",
+        "product_runtime\\.train|product_runtime\\.launch",
+    )
+
+    assert "taili_blind_runtime" not in script
+    assert script.count("if pgrep -fa") == 1
+    assert "then echo '__RUNNING__1'; else echo '__RUNNING__0'; fi" in script
+
+
 def test_websocket_stream_connects(client):
     # Regression: the mutation-auth gate was once a GLOBAL dependency typed on Request, which made the
     # WebSocket handshake 500 (no Request in WS scope). It must be HTTP-scope only so the live stream

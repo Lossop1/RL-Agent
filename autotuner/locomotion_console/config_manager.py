@@ -280,7 +280,7 @@ def desired_framework_id(settings: LocomotionConsoleSettings) -> str:
     saved = read_console_config(settings).get("framework_id")
     if isinstance(saved, str) and saved.strip():
         try:
-            get_framework_profile(saved.strip())
+            get_framework_profile(saved.strip(), product_id=settings.product_id or None)
             return saved.strip()
         except ValueError:
             pass
@@ -289,7 +289,7 @@ def desired_framework_id(settings: LocomotionConsoleSettings) -> str:
 
 def select_framework(settings: LocomotionConsoleSettings, framework_id: str) -> FrameworkSelectionState:
     framework_id = framework_id.strip()
-    get_framework_profile(framework_id)
+    get_framework_profile(framework_id, product_id=settings.product_id or None)
     path = console_config_path(settings)
     cfg = read_console_config(settings)
     cfg["framework_id"] = framework_id
@@ -379,8 +379,7 @@ def llm_audit_dirs(settings: LocomotionConsoleSettings) -> list[Path]:
     if override:
         return [Path(override)]
     primary = state_root(settings) / "llm_gateway_audit"
-    legacy = Path("out_v07_taili_dog/llm_gateway_audit")
-    return [primary, legacy] if primary != legacy else [primary]
+    return [primary]
 
 
 def recent_llm_audit(settings: LocomotionConsoleSettings, limit: int = 20) -> list[LLMAuditItem]:

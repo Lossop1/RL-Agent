@@ -22,7 +22,7 @@ _ROOT = Path(os.environ.get("LOCOMOTION_CONSOLE_STATE_ROOT", "/tmp/lc_console_st
 
 def _path(robot: str) -> Path:
     _ROOT.mkdir(parents=True, exist_ok=True)
-    return _ROOT / f"{robot or 'taili'}.jsonl"
+    return _ROOT / f"{robot or 'unscoped'}.jsonl"
 
 
 def record_iteration(robot: str, *, target_gate: str, lever: str, config_diff: str = "",
@@ -61,7 +61,7 @@ def _load(robot: str) -> list[dict[str, Any]]:
     return out
 
 
-def read_journal(robot: str = "taili", limit: int = 30) -> dict[str, Any]:
+def read_journal(robot: str = "", limit: int = 30) -> dict[str, Any]:
     """The campaign's decision memory, summarized for the two guards that consume it:
       - tried_and_rolled_back: (gate,lever) pairs the NO-REPEAT guard must reject.
       - best_so_far: the highest kept score — what a new run must beat.

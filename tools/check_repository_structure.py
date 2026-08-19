@@ -59,7 +59,11 @@ def _under(path: Path, root: Path, relative_roots: Iterable[str]) -> bool:
 
 
 def _python_files(root: Path) -> Iterable[Path]:
-    for base in (root / "autotuner", root / "tools" / "isaaclab_quad_diag_observation" / "isaaclab_quad_diag"):
+    for base in (
+        root / "autotuner",
+        root / "products",
+        root / "tools" / "isaaclab_quad_diag_observation" / "isaaclab_quad_diag",
+    ):
         if not base.is_dir():
             continue
         yield from (p for p in base.rglob("*.py") if "__pycache__" not in p.parts)
@@ -82,7 +86,10 @@ def _absolute_imports(tree: ast.AST) -> Iterable[str]:
 
 
 def _is_compatibility(module: str, layout: dict) -> bool:
-    return module in set(layout.get("compatibility", {}).get("modules", []))
+    compatibility = layout.get("compatibility", {})
+    if module in set(compatibility.get("modules", [])):
+        return True
+    return module in set(compatibility.get("packages", []))
 
 
 def check_encoding(root: Path, report: CheckReport) -> None:
@@ -126,7 +133,7 @@ def check_source_boundaries(root: Path, layout: dict, report: CheckReport) -> No
                 if imported == target or imported.startswith(target + "."):
                     report.error(f"非法依赖: {_module_name(path, root)} -> {imported} (禁止依赖 {target})")
 
-    for root_name in ("autotuner", "tools"):
+    for root_name in ("autotuner", "products", "tools"):
         base = root / root_name
         if not base.is_dir():
             continue
@@ -138,9 +145,14 @@ def check_source_boundaries(root: Path, layout: dict, report: CheckReport) -> No
 
 
 def check_compatibility_shims(root: Path, layout: dict, report: CheckReport) -> None:
-    for module in layout.get("compatibility", {}).get("modules", []):
-        path = root / Path(*module.split("."))
-        path = path.with_suffix(".py")
+    compatibility = layout.get("compatibility", {})
+    entries = [
+        *((module, False) for module in compatibility.get("modules", [])),
+        *((module, True) for module in compatibility.get("packages", [])),
+    ]
+    for module, is_package in entries:
+        base = root / Path(*module.split("."))
+        path = base / "__init__.py" if is_package else base.with_suffix(".py")
         if not path.is_file():
             report.error(f"兼容入口缺失: {path.relative_to(root).as_posix()}")
             continue
@@ -164,6 +176,8 @@ def check_required_paths(root: Path, layout: dict, report: CheckReport) -> None:
         "autotuner/research/__init__.py",
         "autotuner/infrastructure/__init__.py",
         "autotuner/taili_ops/__init__.py",
+        "products/__init__.py",
+        "products/taili/__init__.py",
     ]
     required.extend(layout.get("entrypoints", {}).values())
     # entrypoint value 是命令而非路径；只检查文档中列出的模块/文件。
@@ -177,7 +191,7 @@ def check_payload_manifest(root: Path, report: CheckReport) -> None:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     try:
-        from autotuner.training_payloads.taili_blind_runtime.payload_manifest import validate_manifest
+        from products.taili.payload.payload_manifest import validate_manifest
         result = validate_manifest(root)
     except Exception as exc:  # pragma: no cover - dependency/environment failure is reported clearly
         report.error(f"payload 清单无法加载: {type(exc).__name__}: {exc}")

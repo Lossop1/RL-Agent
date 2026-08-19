@@ -14,12 +14,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from .config import LocomotionConsoleSettings
 from .config_set import get_active_config_set
 from .diagnostic_history import DiagnosticHistoryStore
 from .framework_profile import FrameworkProfile, get_framework_profile, list_framework_profiles
+from autotuner.product import ProductRuntimeView, resolve_product_runtime
 from .schemas import (
     ArtifactRefInfo,
     DiagnosticCatalog,
@@ -73,6 +74,7 @@ class _Job:
     message: str = ""
 
 
+# 兼容旧控制台客户端的最小默认集；正常运行时由产品合同 diagnostics.presets 覆盖。
 PRESETS: tuple[_Preset, ...] = (
     _Preset(
         "quick",
@@ -151,8 +153,7 @@ PRESETS: tuple[_Preset, ...] = (
 _PRESET_BY_ID = {preset.id: preset for preset in PRESETS}
 _SESSION = "locomotion_console_diag"
 _TASK_MARKER = "__LOCOMOTION_CONSOLE_DIAGNOSTIC_TASKS__"
-_PAYLOAD_DIAG_FRAMEWORKS = {"taili_amp_blind"}
-_PAYLOAD_GLOBS = ("taili_blind_runtime_*", "taili_recovered_*")
+# 诊断模式、payload 和本体顺序必须来自产品合同；系统层不维护产品名单。
 _TASK_GENERIC_TOKENS = {
     "direct",
     "env",
@@ -163,12 +164,8 @@ _TASK_GENERIC_TOKENS = {
     "v0",
 }
 _TASK_STRONG_TOKENS = {"blind", "teacher"}
-_JOINT_ORDER = [
-    "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
-    "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
-    "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
-]
-_LEG_ORDER = ["FL", "FR", "RL", "RR"]
+_JOINT_ORDER: tuple[str, ...] = ()
+_LEG_ORDER: tuple[str, ...] = ()
 _DIRECTION_STAGE_IDS = {"forward", "backward", "lateral", "yaw"}
 _TERRAIN_ALIASES = {
     "flat": "flat",
@@ -190,11 +187,49 @@ _TERRAIN_ALIASES = {
 _MAX_PLAN_SECONDS = 18 * 60
 
 
-def _task_tokens(value: str) -> set[str]:
+def _preset_from_mapping(data: dict[str, Any]) -> _Preset:
+    """把产品合同中的诊断预设解析为控制器内部对象。"""
+    stages: list[_Stage] = []
+    raw_stages = data.get("stages") if isinstance(data.get("stages"), list) else []
+    for raw in raw_stages:
+        if not isinstance(raw, dict):
+            continue
+        stages.append(
+            _Stage(
+                id=str(raw.get("id") or "stage"),
+                label=str(raw.get("label") or raw.get("id") or "stage"),
+                suite=str(raw.get("suite") or ""),
+                expected_segments=max(1, int(raw.get("expected_segments", 1) or 1)),
+            )
+        )
+    if not stages:
+        stages = [_Stage(str(data.get("id") or "quick"), str(data.get("label") or "Quick check"), "", 1)]
+    category = str(data.get("category") or "quick")
+    if category not in {"quick", "direction", "environment", "robustness"}:
+        category = "quick"
+    return _Preset(
+        id=str(data.get("id") or stages[0].id),
+        label=str(data.get("label") or data.get("id") or "Diagnostic"),
+        description=str(data.get("description") or ""),
+        category=category,
+        estimated_minutes=max(1, int(data.get("estimated_minutes", 1) or 1)),
+        stages=tuple(stages),
+    )
+
+
+def _presets_for_runtime(runtime: ProductRuntimeView | None) -> tuple[_Preset, ...]:
+    if runtime is None:
+        return PRESETS
+    parsed = tuple(_preset_from_mapping(dict(item)) for item in runtime.diagnostic_presets())
+    return parsed or PRESETS
+
+
+def _task_tokens(value: str, generic_tokens: set[str] | None = None) -> set[str]:
+    ignored = generic_tokens if generic_tokens is not None else _TASK_GENERIC_TOKENS
     return {
         token
         for token in re.split(r"[^A-Za-z0-9]+", value.lower())
-        if token and token not in _TASK_GENERIC_TOKENS
+        if token and token not in ignored
     }
 
 
@@ -587,6 +622,7 @@ def _select_diagnostic_task_from_candidates(
     configured_task: str,
     framework_id: str,
     candidates: list[str],
+    selection: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[str, str]:
     """Return a remote-registered diagnostic task, resolving stale local names.
 
@@ -603,30 +639,33 @@ def _select_diagnostic_task_from_candidates(
             f"Remote Gym registry did not report any diagnostic tasks while validating {configured_task!r}"
         )
 
-    configured_tokens = _task_tokens(configured_task)
-    framework_tokens = _task_tokens(framework_id.replace("_", "-"))
+    selection = selection or {}
+    generic_tokens = set(selection.get("generic_tokens") or _TASK_GENERIC_TOKENS)
+    strong_tokens = set(selection.get("strong_tokens") or _TASK_STRONG_TOKENS)
+    family_tokens = set(selection.get("family_tokens") or ())
+    configured_tokens = _task_tokens(configured_task, generic_tokens)
+    framework_tokens = _task_tokens(framework_id.replace("_", "-"), generic_tokens)
     desired_tokens = configured_tokens | framework_tokens
 
     # Strong semantic tokens must not silently cross framework families:
     # blind checkpoints must not resolve to teacher tasks and vice versa.
-    required_strong = sorted(desired_tokens & _TASK_STRONG_TOKENS)
+    required_strong = sorted(desired_tokens & strong_tokens)
     viable = [
         candidate
         for candidate in unique
-        if all(token in _task_tokens(candidate) for token in required_strong)
+        if all(token in _task_tokens(candidate, generic_tokens) for token in required_strong)
     ] or unique
 
     def score(candidate: str) -> float:
-        tokens = _task_tokens(candidate)
+        tokens = _task_tokens(candidate, generic_tokens)
         shared = tokens & desired_tokens
         result = 100.0 * SequenceMatcher(None, configured_task.lower(), candidate.lower()).ratio()
         result += 14.0 * len(shared)
-        if "taili" in desired_tokens and "taili" in tokens:
-            result += 30.0
+        result += 30.0 * len(family_tokens & desired_tokens & tokens)
         for token in required_strong:
             if token in tokens:
                 result += 45.0
-        for token in _TASK_STRONG_TOKENS - set(required_strong):
+        for token in strong_tokens - set(required_strong):
             if token in tokens:
                 result -= 60.0
         # "AMP" is often a training/checkpoint family rather than a Gym task id.
@@ -654,10 +693,83 @@ class DiagnosticsController:
     def __init__(self, settings: LocomotionConsoleSettings, source: Any):
         self.settings = settings
         self.source = source
-        self.framework = get_framework_profile(settings.framework_id)
+        self.framework = get_framework_profile(
+            settings.framework_id,
+            product_id=settings.product_id or None,
+        )
+        try:
+            self.runtime = resolve_product_runtime(settings.product_id or None, check_files=False)
+        except Exception:
+            # 配置错误在执行阶段会被合同校验报告；控制台仍可显示可读错误。
+            self.runtime = None
+        self.presets = _presets_for_runtime(self.runtime)
+        self.preset_by_id = {preset.id: preset for preset in self.presets}
         self.config_set = get_active_config_set(settings)
         self.history = DiagnosticHistoryStore(settings)
         self._job: _Job | None = None
+
+    def _diagnostic_values(self) -> dict[str, Any]:
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            return {}
+        return dict(runtime.diagnostics)
+
+    def _payload_values(self) -> dict[str, Any]:
+        values = self._diagnostic_values().get("payload")
+        return dict(values) if isinstance(values, dict) else {}
+
+    def _task_selection_values(self) -> dict[str, tuple[str, ...]]:
+        values = self._diagnostic_values().get("task_selection")
+        if not isinstance(values, dict):
+            return {}
+        return {
+            key: tuple(str(item).lower() for item in value)
+            for key, value in values.items()
+            if isinstance(value, (list, tuple))
+        }
+
+    def _uses_payload_diagnostics(self, framework_id: str | None = None) -> bool:
+        mode = str(self._diagnostic_values().get("mode") or "").strip().lower()
+        if mode:
+            return mode == "payload"
+        # 仅为旧的、未初始化 controller 的调用保留兼容判断。
+        return False
+
+    def _joint_order(self) -> tuple[str, ...]:
+        values = self._diagnostic_values().get("observation", {})
+        if isinstance(values, dict) and isinstance(values.get("joint_order"), (list, tuple)):
+            return tuple(str(item) for item in values["joint_order"])
+        return ()
+
+    def _leg_order(self) -> tuple[str, ...]:
+        values = self._diagnostic_values().get("observation", {})
+        if isinstance(values, dict) and isinstance(values.get("leg_order"), (list, tuple)):
+            return tuple(str(item) for item in values["leg_order"])
+        return ()
+
+    def _phase_environment_name(self) -> str:
+        runtime = getattr(self, "runtime", None)
+        deployment = runtime.deployment if runtime is not None else {}
+        launch = deployment.get("training_launch") if isinstance(deployment, dict) else {}
+        state = launch.get("resume_state_environment") if isinstance(launch, dict) else {}
+        if isinstance(state, dict):
+            value = str(state.get("phase") or "").strip()
+            if value:
+                return value
+        return "INIT_PHASE"
+
+    def _best_checkpoint_manifest(self) -> str:
+        runtime = getattr(self, "runtime", None)
+        deployment = runtime.deployment if runtime is not None else {}
+        declared = deployment.get("best_checkpoint_manifest") if isinstance(deployment, dict) else ""
+        if declared:
+            return str(declared)
+        roots = getattr(getattr(self, "framework", None), "checkpoint_roots", ())
+        if roots:
+            root = str(roots[0]).rstrip("/")
+            if "*" not in root:
+                return f"{root}/BEST_CHECKPOINT.json"
+        return ""
 
     async def catalog(self) -> DiagnosticCatalog:
         available = True
@@ -702,9 +814,9 @@ class DiagnosticsController:
                     category=p.category,
                     estimated_minutes=p.estimated_minutes,
                 )
-                for p in PRESETS
+                for p in self.presets
             ],
-            plan_templates={p.id: _default_plan_for_preset(p) for p in PRESETS},
+            plan_templates={p.id: _default_plan_for_preset(p) for p in self.presets},
             checkpoints=checkpoints,
             checkpoint=checkpoint or None,
             checkpoint_name=checkpoint.rsplit("/", 1)[-1] if checkpoint else None,
@@ -724,7 +836,7 @@ class DiagnosticsController:
         requested_checkpoint: str | None = None,
         requested_plan: DiagnosticPlan | dict[str, Any] | None = None,
     ) -> DiagnosticJobStatus:
-        preset = _PRESET_BY_ID.get(preset_id)
+        preset = self.preset_by_id.get(preset_id, _PRESET_BY_ID.get(preset_id))
         if preset is None:
             raise ValueError(f"Unknown diagnostic preset: {preset_id}")
         plan = _normalize_plan(preset, requested_plan)
@@ -752,9 +864,10 @@ class DiagnosticsController:
             if (requested_checkpoint or "").strip().lower() == "best":
                 # BEST_CHECKPOINT.json 来自验收评分，可能指向已经清理掉的历史 run。
                 # 诊断入口的“默认”必须能落到当前可用检查点，否则训练中途探测会被旧注册表卡住。
+                manifest = self._best_checkpoint_manifest()
                 raw = await asyncio.to_thread(
                     remote.exec_out,
-                    "cat /root/gpufree-data/taili_runs/BEST_CHECKPOINT.json 2>/dev/null")
+                    f"cat {shlex.quote(manifest)} 2>/dev/null" if manifest else "true")
                 try:
                     best = str((json.loads(raw or "{}") or {}).get("checkpoint") or "")
                 except Exception:
@@ -978,11 +1091,16 @@ class DiagnosticsController:
                 available=False,
                 source="real" if self.settings.source == "real" else "fake",
                 message="No diagnostic job has been started; no record.csv is available for playback.",
-                joint_order=_JOINT_ORDER,
-                leg_order=_LEG_ORDER,
+                joint_order=list(self._joint_order()),
+                leg_order=list(self._leg_order()),
             )
         if self.settings.source == "fake":
-            return _fake_playback(job, max_frames=max_frames)
+            return _fake_playback(
+                job,
+                max_frames=max_frames,
+                joint_order=self._joint_order(),
+                leg_order=self._leg_order(),
+            )
         try:
             remote = self.source._get_remote()
             stage_records = await asyncio.to_thread(self._read_playback_records, remote, job)
@@ -992,14 +1110,16 @@ class DiagnosticsController:
                 source="real",
                 message=f"Remote is unavailable; playback cannot be read. {type(exc).__name__}: {exc}",
                 output_dir=job.output_dir,
-                joint_order=_JOINT_ORDER,
-                leg_order=_LEG_ORDER,
+                joint_order=list(self._joint_order()),
+                leg_order=list(self._leg_order()),
             )
         return _playback_from_record_texts(
             job,
             stage_records,
             source="real",
             max_frames=max_frames,
+            joint_order=self._joint_order(),
+            leg_order=self._leg_order(),
         )
 
     def _latest_checkpoint(self, remote: Any) -> str:
@@ -1020,7 +1140,7 @@ class DiagnosticsController:
                 active_run_name = ""
         checkpoints: list[DiagnosticCheckpoint] = []
         seen: set[str] = set()
-        for framework in list_framework_profiles():
+        for framework in list_framework_profiles(product_id=self.settings.product_id or None):
             for item in self._recent_checkpoints_for_framework(remote, framework, limit):
                 if item.path in seen:
                     continue
@@ -1129,16 +1249,32 @@ class DiagnosticsController:
         return result
 
     def _build_remote_script(self, job: _Job) -> str:
-        if job.framework_id in _PAYLOAD_DIAG_FRAMEWORKS:
+        if self._uses_payload_diagnostics(job.framework_id):
             return self._build_payload_remote_script(job)
         return self._build_legacy_remote_script(job)
 
     def _payload_root_shell(self, checkpoint: str = "") -> str:
-        roots = []
+        payload_config = self._payload_values()
+        payload_package = str(payload_config.get("package") or "").strip()
+        payload_patterns = tuple(
+            str(item) for item in payload_config.get("payload_globs", ()) if str(item).strip()
+        )
+        payload_required_files = tuple(
+            str(item) for item in payload_config.get("required_files", ()) if str(item).strip()
+        )
+        roots = [
+            str(item).rstrip("/")
+            for item in payload_config.get("payload_roots", ())
+            if str(item).strip()
+        ]
         root = str(self.settings.diagnostic_tool_root or "").rstrip("/")
         if root:
             roots.append(root)
-        roots.append("/root/gpufree-data/training_payloads")
+        if not payload_package or not payload_patterns or not payload_required_files or not roots:
+            return (
+                "echo '[diagnostics] product contract does not declare a complete diagnostic payload' >&2\n"
+                "exit 31\n"
+            )
         unique = []
         for item in roots:
             if item and item not in unique:
@@ -1146,8 +1282,15 @@ class DiagnosticsController:
         clauses = " ".join(
             f"{shlex.quote(root.rstrip('/'))}/{pattern}"
             for root in unique
-            for pattern in _PAYLOAD_GLOBS
+            for pattern in payload_patterns
         )
+        preferred_condition = " && ".join(
+            f'[ -f "$PREFERRED_PAYLOAD/{path}" ]' for path in payload_required_files
+        )
+        candidate_condition = " && ".join(
+            f'[ -f "$candidate/{path}" ]' for path in payload_required_files
+        )
+        first_required_file = payload_required_files[0]
         preferred = ""
         if checkpoint:
             load_payload = (
@@ -1162,9 +1305,7 @@ class DiagnosticsController:
                 "if [ -f \"$RUN_DIR/run.json\" ]; then\n"
                 f"  PREFERRED_PAYLOAD=\"$(python3 -c {shlex.quote(load_payload)} \"$RUN_DIR/run.json\" 2>/dev/null || true)\"\n"
                 "fi\n"
-                "if [ -n \"$PREFERRED_PAYLOAD\" ] "
-                "&& [ -f \"$PREFERRED_PAYLOAD/taili_blind_runtime/diagnose_taili_cases.py\" ] "
-                "&& [ -f \"$PREFERRED_PAYLOAD/taili_blind_runtime/isaaclab_quad_diag/metrics.py\" ]; then\n"
+                f"if [ -n \"$PREFERRED_PAYLOAD\" ] && {preferred_condition}; then\n"
                 "  PAYLOAD=\"$PREFERRED_PAYLOAD\"\n"
                 "  echo \"[diagnostics] payload selected from checkpoint run metadata: $PAYLOAD\"\n"
                 "elif [ -n \"$PREFERRED_PAYLOAD\" ]; then\n"
@@ -1176,17 +1317,17 @@ class DiagnosticsController:
             f"{preferred}"
             "if [ -z \"$PAYLOAD\" ]; then\n"
             f"  for candidate in $(ls -td {clauses} 2>/dev/null || true); do\n"
-            "  if [ -f \"$candidate/taili_blind_runtime/diagnose_taili_cases.py\" ] && [ -f \"$candidate/taili_blind_runtime/isaaclab_quad_diag/metrics.py\" ]; then\n"
+            f"  if {candidate_condition}; then\n"
             "      PAYLOAD=\"$candidate\"\n"
             "      break\n"
             "  fi\n"
-            "  if [ -f \"$candidate/taili_blind_runtime/diagnose_taili_cases.py\" ]; then\n"
-            "      echo \"[diagnostics] skipping incomplete payload without taili_blind_runtime/isaaclab_quad_diag/metrics.py: $candidate\" >&2\n"
+            f"  if [ -f \"$candidate/{first_required_file}\" ]; then\n"
+            f"      echo \"[diagnostics] skipping incomplete {payload_package} payload: $candidate\" >&2\n"
             "  fi\n"
             "  done\n"
             "fi\n"
             "if [ -z \"$PAYLOAD\" ]; then\n"
-            "  echo '[diagnostics] compatible taili_blind_runtime payload was not found under configured payload roots; expected diagnose_taili_cases.py and isaaclab_quad_diag/metrics.py' >&2\n"
+            f"  echo '[diagnostics] compatible {payload_package} payload was not found under configured payload roots' >&2\n"
             "  exit 31\n"
             "fi\n"
             "echo \"[diagnostics] payload=$PAYLOAD\"\n"
@@ -1197,6 +1338,11 @@ class DiagnosticsController:
 
     def _build_payload_remote_script(self, job: _Job) -> str:
         s = self.settings
+        payload_config = self._payload_values()
+        diagnostic_module = str(payload_config.get("diagnostic_module") or "").strip()
+        if not diagnostic_module:
+            return "echo '[diagnostics] product contract does not declare a diagnostic module' >&2\nexit 31"
+        phase_environment = self._phase_environment_name()
         commands = [
             "set -e",
             self._payload_root_shell(job.checkpoint),
@@ -1210,11 +1356,11 @@ class DiagnosticsController:
             init_phase = _clamp_int(stage_plan.get("init_phase"), 0, 9, 0)
             diag_cmd = " ".join(
                 [
-                    f"TAILI_INIT_PHASE={init_phase}",
+                    f"{phase_environment}={init_phase}",
                     shlex.quote(s.diagnostic_python),
                     "-u",
                     "-m",
-                    "taili_blind_runtime.diagnose_taili_cases",
+                    diagnostic_module,
                     "--task",
                     shlex.quote(job.diagnostic_task or s.diagnostic_task),
                     "--checkpoint",
@@ -1282,6 +1428,17 @@ class DiagnosticsController:
 
     def _build_legacy_remote_script(self, job: _Job) -> str:
         s = self.settings
+        diagnostics = self._diagnostic_values()
+        fallback_spec = str(
+            self._payload_values().get("fallback_spec")
+            or diagnostics.get("spec")
+            or ""
+        ).lstrip("/")
+        spec_path = (
+            str(diagnostics.get("spec"))
+            if str(diagnostics.get("spec") or "").startswith("/")
+            else f"{s.diagnostic_tool_root}/{fallback_spec}"
+        )
         commands = [
             "set -e",
             f"cd {shlex.quote(s.diagnostic_robot_root)}",
@@ -1290,7 +1447,7 @@ class DiagnosticsController:
         ]
         for stage in job.preset.stages:
             stage_out = self._stage_output(job, stage)
-            spec = f"{s.diagnostic_tool_root}/specs/taili.yaml"
+            spec = spec_path
             commands.append(f"mkdir -p {shlex.quote(stage_out)}")
             commands.append(
                 " ".join(
@@ -1428,8 +1585,12 @@ class DiagnosticsController:
 
     def _remote_payload_diagnostic_tasks(self, remote: Any) -> list[str]:
         s = self.settings
+        payload_package = str(self._payload_values().get("package") or "").strip()
+        if not payload_package:
+            raise RuntimeError("product contract does not declare a diagnostic payload package")
         script = f"""
 import argparse
+import importlib
 import json
 try:
     from isaaclab.app import AppLauncher
@@ -1437,9 +1598,9 @@ try:
     app = AppLauncher(launch_args).app
     try:
         import gymnasium as gym  # noqa: F401
-        import taili_blind_runtime  # noqa: F401
+        importlib.import_module({payload_package!r})
         from gymnasium.envs.registration import registry
-        names = sorted(str(key) for key in registry.keys() if "RobotLab" in str(key) or "Taili" in str(key))
+        names = sorted(str(key) for key in registry.keys())
         print("{_TASK_MARKER}" + json.dumps(names))
     finally:
         app.close()
@@ -1470,8 +1631,18 @@ except BaseException as exc:
 
     def _legacy_remote_diagnostic_tasks(self, remote: Any) -> list[str]:
         s = self.settings
+        configured_imports = self._diagnostic_values().get("registry_imports", ())
+        registry_imports = (
+            tuple(str(item) for item in configured_imports)
+            if isinstance(configured_imports, (list, tuple))
+            else ()
+        )
+        import_lines = chr(10).join(
+            f"        importlib.import_module({module!r})" for module in registry_imports
+        )
         script = f"""
 import argparse
+import importlib
 import json
 try:
     from isaaclab.app import AppLauncher
@@ -1479,9 +1650,9 @@ try:
     app = AppLauncher(launch_args).app
     try:
         import gymnasium as gym  # noqa: F401
-        import robot_lab.tasks  # noqa: F401
+{import_lines}
         from gymnasium.envs.registration import registry
-        names = sorted(str(key) for key in registry.keys() if "RobotLab" in str(key) or "Taili" in str(key))
+        names = sorted(str(key) for key in registry.keys())
         print("{_TASK_MARKER}" + json.dumps(names))
     finally:
         app.close()
@@ -1517,12 +1688,17 @@ except BaseException as exc:
             cache = self._task_registry_cache = {}
         candidates = cache.get(framework_id)
         if not candidates:
-            if framework_id in _PAYLOAD_DIAG_FRAMEWORKS:
+            if self._uses_payload_diagnostics(framework_id):
                 candidates = self._remote_payload_diagnostic_tasks(remote)
             else:
                 candidates = self._remote_diagnostic_tasks(remote)
             cache[framework_id] = candidates
-        return _select_diagnostic_task_from_candidates(configured_task, framework_id, candidates)
+        return _select_diagnostic_task_from_candidates(
+            configured_task,
+            framework_id,
+            candidates,
+            self._task_selection_values(),
+        )
 
     def _stage_output(self, job: _Job, stage: _Stage) -> str:
         if len(job.preset.stages) == 1:
@@ -1841,7 +2017,7 @@ except BaseException as exc:
     def _job_from_history_item(self, item) -> _Job | None:
         if item is None or not item.output_dir or not item.preset:
             return None
-        preset = _PRESET_BY_ID.get(item.preset)
+        preset = getattr(self, "preset_by_id", {}).get(item.preset, _PRESET_BY_ID.get(item.preset))
         if preset is None:
             return None
         return _Job(
@@ -1881,6 +2057,28 @@ def _bool_cell(value: Any) -> bool:
         return False
     text = str(value).strip().lower()
     return text in {"1", "1.0", "true", "yes", "y"}
+
+
+def _infer_joint_order(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """从记录列推断关节数量；有产品合同顺序时由调用方优先传入。"""
+    indices = {
+        int(match.group(1))
+        for key in row
+        if (match := re.fullmatch(r"joint_pos_(\d+)", str(key)))
+    }
+    if not indices:
+        return ()
+    return tuple(f"joint_{index}" for index in range(max(indices) + 1))
+
+
+def _infer_leg_order(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """从足端位置列推断腿名，保持 CSV 首次出现顺序。"""
+    names: list[str] = []
+    for key in row:
+        match = re.fullmatch(r"foot_([^_]+)_pos_w_x", str(key))
+        if match and match.group(1) not in names:
+            names.append(match.group(1))
+    return tuple(names)
 
 
 def _row_key(row: dict[str, str]) -> tuple[int, int, int]:
@@ -1947,7 +2145,15 @@ def _downsample(rows: list[dict[str, str]], max_frames: int) -> tuple[list[dict[
     return rows[::stride], stride
 
 
-def _frame_from_row(stage_id: str, row: dict[str, str], t_offset: float) -> DiagnosticPlaybackFrame | None:
+def _frame_from_row(
+    stage_id: str,
+    row: dict[str, str],
+    t_offset: float,
+    joint_order: tuple[str, ...] | None = None,
+    leg_order: tuple[str, ...] | None = None,
+) -> DiagnosticPlaybackFrame | None:
+    joint_order = joint_order or tuple(_JOINT_ORDER) or _infer_joint_order(row)
+    leg_order = leg_order or tuple(_LEG_ORDER) or _infer_leg_order(row)
     base = [
         _finite_float(row.get("base_pos_w_x")),
         _finite_float(row.get("base_pos_w_y")),
@@ -1959,12 +2165,12 @@ def _frame_from_row(stage_id: str, row: dict[str, str], t_offset: float) -> Diag
         _finite_float(row.get("base_quat_y")),
         _finite_float(row.get("base_quat_z")),
     ]
-    joints = [_finite_float(row.get(f"joint_pos_{i}")) for i in range(len(_JOINT_ORDER))]
+    joints = [_finite_float(row.get(f"joint_pos_{i}")) for i in range(len(joint_order))]
     if any(value is None for value in base + quat + joints):
         return None
     row_t = _finite_float(row.get("time")) or 0.0
     feet: dict[str, DiagnosticPlaybackFoot] = {}
-    for leg in _LEG_ORDER:
+    for leg in leg_order:
         pos = [
             _finite_float(row.get(f"foot_{leg}_pos_w_x")),
             _finite_float(row.get(f"foot_{leg}_pos_w_y")),
@@ -2008,7 +2214,11 @@ def _playback_from_record_texts(
     stage_records: list[tuple[str, str]],
     source: str,
     max_frames: int,
+    joint_order: tuple[str, ...] | None = None,
+    leg_order: tuple[str, ...] | None = None,
 ) -> DiagnosticPlayback:
+    joint_order = joint_order or tuple(_JOINT_ORDER)
+    leg_order = leg_order or tuple(_LEG_ORDER)
     source_rows = 0
     all_rows: list[dict[str, str]] = []
     rows_by_stage: list[tuple[str, list[dict[str, str]]]] = []
@@ -2018,6 +2228,11 @@ def _playback_from_record_texts(
         source_rows += len(rows)
         all_rows.extend(rows)
         rows_by_stage.append((stage_id, rows))
+    if all_rows:
+        # 没有产品顺序声明时，从实际记录恢复最小可播放 schema。
+        sample_row = all_rows[0]
+        joint_order = joint_order or tuple(_JOINT_ORDER) or _infer_joint_order(sample_row)
+        leg_order = leg_order or tuple(_LEG_ORDER) or _infer_leg_order(sample_row)
     selected_env_id = _choose_playback_env(all_rows)
     for stage_id, rows in rows_by_stage:
         for row in _best_continuous_rows(rows, selected_env_id):
@@ -2029,8 +2244,8 @@ def _playback_from_record_texts(
             message="Diagnostic output did not contain playable record.csv frames.",
             source=source,  # type: ignore[arg-type]
             output_dir=job.output_dir,
-            joint_order=_JOINT_ORDER,
-            leg_order=_LEG_ORDER,
+            joint_order=list(joint_order),
+            leg_order=list(leg_order),
             source_rows=source_rows,
             selected_env_id=selected_env_id,
             available_env_ids=available_env_ids,
@@ -2049,7 +2264,7 @@ def _playback_from_record_texts(
         chunk = (stage_id, int(_finite_float(row.get("case_id")) or 0))
         if previous_chunk is not None and chunk != previous_chunk:
             t_offset += previous_raw_t + 0.5
-        frame = _frame_from_row(stage_id, row, t_offset)
+        frame = _frame_from_row(stage_id, row, t_offset, joint_order, leg_order)
         if frame is not None:
             frames.append(frame)
             previous_raw_t = raw_t
@@ -2065,8 +2280,8 @@ def _playback_from_record_texts(
         source=source,  # type: ignore[arg-type]
         output_dir=job.output_dir,
         fps=max(1.0, min(120.0, fps)),
-        joint_order=_JOINT_ORDER,
-        leg_order=_LEG_ORDER,
+        joint_order=list(joint_order),
+        leg_order=list(leg_order),
         frames=frames,
         source_rows=source_rows,
         stride=stride,
@@ -2075,7 +2290,14 @@ def _playback_from_record_texts(
     )
 
 
-def _fake_playback(job: _Job, max_frames: int = 900) -> DiagnosticPlayback:
+def _fake_playback(
+    job: _Job,
+    max_frames: int = 900,
+    joint_order: tuple[str, ...] | None = None,
+    leg_order: tuple[str, ...] | None = None,
+) -> DiagnosticPlayback:
+    joint_order = joint_order or tuple(_JOINT_ORDER)
+    leg_order = leg_order or tuple(_LEG_ORDER)
     frames: list[DiagnosticPlaybackFrame] = []
     dt = 1.0 / 50.0
     total = min(max_frames, 240)
@@ -2085,8 +2307,8 @@ def _fake_playback(job: _Job, max_frames: int = 900) -> DiagnosticPlayback:
         moving = t > 0.8
         x = max(0.0, t - 0.8) * 0.35 if moving else 0.0
         z = 0.55 + (0.015 * math.sin(phase * 2.0) if moving else 0.0)
-        joints = [0.0] * len(_JOINT_ORDER)
-        for leg_index in range(4):
+        joints = [0.0] * len(joint_order)
+        for leg_index in range(min(4, len(leg_order))):
             leg_phase = phase + (math.pi if leg_index in {0, 3} else 0.0)
             hip = 0.10 * math.sin(leg_phase) if moving else 0.0
             thigh = 0.45 + (0.20 * math.sin(leg_phase) if moving else 0.0)
@@ -2101,7 +2323,7 @@ def _fake_playback(job: _Job, max_frames: int = 900) -> DiagnosticPlayback:
             "RR": (-0.28, -0.18),
         }
         feet = {}
-        for leg_index, leg in enumerate(_LEG_ORDER):
+        for leg_index, leg in enumerate(leg_order):
             leg_phase = phase + (math.pi if leg_index in {0, 3} else 0.0)
             swing = moving and math.sin(leg_phase) > 0.0
             ox, oy = foot_offsets[leg]
@@ -2139,8 +2361,8 @@ def _fake_playback(job: _Job, max_frames: int = 900) -> DiagnosticPlayback:
         source="fake",
         output_dir=job.output_dir,
         fps=50.0,
-        joint_order=_JOINT_ORDER,
-        leg_order=_LEG_ORDER,
+        joint_order=list(joint_order),
+        leg_order=list(leg_order),
         frames=frames,
         source_rows=len(frames),
         stride=1,

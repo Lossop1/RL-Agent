@@ -302,11 +302,11 @@ class VersionedRemoteDeployer:
             )
             if code != 0:
                 raise RuntimeError(f"payload archive extraction failed: {identity}")
-            manifest_candidates = (
-                f"{unpacked}/payload_manifest.json",
-                f"{unpacked}/taili_blind_runtime/payload_manifest.json",
-            )
-            embedded = next((path for path in manifest_candidates if self._remote_file_exists(path)), "")
+            # Payload archives have one product-neutral root manifest.  The
+            # execution layer must not infer a package name (or know Taili).
+            embedded = f"{unpacked}/payload_manifest.json"
+            if not self._remote_file_exists(embedded):
+                embedded = ""
             if not embedded:
                 raise RuntimeError(f"payload archive has no embedded manifest: {identity}")
             if expected_manifest_sha and _remote_sha(self.remote, embedded) != expected_manifest_sha:

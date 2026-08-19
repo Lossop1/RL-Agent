@@ -22,7 +22,7 @@ def _required(mapping: dict[str, Any], key: str, context: str) -> Any:
 
 
 def contract_from_export_metadata(metadata: dict[str, Any], *, contract_id: str, version: str = "") -> PolicyDeploymentContract:
-    """Convert ``export_taili_deployment.py`` metadata into the shared contract."""
+    """Convert a product deployment export into the shared contract."""
     observation = dict(_required(metadata, "observation", "deployment metadata"))
     control = dict(_required(metadata, "control", "deployment metadata"))
     timing = dict(_required(metadata, "timing", "deployment metadata"))

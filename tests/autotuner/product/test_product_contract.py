@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 
 import pytest
@@ -21,6 +22,10 @@ def test_taili_contract_is_resolved_from_manifest() -> None:
         "RobotLab-Isaac-Taili-AMP-Blind-Direct-v0",
     ]
     assert contract.deployment["payload_package"] == "taili_blind_runtime"
+    assert "taili_blind_tp" in contract.framework["compositions"]
+    assert contract.adaptation["urdf_asset"] == "robot_urdf"
+    assert contract.adaptation["legacy_deploy"]["enabled"] is False
+    assert contract.plugins["strategy"]["apply"].startswith("products.taili.")
     assert not contract.issues
 
 
@@ -141,3 +146,21 @@ sources: {config: missing.yaml}
     product = load_product_manifest(path)
 
     assert any("joint_order" in issue for issue in product.validate(tmp_path))
+
+
+def test_product_manifest_rejects_malformed_framework_composition() -> None:
+    product = load_product_manifest("config/products/taili.yaml")
+    malformed = replace(
+        product,
+        framework={
+            "compositions": {
+                "broken": {"component_ids": ["M1", "M1"]},
+                "empty": {"component_ids": []},
+            }
+        },
+    )
+
+    issues = malformed.validate(check_files=False)
+
+    assert any("contains duplicates" in issue for issue in issues)
+    assert any("must be a non-empty list" in issue for issue in issues)

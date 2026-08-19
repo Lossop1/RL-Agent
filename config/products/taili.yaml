@@ -35,21 +35,31 @@ task:
   id: taili_blind_locomotion
   family: blind_locomotion
   framework_id: taili_amp_blind
-  train_entrypoint: autotuner.blind_locomotion.launch_taili_train:main
-  diagnose_entrypoint: autotuner.blind_locomotion.diagnose_taili:main
+  train_entrypoint: products.taili.blind_locomotion.launch_taili_train:main
+  diagnose_entrypoint: products.taili.blind_locomotion.diagnose_taili:main
   requirements:
     actor_observation: proprioceptive_only
     deployment_requires_privileged_terrain: false
+  intake:
+    robot_ids: [robot.taili, taili]
+    task_classes: [blind_locomotion, velocity_tracking]
+    terrains: [flat, rough, slope, stairs]
+    ambition_levels: [baseline_walking, robust_locomotion, industry_grade]
 
 sources:
-  config: autotuner/blind_locomotion/taili_blind_config.yaml
+  config: products/taili/blind_locomotion/taili_blind_config.yaml
   roots:
-    - autotuner/blind_locomotion
-    - autotuner/taili_core
-  task_env: autotuner/blind_locomotion/blind_tp_env.py
-  task_config: autotuner/blind_locomotion/taili_blind_env_cfg.py
-  reward: autotuner/taili_core/taili_reward.py
-  asset_config: autotuner/blind_locomotion/assets/taili.py
+    - products/taili
+  task_env: products/taili/blind_locomotion/blind_tp_env.py
+  task_config: products/taili/blind_locomotion/taili_blind_env_cfg.py
+  config_loader: products/taili/blind_locomotion/taili_blind_config.py
+  trainer: products/taili/blind_locomotion/train_taili.py
+  reward: products/taili/core/taili_reward.py
+  acceptance_score: products/taili/blind_locomotion/acceptance_score.py
+  telemetry: products/taili/blind_locomotion/telemetry_emit.py
+  telemetry_contract: products/taili/blind_locomotion/telemetry_payloads.py
+  runtime_manifest: products/taili/blind_locomotion/runtime_manifest.py
+  asset_config: products/taili/blind_locomotion/assets/taili.py
 
 assets:
   - id: robot_urdf
@@ -62,21 +72,231 @@ assets:
     kind: diagnostic_spec
     path: tools/isaaclab_quad_diag_observation/specs/taili.yaml
 
+asset_reuse:
+  policy: reuse_when_compatible
+  # 这些声明只描述迁移时的处理方式，不把历史 checkpoint 当作源码。
+  groups:
+    robot_geometry: reuse_with_hash_check
+    diagnostic_spec: reuse_with_hash_check
+    training_baseline: require_explicit_lineage
+
+adaptation:
+  composition: taili_amp_proven
+  robot_capabilities: [quadruped_12dof, blind_actor, amp_reference]
+  urdf_asset: robot_urdf
+  actuator:
+    joint_roles:
+      hip: ".*_hip_joint$"
+      thigh: ".*_thigh_joint$"
+      calf: ".*_calf_joint$"
+    kp_per_effort: 1.0909090909
+    damping_inertia_floor: 0.05
+  health_ratios:
+    base_height_target: 0.81
+    base_height_band: [0.78, 0.90]
+    swing_height_band: [0.18, 0.25]
+    drag_height: 0.08
+  reference_geometry:
+    leg: FL
+    reference_leg_length: 0.6818135
+    base_height: 0.52
+    swing_clearance: 0.04
+  reward_anchor:
+    leg_length: 0.682
+    mass_kg: 38.98
+    thresholds:
+      stand_height: 0.52
+      base_clearance: 0.07
+      clr_rough_bonus_max: 0.06
+      air_time_min: 0.08
+      torque_limit_frac: 0.85
+      cmd_fwd_range: [0.30, 0.70]
+      cmd_back_range: [0.20, 0.45]
+      cmd_lat_range: [0.15, 0.35]
+      cmd_yaw_range: [0.25, 0.80]
+      dr_mass_range_1: [-1.0, 2.0]
+      dr_mass_range_2: [-3.0, 6.0]
+      dr_mass_range_3: [-3.0, 10.0]
+  materialization:
+    env_source: products/taili/blind_locomotion/taili_amp_env_cfg.py
+    asset_source: products/taili/blind_locomotion/assets/taili.py
+    env_fields:
+      stand_height: stand_height
+      base_clearance: base_clearance
+      clr_rough_bonus_max: clr_rough_bonus_max
+      air_time_min: air_time_min
+      torque_limit_frac: torque_limit_frac
+      cmd_fwd_range: cmd_fwd_range
+      cmd_back_range: cmd_back_range
+      cmd_lat_range: cmd_lat_range
+      cmd_yaw_range: cmd_yaw_range
+      dr_mass_range_1: dr_mass_range_1
+      dr_mass_range_2: dr_mass_range_2
+      dr_mass_range_3: dr_mass_range_3
+    actuator_blocks:
+      effort_limit: effort
+      velocity_limit: velocity
+    actuator_joint_patterns:
+      hip: ".*_hip_joint"
+      thigh: ".*_thigh_joint"
+      calf: ".*_calf_joint"
+    advisory_roles: [hip, thigh, calf]
+    advisory_baseline:
+      Kp: "shared 120.0"
+      Kd: "shared 10.0"
+  legacy_deploy:
+    enabled: false
+    require_reference_clips: false
+
 build:
-  payload_builder: autotuner.training_payloads.taili_blind_runtime.build_payload:build_payload
+  payload_builder: products.taili.payload.build_payload:build_payload
   payload_package: taili_blind_runtime
 
 telemetry:
-  source: autotuner/blind_locomotion/telemetry_emit.py
-  contract: autotuner/blind_locomotion/telemetry_payloads.py
+  source: products/taili/blind_locomotion/telemetry_emit.py
+  contract: products/taili/blind_locomotion/telemetry_payloads.py
+  module_candidates: [taili_blind_runtime.telemetry_emit, telemetry_emit]
 
 diagnostics:
   spec_asset: diagnostic_spec
   suite_root: tools/isaaclab_quad_diag_observation/suites
+  mode: payload
+  python: /opt/conda/envs/isaaclab/bin/python
+  tool_root: /root/gpufree-data/tools/isaaclab_quad_diag_v051
+  output_root: /root/gpufree-data/diag_runs
+  robot_root: /root/gpufree-data/robot_lab
+  payload:
+    package: taili_blind_runtime
+    diagnostic_module: taili_blind_runtime.diagnose_taili_cases
+    metrics_module: isaaclab_quad_diag.metrics
+    payload_roots:
+      - /root/gpufree-data/training_payloads
+    payload_globs:
+      - taili_blind_runtime_*
+      - taili_recovered_*
+    required_files:
+      - taili_blind_runtime/diagnose_taili_cases.py
+      - taili_blind_runtime/isaaclab_quad_diag/metrics.py
+    fallback_spec: specs/taili.yaml
+  task_selection:
+    generic_tokens: [direct, env, isaac, lab, robot, robotlab, v0]
+    strong_tokens: [blind, teacher]
+    family_tokens: [taili]
+  observation:
+    joint_order: [FL_hip_joint, FR_hip_joint, RL_hip_joint, RR_hip_joint, FL_thigh_joint, FR_thigh_joint, RL_thigh_joint, RR_thigh_joint, FL_calf_joint, FR_calf_joint, RL_calf_joint, RR_calf_joint]
+    leg_order: [FL, FR, RL, RR]
+  presets:
+    - id: quick
+      label: Quick check
+      description: Verify the diagnostic task, checkpoint, and record pipeline.
+      category: quick
+      estimated_minutes: 1
+      stages: [{id: quick, label: Quick check, suite: remote_probe.yaml, expected_segments: 2}]
+    - id: forward
+      label: Forward
+      description: Run a stand baseline and then switch to a forward command.
+      category: direction
+      estimated_minutes: 2
+      stages: [{id: forward, label: Forward, suite: direction_forward.yaml, expected_segments: 2}]
+    - id: backward
+      label: Backward
+      description: Run a stand baseline and then switch to a backward command.
+      category: direction
+      estimated_minutes: 2
+      stages: [{id: backward, label: Backward, suite: direction_backward.yaml, expected_segments: 2}]
+    - id: lateral
+      label: Lateral
+      description: Run a stand baseline and then switch to a lateral command.
+      category: direction
+      estimated_minutes: 2
+      stages: [{id: lateral, label: Lateral, suite: direction_lateral.yaml, expected_segments: 2}]
+    - id: yaw
+      label: Yaw
+      description: Run a stand baseline and then switch to a yaw command.
+      category: direction
+      estimated_minutes: 2
+      stages: [{id: yaw, label: Yaw, suite: direction_yaw.yaml, expected_segments: 2}]
+    - id: directions
+      label: All directions
+      description: Run forward, backward, lateral, and yaw in one diagnostic session.
+      category: direction
+      estimated_minutes: 3
+      stages: [{id: directions, label: All directions, suite: directions_combined.yaml, expected_segments: 5}]
+    - id: terrain
+      label: Terrain coverage
+      description: Check flat, slope, rough, and stair terrain coverage.
+      category: environment
+      estimated_minutes: 5
+      stages: [{id: terrain, label: Terrain coverage, suite: terrain_probe.yaml, expected_segments: 2}]
+    - id: dr
+      label: Domain randomization
+      description: Compare observed behavior across declared domain-randomization levels.
+      category: robustness
+      estimated_minutes: 3
+      stages: [{id: dr, label: Domain randomization, suite: dr_probe.yaml, expected_segments: 2}]
+    - id: push
+      label: External push
+      description: Apply a known lateral delta-v and observe recovery.
+      category: robustness
+      estimated_minutes: 2
+      stages: [{id: push, label: External push, suite: push_probe.yaml, expected_segments: 1}]
+
+simulation:
+  worlds:
+    - id: isaaclab_nominal
+      backend: isaaclab
+      task_ids:
+        - RobotLab-Isaac-Taili-Blind-Direct-v0
+        - RobotLab-Isaac-Taili-AMP-Blind-Direct-v0
+    - id: mujoco_taili
+      backend: mujoco
+      project_root: /root/rl_sar
+      runner: rl_sim_mujoco
+      scene_root: src/rl_sar_zoo/taili_description/mjcf
+      base_scene: taili.xml
+      scene_generator: tools/generate_taili_mujoco_stairs.py
+      command: [rl_sim_mujoco, taili, "{scene}"]
+      physics_timestep_s: 0.0025
+      policy_period_s: 0.02
+  sim2sim:
+    required: true
+    adapter: rl_sar_taili
+    privileged_information_required: false
 
 deployment:
   runtime_package: taili_blind_runtime
   privileged_information_required: false
+  remote_root: /root/gpufree-data/rl-agent
+  legacy_payload_root: /root/gpufree-data/training_payloads
+  runs_root: /root/gpufree-data/taili_runs
+  run_prefix: taili_train
+  data_root: /root/gpufree-data
+  runtime_python: /opt/conda/envs/isaaclab/bin/python
+  launcher_protocol: rl-agent.payload-train/v1
+  configuration_artifacts:
+    source_config: taili_blind_config.yaml
+    effective_config: effective_config.yaml
+    agent_config: agent.skrl.yaml
+  training_launch:
+    tmux_session: rl_train
+    total_steps: 1500000
+    telemetry_interval: 10
+    num_envs: 1024
+    headless: true
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TAILI_CHECKPOINT_INTERVAL: "2000"
+      TAILI_WRITE_INTERVAL: auto
+    # 训练阶段会生成额外的 TAILI_* 开关；由产品合同显式授权状态探针读取。
+    environment_prefixes: ["TAILI_"]
+    # 通用执行层只认识 phase 这个恢复状态名，环境变量名由产品声明。
+    resume_state_environment:
+      phase: TAILI_INIT_PHASE
+    train_args: ["--num_envs", "{num_envs}"]
+  payload_entrypoints:
+    launcher: launch_taili_train.py
+    trainer: train_taili.py
+    diagnostics: diagnose_taili_cases.py
 
 runtime:
   backend: isaaclab
@@ -104,15 +324,125 @@ compatibility:
   normalization: taili.observation-normalizer.v1
   physics_timestep: declared-by-task-runtime
 
+framework:
+  default_profile: taili_amp_blind
+  profiles:
+    taili_amp_blind:
+      label: Taili AMP Blind
+      status: draft
+      experiment: taili_amp_blind
+      task_id: RobotLab-Isaac-Taili-AMP-Blind-Direct-v0
+      diagnostic_task: RobotLab-Isaac-Taili-AMP-Blind-Direct-v0
+      run_globs:
+        - /root/gpufree-data/taili_runs/*/
+        - /root/tp_runs/*/
+        - /root/gpufree-data/robot_lab/logs/skrl/taili_amp_blind/*/
+        - /root/gpufree-data/logs/skrl/taili_amp_blind/*/
+        - /root/robot_lab/logs/skrl/taili_amp_blind/*/
+      checkpoint_roots:
+        - /root/gpufree-data/taili_runs
+        - /root/tp_runs
+        - /root/gpufree-data/robot_lab/logs/skrl/taili_amp_blind
+        - /root/gpufree-data/logs/skrl/taili_amp_blind
+        - /root/robot_lab/logs/skrl/taili_amp_blind
+      required_robot_capabilities: [quadruped_12dof, blind_actor, amp_reference]
+      note: Current draft framework target. It is not the teacher task.
+      commands:
+        physeval_log: /root/gpufree-data/diag_runs/physeval_blind.log
+        train_running_probe: pgrep -fa 'taili_blind_runtime\.train_taili|launch_taili_train|RobotLab-Isaac-Taili.*Blind' | grep -v pgrep
+        kill: pkill -f 'taili_blind_runtime\.train_taili|launch_taili_train|RobotLab-Isaac-Taili.*Blind'
+    taili_amp_teacher_reference:
+      label: Taili AMP Teacher Reference
+      status: reference
+      experiment: taili_amp_teacher
+      task_id: RobotLab-Isaac-Taili-AMP-Teacher-Direct-v0
+      diagnostic_task: RobotLab-Isaac-Taili-AMP-Teacher-Direct-v0
+      run_globs:
+        - /root/gpufree-data/robot_lab/logs/skrl/taili_amp_teacher/*/
+        - /root/gpufree-data/logs/skrl/taili_amp_teacher/*/
+        - /root/robot_lab/logs/skrl/taili_amp_teacher/*/
+      checkpoint_roots:
+        - /root/gpufree-data/robot_lab/logs/skrl/taili_amp_teacher
+        - /root/gpufree-data/logs/skrl/taili_amp_teacher
+        - /root/robot_lab/logs/skrl/taili_amp_teacher
+      required_robot_capabilities: [quadruped_12dof, privileged_teacher]
+      note: Reference-only profile for generated teacher checkpoints.
+  compositions:
+    taili_amp_proven:
+      label: Taili AMP 历史验证基线
+      component_ids: [M1, M2, M3, M4, M5, M6, M7, M8, M9]
+      status: validated
+      note: 历史基线仅作为可复用证据，不自动覆盖当前任务合同
+    taili_blind_tp:
+      label: Taili 盲态地形感知组合
+      component_ids: [B1, B2, B3, B4, M4, M5, M6, M9]
+      status: draft
+      note: 产品组合声明；具体训练效果仍由诊断和验收判定
+
 knowledge:
-  reward_file: autotuner/taili_core/taili_reward.py
+  reward_file: products/taili/core/taili_reward.py
   reward_func: compute_reward_components
   reward_cfg_class: RewardConfig
   reward_gate_const: REWARD_GROUP_GATES
   reward_group_const: _REWARD_GROUP_OF
-  env_reward_file: autotuner/blind_locomotion/blind_tp_env.py
-  asset_file: autotuner/blind_locomotion/assets/taili.py
-  curriculum_file: autotuner/blind_locomotion/taili_amp_env_cfg.py
+  env_reward_file: products/taili/blind_locomotion/blind_tp_env.py
+  asset_file: products/taili/blind_locomotion/assets/taili.py
+  curriculum_file: products/taili/blind_locomotion/taili_amp_env_cfg.py
   asset_cfg_call: ArticulationCfg
   asset_constant_files:
-    geometry: autotuner/taili_core/taili_geometry.py
+    geometry: products/taili/core/taili_geometry.py
+  runtime_symbols:
+    reward.compute_reward_components:
+      source: products/taili/core/taili_reward.py
+      names: [compute_reward_components]
+    env.class:
+      source: products/taili/blind_locomotion/blind_tp_env.py
+      names: [TailiBlindTPEnv]
+    env.rewards:
+      source: products/taili/blind_locomotion/blind_tp_env.py
+      names: [_get_rewards]
+    env.reset:
+      source: products/taili/blind_locomotion/blind_tp_env.py
+      names: [_reset_idx]
+    env.commands:
+      source: products/taili/blind_locomotion/blind_tp_env.py
+      names: [_resample_commands]
+  decision_replay_cases: config/decision_replay/taili_core_cases.jsonl
+
+# 控制台与研究层只依赖这些角色；入口的实现属于 Taili 产品插件。
+plugins:
+  playbook:
+    get_playbook: products.taili.ops.playbook:get_playbook
+  adaptation:
+    regenerate_reference: products.taili.ops.adaptation:regenerate_reference
+    reference_geometry: products.taili.ops.adaptation:reference_geometry
+  code_knowledge:
+    allowlist_files: products.taili.ops.code_knowledge:_ALLOWLIST_FILES
+    read_allowlisted: products.taili.ops.code_knowledge:_read_allowlisted
+    build_signal_map: products.taili.ops.code_knowledge:build_signal_map
+    search: products.taili.ops.code_knowledge:search_code_knowledge
+    source_inventory: products.taili.ops.code_knowledge:source_inventory
+  knowledge:
+    search: products.taili.ops.knowledge:search
+    context_pack: products.taili.ops.knowledge:build_context_pack
+  acceptance:
+    aggregate: products.taili.blind_locomotion.acceptance_aggregate:aggregate
+    parse_scorecard: products.taili.blind_locomotion.acceptance_aggregate:parse_scorecard
+    merge_runs: products.taili.blind_locomotion.acceptance_aggregate:merge_runs
+    scoreboard: products.taili.ops.scoreboard:build_scoreboard
+    metadata: products.taili.ops.scoreboard:metadata
+    spec_coverage: products.taili.ops.spec_coverage:build_spec_coverage_report
+    curriculum_facts: products.taili.ops.curriculum_facts:build_facts_card
+    command: products.taili.ops.acceptance_run:main
+  strategy:
+    load_config: products.taili.blind_locomotion.taili_blind_config:load_taili_blind_config
+    config_value: products.taili.blind_locomotion.taili_blind_config:get_config_value
+    apply: products.taili.ops.strategy_edit:apply_weight_changes
+    rollback: products.taili.ops.strategy_edit:rollback_last
+    rollback_stack: products.taili.ops.strategy_edit:rollback_stack
+  tuning:
+    command: products.taili.ops.tune_orchestrator:main
+    analyze_gaps: products.taili.ops.tune_orchestrator:analyze_gaps
+    propose_change: products.taili.ops.tune_orchestrator:propose_change
+    gate_levers: products.taili.ops.tune_orchestrator:GATE_LEVERS
+    skip_families: products.taili.ops.tune_orchestrator:SKIP_FAMILIES

@@ -46,22 +46,14 @@ def _is_within(p: Path, root: Path) -> bool:
 
 
 def allowed_urdf_roots() -> set[Path]:
-    """The directories a console-supplied URDF path is allowed to resolve inside."""
+    """返回产品清单声明的 URDF 资产目录。"""
+    from autotuner.product.registry import PROJECT_ROOT, ProductRegistry
+
     roots: set[Path] = set()
-    try:
-        from autotuner.adapter.__main__ import PRESETS
-        for preset in PRESETS.values():
-            u = preset.get("urdf")
-            if u:
-                roots.add(Path(u).resolve().parent)
-    except Exception:
-        pass
-    repo = Path(__file__).resolve().parents[2]
-    for extra in ("autotuner/blind_locomotion/assets", "frontend/dist/robot",
-                  "autotuner/training_payloads"):
-        d = repo / extra
-        if d.exists():
-            roots.add(d.resolve())
+    for product in ProductRegistry().list(valid_only=True):
+        for asset in product.assets:
+            if asset.kind.lower() == "urdf":
+                roots.add(asset.resolve(PROJECT_ROOT).parent)
     return roots
 
 

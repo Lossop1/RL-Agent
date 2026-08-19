@@ -1,45 +1,30 @@
-# Taili Adapter Backend (`autotuner/adapter/`)
+# 产品适配层
 
-This package is currently kept as a Taili-only dry-run and compatibility surface for the console.
-It derives actuator/geometry/reward-threshold values from the Taili URDF, materializes local
-copies of env/asset files, and produces a deploy plan for review.
+`autotuner/adapter/` 提供产品无关的 URDF 校验、执行器派生、数值缩放、
+配置副本物化和部署计划算法。机器人资产、经验锚点、字段映射、参考生成器
+与远程目标均来自 `config/products/<product>.yaml` 和对应产品插件。
 
-It is not the active training deployment strategy. The training path should move to the packaged
-Taili blind runtime payload under `autotuner/training_payloads/taili_blind_runtime/`, so remote
-machines do not depend on a mutable `robot_lab` source tree.
+## 边界
 
-The authoritative artifact deployment API lives in `autotuner.execution`.
-Callers that already have a resolved payload should construct a
-`DeploymentSpec` and use `VersionedRemoteDeployer` (or the
-`VersionedPayloadDeployExecutor` bridge). The legacy `deploy.py` file-plan
-executor remains only to avoid breaking old ConfigSet workflows; it is not a
-second source of truth for runtime or payload identity.
+- 系统层不导入 `products.<id>`，只按产品合同加载声明的插件入口。
+- 通用算法不会猜测自由度、关节名称或训练文件路径。
+- 旧文件级部署只保留兼容能力，默认关闭；版本化 product payload 是权威交付路径。
+- 适配预览只写临时副本，不连接远端，也不启动训练。
 
-## Command
+## 命令
 
 ```bash
-python -m autotuner.adapter [taili] [--composition ID] [--save ID|--load ID|--list]
-                            [--work-dir DIR] [--execute --confirm [--launch]] [--force]
+python -m autotuner.adapter [product-id] [--composition ID]
+                            [--save ID|--load ID|--list|--list-products]
+                            [--work-dir DIR]
 ```
 
-Default mode is a dry-run. It prints:
+注册表中只有一个产品时可以省略 `product-id`。存在多个产品时必须显式指定，
+系统不会回退到任意默认机器人。
 
-- derived Taili values;
-- consistency report;
-- deploy-readiness blockers;
-- a deterministic file plan.
-
-`--execute --confirm` is outward-facing: it can write remote files and optionally launch a job.
-Keep it gated.
-
-## Current scope
-
-- Current preset: `taili`.
-- Current local robot assets: `assets/robots/taili-dog/`.
-- Unitree/B2 proof fixtures and tools were moved to `archive/2026-07-cleanup/b2-removed/`.
-
-## Tests
+## 验证
 
 ```bash
-pytest tests/autotuner/adapter tests/autotuner/framework_library -q
+python -m pytest tests/autotuner/adapter tests/autotuner/product \
+  tests/autotuner/framework_library --basetemp .pytest-tmp-adapter -q
 ```

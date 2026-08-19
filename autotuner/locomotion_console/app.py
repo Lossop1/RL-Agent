@@ -29,6 +29,7 @@ from autotuner.mechanisms.mechanism_synthesis import SynthesisRequest
 from autotuner.mechanisms.mechanism_validation import ValidationContext
 from autotuner.research.research_ledger import ExperimentPlan
 from autotuner.research.research_state import ResearchState
+from autotuner.product import resolve_product_runtime
 
 from .config import get_settings
 from .config_manager import (
@@ -589,7 +590,7 @@ def _chat_agent_message(
         "训练问题",
         "为什么",
         "怎么改",
-        "taili",
+        "context pack",
     ]
     strategy_triggers.extend([
         "\u7b56\u7565",      # 策略
@@ -606,7 +607,7 @@ def _chat_agent_message(
     ])
     if any(token in lowered for token in strategy_triggers):
         prefix.append(
-            "Additional guidance: use get_taili_context_pack for focused strategy/spec/YAML grounding "
+            "Additional guidance: use the product context-pack tool for focused strategy/spec/YAML grounding "
             "if get_evidence_context says no live state is needed or a narrower follow-up is needed. "
             "Do not answer from generic RL knowledge alone."
         )
@@ -667,10 +668,35 @@ def _fmt_float(value: object, digits: int = 3) -> str:
         return "?"
 
 
+def _build_fast_training_probe_script(run_glob: str, process_pattern: str) -> str:
+    """构造只读的远程快速探针脚本。
+
+    运行目录和训练进程模式都来自当前产品的数据源；控制台本身不应内置某个
+    机器人的包名。这里保持脚本为纯字符串生成函数，便于在本地测试 shell
+    控制流，而不需要建立 SSH 或启动仿真。
+    """
+    import shlex as _shlex
+
+    quoted_process_pattern = _shlex.quote(process_pattern)
+    return (
+        "run=$(ls -dt " + run_glob + " 2>/dev/null | head -1 | sed 's:/*$::'); "
+        "printf '__RUN__%s\\n' \"$run\"; "
+        "if pgrep -fa " + quoted_process_pattern + " >/dev/null 2>&1; "
+        "then echo '__RUNNING__1'; else echo '__RUNNING__0'; fi; "
+        "date +__NOW__%s; "
+        "if [ -n \"$run\" ]; then "
+        "  if [ -s \"$run/train.telemetry.jsonl\" ]; then printf '__TELEMETRY__'; tail -n 1 \"$run/train.telemetry.jsonl\"; "
+        "  elif [ -s \"$run/console.telemetry.jsonl\" ]; then printf '__TELEMETRY__'; tail -n 1 \"$run/console.telemetry.jsonl\"; "
+        "  else echo '__TELEMETRY__'; fi; "
+        "fi; "
+        "printf '__GPU__'; "
+        "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || true"
+    )
+
+
 async def _fast_training_status_response(req: ChatRequest, started: float) -> ChatResponse:
     import asyncio as _asyncio
     import json as _json
-    import shlex as _shlex
 
     def _probe_sync() -> dict:
         if not hasattr(source, "_get_remote"):
@@ -679,22 +705,15 @@ async def _fast_training_status_response(req: ChatRequest, started: float) -> Ch
         run_glob = (
             source._run_glob_shell()  # type: ignore[attr-defined]
             if hasattr(source, "_run_glob_shell")
-            else "/root/gpufree-data/taili_runs/*"
+            else ""
         )
-        script = (
-            "run=$(ls -dt " + run_glob + " 2>/dev/null | head -1 | sed 's:/*$::'); "
-            "printf '__RUN__%s\\n' \"$run\"; "
-            "if pgrep -fa 'taili_blind_runtime\\.train_taili|taili_blind_runtime\\.launch_taili_train' >/dev/null 2>&1; "
-            "then echo '__RUNNING__1'; else echo '__RUNNING__0'; fi; "
-            "date +__NOW__%s; "
-            "if [ -n \"$run\" ]; then "
-            "  if [ -s \"$run/train.telemetry.jsonl\" ]; then printf '__TELEMETRY__'; tail -n 1 \"$run/train.telemetry.jsonl\"; "
-            "  elif [ -s \"$run/console.telemetry.jsonl\" ]; then printf '__TELEMETRY__'; tail -n 1 \"$run/console.telemetry.jsonl\"; "
-            "  else echo '__TELEMETRY__'; fi; "
-            "fi; "
-            "printf '__GPU__'; "
-            "nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || true"
+        process_pattern = (
+            source._training_process_pattern()  # type: ignore[attr-defined]
+            if hasattr(source, "_training_process_pattern")
+            else ""
         )
+        script = _build_fast_training_probe_script(run_glob, process_pattern)
+        import shlex as _shlex
         out = remote.exec_out("bash -lc " + _shlex.quote(script), timeout=8)
         result: dict = {"raw": out}
         for line in (out or "").splitlines():
@@ -919,9 +938,13 @@ async def research_cycle_execute(req: ResearchCycleExecuteRequest) -> dict:
 @app.get("/research/replay")
 async def research_replay(split: str = "holdout") -> dict:
     from autotuner.research.decision_replay import DecisionReplayRunner, GlobalResearchDecisionPolicy, load_replay_cases
-    from .code_knowledge import _ROOT as project_root
+    from pathlib import Path
 
-    path = project_root / "config" / "decision_replay" / "taili_core_cases.jsonl"
+    runtime = resolve_product_runtime(settings.product_id or None)
+    declared = runtime.training.get("knowledge", {}).get("decision_replay_cases", "")
+    if not declared:
+        raise HTTPException(status_code=409, detail="当前产品未声明 decision replay 数据集")
+    path = Path(__file__).resolve().parents[2] / str(declared)
     cases = load_replay_cases(path, split=split)
     report = await asyncio.to_thread(DecisionReplayRunner().run, cases, GlobalResearchDecisionPolicy())
     return report.model_dump(mode="json")
@@ -959,7 +982,7 @@ async def config_frameworks() -> list[FrameworkProfileInfo]:
             active=profile.id == settings.framework_id,
             desired=profile.id == desired_id,
         )
-        for profile in list_framework_profiles()
+        for profile in list_framework_profiles(product_id=settings.product_id or None)
     ]
 
 
@@ -967,16 +990,17 @@ async def config_frameworks() -> list[FrameworkProfileInfo]:
 async def config_framework_catalog() -> FrameworkCatalogInfo:
     """The Framework Library ② mechanism catalog (M1-M9 + blind-TP) + named compositions with
     per-component adapt_plan. Distinct from /config/frameworks (run-level profiles)."""
-    return build_framework_catalog()
+    return build_framework_catalog(settings.product_id or None)
 
 
 @app.get("/config/adaptation/preview", response_model=AdaptationPreviewInfo)
-async def config_adaptation_preview(robot: str = "taili") -> AdaptationPreviewInfo:
-    """Dry-run the adapter chain (③④⑦) for a robot preset: derived actuator/geometry, ⑦ consistency
+async def config_adaptation_preview(robot: str = "") -> AdaptationPreviewInfo:
+    """Dry-run the adapter chain (③④⑦) for a product: derived actuator/geometry, ⑦ consistency
     (URDF-vs-asset, sim2real hazards), ④ deploy-readiness. Read-only; nothing remote is touched."""
-    if robot not in available_robots():
-        raise HTTPException(status_code=404, detail=f"unknown robot {robot!r}; known: {available_robots()}")
-    return await asyncio.to_thread(build_adaptation_preview, robot)
+    selected = robot or settings.product_id
+    if selected and selected not in available_robots():
+        raise HTTPException(status_code=404, detail=f"unknown product {selected!r}; known: {available_robots()}")
+    return await asyncio.to_thread(build_adaptation_preview, selected)
 
 
 @app.get("/config/robot/import/known", response_model=KnownUrdfsInfo)
@@ -987,9 +1011,8 @@ async def config_robot_import_known() -> KnownUrdfsInfo:
 
 @app.get("/config/robot/import", response_model=RobotImportInfo)
 async def config_robot_import(urdf: str) -> RobotImportInfo:
-    """§3 C front door: is this URDF adaptable by the framework? (12-DoF quadruped, hip/thigh/calf,
-    derivable effort/mass/leg). Returns adaptable + honest issue list. Read-only."""
-    return await asyncio.to_thread(build_robot_import, urdf)
+    """§3 C front door: validate a declared URDF against the selected product adapter."""
+    return await asyncio.to_thread(build_robot_import, urdf, settings.product_id)
 
 
 @app.get("/config/framework/edit/knobs", response_model=EditableKnobsInfo)
@@ -999,12 +1022,13 @@ async def config_framework_edit_knobs() -> EditableKnobsInfo:
 
 
 @app.get("/config/framework/edit/validate", response_model=EditValidationInfo)
-async def config_framework_edit_validate(field: str, value: float, robot: str = "taili") -> EditValidationInfo:
+async def config_framework_edit_validate(field: str, value: float, robot: str = "") -> EditValidationInfo:
     """⑥ guard: is this proposed framework-content edit within the robot's derived safe band?
     Accepted only if in-band (§8.0 no out-of-band guesses). Read-only."""
-    if robot not in available_robots():
-        raise HTTPException(status_code=404, detail=f"unknown robot {robot!r}; known: {available_robots()}")
-    return await asyncio.to_thread(build_edit_validation, field, value, robot)
+    selected = robot or settings.product_id
+    if selected and selected not in available_robots():
+        raise HTTPException(status_code=404, detail=f"unknown product {selected!r}; known: {available_robots()}")
+    return await asyncio.to_thread(build_edit_validation, field, value, selected)
 
 
 def _llm_info() -> LLMProfileInfo:
@@ -1046,12 +1070,13 @@ async def config_remote() -> RemoteProfileInfo:
 
 @app.get("/config/strategy")
 async def config_strategy() -> dict:
-    """The detailed TUNING STRATEGY the operator otherwise couldn't see in the panel: reward weights
-    (grouped tracking / gait-quality / thresholds), curriculum phases + advancement gates, and AMP
-    hyperparameters — read-only, from taili_blind_config.yaml. Edits go through the edit_config action."""
+    """读取当前产品合同声明的训练策略视图；修改仍必须经过 edit_config 动作。"""
     from .strategy_view import build_strategy_view
 
-    return await asyncio.to_thread(build_strategy_view)
+    return await asyncio.to_thread(
+        build_strategy_view,
+        product_id=settings.product_id or None,
+    )
 
 
 @app.patch("/config/remote", response_model=RemoteProfileUpdateResult)
@@ -1454,7 +1479,7 @@ async def run_current_snapshot() -> RunSnapshot:
 
 @app.get("/run/current/scoreboard", response_model=Scoreboard)
 async def run_current_scoreboard() -> Scoreboard:
-    """目标记分牌：按五+类目标排开，每个指标给出 现值/底线/底线出处，只讲事实。"""
+    """读取当前产品记分牌：每个指标给出现值、底线和底线出处，只讲事实。"""
     telemetry = await source.training_telemetry()
     if telemetry.scoreboard is None:
         raise HTTPException(status_code=404, detail="No objective scoreboard available.")
@@ -1463,8 +1488,7 @@ async def run_current_scoreboard() -> Scoreboard:
 
 @app.get("/run/current/acceptance")
 async def run_current_acceptance() -> dict:
-    """Benchmark verdict vs docs/taili_spec.md for the newest run — scored from persisted physeval
-    logs (read-only; never launches physeval). Returns {available: False, reason} when none exist yet."""
+    """读取当前产品验收 verdict；只消费已持久化的验收结果，不启动新的测评。"""
     return await asyncio.to_thread(source.get_acceptance)
 
 

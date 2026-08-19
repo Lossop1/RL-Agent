@@ -25,8 +25,10 @@ _ENV_EXACT = frozenset({
     "CUDA_VISIBLE_DEVICES",
     "RL_RESEARCH_EXPERIMENT_REF",
     "RL_RESEARCH_CANDIDATE_ROOT",
+    "RL_MECHANISM_BUNDLE",
+    "RL_MECHANISM_RELOAD",
 })
-_ENV_PREFIXES = ("TAILI_",)
+_ENV_PREFIXES = ("RL_",)
 _SAFE_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -98,16 +100,28 @@ class SSHExperimentBackend:
         return clean_stdout, stderr
 
     @staticmethod
-    def _remote_environment(environment: Mapping[str, str], candidate_root: str) -> dict[str, str]:
+    def _remote_environment(
+        environment: Mapping[str, str],
+        candidate_root: str,
+        plan: ExperimentPlan,
+    ) -> dict[str, str]:
+        declaration = plan.training_window.get("environment_policy", {})
+        declaration = declaration if isinstance(declaration, Mapping) else {}
+        raw_prefixes = declaration.get("prefixes", ("RL_",))
+        raw_exact = declaration.get("exact", tuple(_ENV_EXACT))
+        prefixes = tuple(str(item).strip() for item in raw_prefixes) if isinstance(raw_prefixes, (list, tuple)) else ()
+        exact = tuple(str(item).strip() for item in raw_exact) if isinstance(raw_exact, (list, tuple)) else ()
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*_", item) for item in prefixes):
+            raise ValueError("training_window.environment_policy.prefixes must be safe names ending in '_'")
         selected: dict[str, str] = {}
         for key, value in environment.items():
             name = str(key)
             if not _SAFE_ENV_NAME.fullmatch(name):
                 continue
-            if name in _ENV_EXACT or name.startswith(_ENV_PREFIXES):
+            if name in exact or name.startswith(prefixes):
                 selected[name] = str(value)
         selected["RL_RESEARCH_CANDIDATE_ROOT"] = candidate_root
-        selected["TAILI_MECHANISM_BUNDLE"] = f"{candidate_root}/mechanisms.json"
+        selected["RL_MECHANISM_BUNDLE"] = f"{candidate_root}/mechanisms.json"
         return selected
 
     @staticmethod
@@ -189,7 +203,7 @@ class SSHExperimentBackend:
         try:
             self._checked(remote, f"mkdir -p {shlex.quote(remote_workspace)}")
             self._upload_tree(remote, workspace / "candidate", candidate_remote)
-            remote_env = self._remote_environment(environment, candidate_remote)
+            remote_env = self._remote_environment(environment, candidate_remote, plan)
             runner = self._runner_script(
                 command,
                 remote_env,
@@ -282,7 +296,7 @@ class SSHExperimentBackend:
         try:
             command = _argv(plan, "evaluation")
             candidate_remote = f"{run.remote_workspace}/candidate"
-            environment = self._remote_environment(run.environment, candidate_remote)
+            environment = self._remote_environment(run.environment, candidate_remote, plan)
             environment["RL_RESEARCH_EXPERIMENT_REF"] = plan.id
             runner = self._runner_script(
                 command,

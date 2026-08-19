@@ -58,7 +58,7 @@ def llm_readiness(settings: LocomotionConsoleSettings) -> dict[str, Any]:
         "get_operator_context",
         "get_training_telemetry",
         "get_remote_status",
-        "get_taili_context_pack",
+        "get_context_pack",
         "explain_definition",
         "get_signal_map",
         "get_code_knowledge",
@@ -146,7 +146,7 @@ async def system_audit(settings: LocomotionConsoleSettings, source: Any, *, incl
         "framework_registry",
         "框架注册表",
         "ok",
-        f"{settings.framework_id} active; {len(list_framework_profiles())} registered",
+        f"{settings.framework_id} active; {len(list_framework_profiles(product_id=settings.product_id or None))} registered",
         {
             "frameworks": [
                 {
@@ -156,7 +156,7 @@ async def system_audit(settings: LocomotionConsoleSettings, source: Any, *, incl
                     "diagnostic_task": profile.diagnostic_task,
                     "active": profile.id == settings.framework_id,
                 }
-                for profile in list_framework_profiles()
+                for profile in list_framework_profiles(product_id=settings.product_id or None)
             ]
         },
     ))

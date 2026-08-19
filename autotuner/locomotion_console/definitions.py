@@ -376,7 +376,7 @@ _DEFINITIONS: list[DefinitionInfo] = [
         label="低身高惩罚",
         category="reward",
         formula="reward.height_low = -w_height_low * max((height_min_ok - base_h) / (nominal_base_h - height_min_ok), 0)^2",
-        meaning="当 base_h 低于 spec 下界时出现的显式惩罚。当前 Taili nominal_base_h=0.52，height_min_ok=0.47；0.45m 会被明确扣分。",
+        meaning="当 base_h 低于当前产品规范下界时出现的显式惩罚；具体 nominal_base_h 与 height_min_ok 以本次产品合同和生效配置为准。",
         source="train.telemetry.jsonl reward.height_low / [TPPEN] height_low",
         related=["base_h", "reward", "stable_motion_gate"],
         actions=["/explain base_h", "/status"],

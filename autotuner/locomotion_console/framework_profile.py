@@ -1,13 +1,16 @@
-"""Framework registry for the locomotion console.
+"""产品合同投影出的框架运行档案。
 
-The framework is intentionally a profile, not hardcoded behavior. The current
-candidate framework is not the teacher task; teacher remains a reference profile
-that must be selected explicitly.
+框架档案描述“如何找到并运行一类训练”，但不拥有任何机器人名称、路径
+或任务实现。具体值来自产品清单的 ``framework.profiles``；本模块只负责
+把它转换成控制台需要的不可变对象，并保留旧 API 作为兼容入口。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+import os
+from typing import Any, Literal, Mapping
+
+from autotuner.product import ProductManifestError, resolve_product_runtime
 
 
 FrameworkStatus = Literal["draft", "validated", "reference", "legacy"]
@@ -15,6 +18,7 @@ FrameworkStatus = Literal["draft", "validated", "reference", "legacy"]
 
 @dataclass(frozen=True)
 class FrameworkProfile:
+    product_id: str
     id: str
     label: str
     status: FrameworkStatus
@@ -25,7 +29,7 @@ class FrameworkProfile:
     checkpoint_roots: tuple[str, ...]
     note: str = ""
     required_robot_capabilities: tuple[str, ...] = field(default_factory=tuple)
-    # per-framework action commands (override BoxProfile when set); {checkpoint} substituted at run time.
+    # 每个档案可以覆盖远程动作命令；命令中的占位符由调用方替换。
     physeval_cmd: str = ""
     physeval_log: str = ""
     resume_cmd: str = ""
@@ -33,97 +37,93 @@ class FrameworkProfile:
     kill_cmd: str = ""
 
 
-_FRAMEWORKS: dict[str, FrameworkProfile] = {
-    "taili_amp_blind": FrameworkProfile(
-        id="taili_amp_blind",
-        label="Taili AMP Blind",
-        status="draft",
-        experiment="taili_amp_blind",
-        task_id="RobotLab-Isaac-Taili-AMP-Blind-Direct-v0",
-        diagnostic_task="RobotLab-Isaac-Taili-AMP-Blind-Direct-v0",
-        run_globs=(
-            # Runtime payload launches create one data-disk run directory containing
-            # train.log, train.telemetry.jsonl, console.log, checkpoints/, and tfevents.
-            "/root/gpufree-data/taili_runs/*/",
-            # Legacy fallback for runs created before the self-contained payload launcher.
-            "/root/tp_runs/*/",
-            "/root/gpufree-data/robot_lab/logs/skrl/taili_amp_blind/*/",
-            "/root/gpufree-data/logs/skrl/taili_amp_blind/*/",
-            "/root/robot_lab/logs/skrl/taili_amp_blind/*/",
-        ),
-        checkpoint_roots=(
-            "/root/gpufree-data/taili_runs",
-            "/root/tp_runs",
-            "/root/gpufree-data/robot_lab/logs/skrl/taili_amp_blind",
-            "/root/gpufree-data/logs/skrl/taili_amp_blind",
-            "/root/robot_lab/logs/skrl/taili_amp_blind",
-        ),
-        required_robot_capabilities=("quadruped_12dof", "blind_actor", "amp_reference"),
-        note="Current draft framework target. It is the active default and is not the teacher task.",
-        # blind acceptance uses physeval_blind.py (deployment-口径 mean-action), NOT the old physeval.py
-        physeval_cmd="",
-        physeval_log="/root/gpufree-data/diag_runs/physeval_blind.log",
-        train_running_probe=(
-            "pgrep -fa 'taili_blind_runtime\\.train_taili|launch_taili_train|RobotLab-Isaac-Taili.*Blind' "
-            "| grep -v pgrep"
-        ),
-        kill_cmd="pkill -f 'taili_blind_runtime\\.train_taili|launch_taili_train|RobotLab-Isaac-Taili.*Blind'",
-        # 运维支持从检查点暖启动；具体恢复命令由运行器提供。
-        resume_cmd="",
-    ),
-    "taili_amp_teacher_reference": FrameworkProfile(
-        id="taili_amp_teacher_reference",
-        label="Taili AMP Teacher Reference",
-        status="reference",
-        experiment="taili_amp_teacher",
-        task_id="RobotLab-Isaac-Taili-AMP-Teacher-Direct-v0",
-        diagnostic_task="RobotLab-Isaac-Taili-AMP-Teacher-Direct-v0",
-        run_globs=(
-            "/root/gpufree-data/robot_lab/logs/skrl/taili_amp_teacher/*/",
-            "/root/gpufree-data/logs/skrl/taili_amp_teacher/*/",
-            "/root/robot_lab/logs/skrl/taili_amp_teacher/*/",
-        ),
-        checkpoint_roots=(
-            "/root/gpufree-data/robot_lab/logs/skrl/taili_amp_teacher",
-            "/root/gpufree-data/logs/skrl/taili_amp_teacher",
-            "/root/robot_lab/logs/skrl/taili_amp_teacher",
-        ),
-        required_robot_capabilities=("quadruped_12dof", "privileged_teacher"),
-        note="Reference-only profile for already generated teacher checkpoints; never the default.",
-    ),
-}
+def _tuple_strings(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
 
 
-DEFAULT_FRAMEWORK_ID = "taili_amp_blind"
+def _profile_from_mapping(product_id: str, identifier: str, data: Mapping[str, Any]) -> FrameworkProfile:
+    commands = data.get("commands") if isinstance(data.get("commands"), Mapping) else {}
+    status = str(data.get("status") or "draft").strip().lower()
+    if status not in {"draft", "validated", "reference", "legacy"}:
+        status = "draft"
+    return FrameworkProfile(
+        product_id=product_id,
+        id=identifier,
+        label=str(data.get("label") or identifier),
+        status=status,  # type: ignore[arg-type]
+        experiment=str(data.get("experiment") or ""),
+        task_id=str(data.get("task_id") or ""),
+        diagnostic_task=str(data.get("diagnostic_task") or data.get("task_id") or ""),
+        run_globs=_tuple_strings(data.get("run_globs")),
+        checkpoint_roots=_tuple_strings(data.get("checkpoint_roots")),
+        note=str(data.get("note") or ""),
+        required_robot_capabilities=_tuple_strings(data.get("required_robot_capabilities")),
+        physeval_cmd=str(commands.get("physeval") or data.get("physeval_cmd") or ""),
+        physeval_log=str(commands.get("physeval_log") or data.get("physeval_log") or ""),
+        resume_cmd=str(commands.get("resume") or data.get("resume_cmd") or ""),
+        train_running_probe=str(commands.get("train_running_probe") or data.get("train_running_probe") or ""),
+        kill_cmd=str(commands.get("kill") or data.get("kill_cmd") or ""),
+    )
 
 
-def list_framework_profiles() -> list[FrameworkProfile]:
-    return list(_FRAMEWORKS.values())
+def _runtime(product_id: str | None = None):
+    return resolve_product_runtime(product_id, check_files=False)
 
 
-def get_framework_profile(framework_id: str | None = None) -> FrameworkProfile:
-    key = framework_id or DEFAULT_FRAMEWORK_ID
+def default_framework_id(product_id: str | None = None) -> str:
+    """取得产品声明的默认框架；没有声明时明确返回空字符串。"""
+    explicit = os.environ.get("LOCOMOTION_CONSOLE_FRAMEWORK", "").strip()
+    if explicit:
+        return explicit
+    return _runtime(product_id).default_framework_id()
+
+
+# 兼容旧的 import；新代码应调用 default_framework_id()，避免模块导入时冻结产品选择。
+DEFAULT_FRAMEWORK_ID = os.environ.get("LOCOMOTION_CONSOLE_FRAMEWORK", "").strip()
+
+
+def list_framework_profiles(product_id: str | None = None) -> list[FrameworkProfile]:
+    view = _runtime(product_id)
+    return [
+        _profile_from_mapping(view.product_id, identifier, data)
+        for identifier, data in view.framework_profiles().items()
+    ]
+
+
+def get_framework_profile(
+    framework_id: str | None = None,
+    *,
+    product_id: str | None = None,
+) -> FrameworkProfile:
+    view = _runtime(product_id)
+    key = (framework_id or "").strip() or view.default_framework_id()
+    profiles = view.framework_profiles()
+    if not key:
+        raise ProductManifestError(
+            f"product {view.product_id!r} does not declare a default framework profile"
+        )
     try:
-        return _FRAMEWORKS[key]
+        return _profile_from_mapping(view.product_id, key, profiles[key])
     except KeyError as exc:
-        known = ", ".join(sorted(_FRAMEWORKS))
-        raise ValueError(f"Unknown framework profile: {key}. Known: {known}") from exc
+        known = ", ".join(sorted(profiles)) or "<none>"
+        raise ValueError(
+            f"Unknown framework profile {key!r} for product {view.product_id!r}. Known: {known}"
+        ) from exc
 
 
 def merge_box_profile(profile, framework: FrameworkProfile):
-    """Return a BoxProfile aligned to the active framework.
+    """将发现到的远程实例与合同中的框架结构合并。
 
-    BoxProfile still carries discovered remote details, but framework identity,
-    run globs, and task id come from the selected FrameworkProfile so the console
-    cannot accidentally show teacher state while the active framework is blind.
+    BoxProfile 只保存机器上发现的动态细节；产品合同决定任务、运行目录和
+    动作命令，避免探测结果把 teacher 或另一产品误认成当前任务。
     """
     update = {
-        "experiment": framework.experiment,
+        "experiment": framework.experiment or profile.experiment,
         "runs_glob": framework.run_globs[0] if framework.run_globs else profile.runs_glob,
-        "task_id": framework.task_id,
+        "task_id": framework.task_id or profile.task_id,
     }
-    # per-framework action commands override the box defaults (the blind framework's physeval is
-    # physeval_blind.py, not the box's old physeval.py / task).
     if framework.physeval_cmd:
         update["physeval_cmd"] = framework.physeval_cmd
     if framework.physeval_log:
@@ -135,3 +135,13 @@ def merge_box_profile(profile, framework: FrameworkProfile):
     if framework.kill_cmd:
         update["kill_cmd"] = framework.kill_cmd
     return profile.model_copy(update=update)
+
+
+__all__ = [
+    "DEFAULT_FRAMEWORK_ID",
+    "FrameworkProfile",
+    "default_framework_id",
+    "get_framework_profile",
+    "list_framework_profiles",
+    "merge_box_profile",
+]

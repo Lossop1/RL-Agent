@@ -14,25 +14,84 @@ fallback rather than letting the violation propagate.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Mapping, Optional
 
 
 # ── Known enums ─────────────────────────────────────────────────────────
 
 KNOWN_ROBOT_IDS: tuple[str, ...] = (
-    "taili_dog_39kg",
+    "robot",
 )
 KNOWN_TASK_CLASSES: tuple[str, ...] = (
-    "velocity_tracking",
+    "locomotion",
 )
 KNOWN_TERRAINS: tuple[str, ...] = (
-    "flat", "rough", "slope", "stairs",
+    "flat",
 )
 KNOWN_AMBITION_LEVELS: tuple[str, ...] = (
     "baseline_walking",          # robot moves and tracks moderately
     "robust_locomotion",         # walks on terrain, recovers from disturbance
     "industry_grade",            # meets the project's measurable robustness gates
 )
+
+
+def _vocabulary_values(value: object, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    """规范化合同词表，去重并拒绝空值，避免 LLM schema 出现无效枚举。"""
+    if not isinstance(value, (list, tuple)):
+        return fallback
+    result = tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+    return result or fallback
+
+
+@dataclass(frozen=True)
+class TaskSpecVocabulary:
+    """一个产品允许任务接收器使用的最小枚举集合。"""
+
+    robot_ids: tuple[str, ...] = ("robot",)
+    task_classes: tuple[str, ...] = ("locomotion",)
+    terrains: tuple[str, ...] = ("flat",)
+    ambition_levels: tuple[str, ...] = KNOWN_AMBITION_LEVELS
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object] | None) -> "TaskSpecVocabulary":
+        data = value if isinstance(value, Mapping) else {}
+        return cls(
+            robot_ids=_vocabulary_values(data.get("robot_ids"), ("robot",)),
+            task_classes=_vocabulary_values(data.get("task_classes"), ("locomotion",)),
+            terrains=_vocabulary_values(data.get("terrains"), ("flat",)),
+            ambition_levels=_vocabulary_values(data.get("ambition_levels"), KNOWN_AMBITION_LEVELS),
+        )
+
+
+DEFAULT_TASK_SPEC_VOCABULARY = TaskSpecVocabulary()
+
+
+def task_spec_json_schema(vocabulary: TaskSpecVocabulary | None = None) -> Dict:
+    """为指定产品词表生成 JSON schema，不把某个产品写入网关代码。"""
+    values = vocabulary or DEFAULT_TASK_SPEC_VOCABULARY
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "robot_id", "task_class", "terrain", "ambition",
+            "max_command_lin_vel_mps", "user_clarifications_needed", "confidence",
+        ],
+        "properties": {
+            "robot_id": {"type": "string", "enum": list(values.robot_ids)},
+            "task_class": {"type": "string", "enum": list(values.task_classes)},
+            "terrain": {"type": "string", "enum": list(values.terrains)},
+            "ambition": {"type": "string", "enum": list(values.ambition_levels)},
+            "max_command_lin_vel_mps": {
+                "type": "number", "minimum": 0.1, "maximum": 3.0,
+            },
+            "user_clarifications_needed": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": 200},
+                "maxItems": 4,
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        },
+    }
 
 
 # ── TaskSpec — output of task_intake ──────────────────────────────────
@@ -52,48 +111,39 @@ class TaskSpec:
     confidence: float                # 0.0..1.0
 
 
-TASK_SPEC_JSON_SCHEMA: Dict = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": [
-        "robot_id", "task_class", "terrain", "ambition",
-        "max_command_lin_vel_mps", "user_clarifications_needed",
-        "confidence",
-    ],
-    "properties": {
-        "robot_id":  {"type": "string", "enum": list(KNOWN_ROBOT_IDS)},
-        "task_class": {"type": "string", "enum": list(KNOWN_TASK_CLASSES)},
-        "terrain":   {"type": "string", "enum": list(KNOWN_TERRAINS)},
-        "ambition":  {"type": "string", "enum": list(KNOWN_AMBITION_LEVELS)},
-        "max_command_lin_vel_mps": {
-            "type": "number", "minimum": 0.1, "maximum": 3.0,
-        },
-        "user_clarifications_needed": {
-            "type": "array",
-            "items": {"type": "string", "maxLength": 200},
-            "maxItems": 4,
-        },
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-    },
-}
+TASK_SPEC_JSON_SCHEMA: Dict = task_spec_json_schema(
+    TaskSpecVocabulary(
+        robot_ids=KNOWN_ROBOT_IDS,
+        task_classes=KNOWN_TASK_CLASSES,
+        terrains=KNOWN_TERRAINS,
+        ambition_levels=KNOWN_AMBITION_LEVELS,
+    )
+)
 
 
-def validate_task_spec(d: dict, raw_text: str, llm_model: str) -> TaskSpec:
+def validate_task_spec(
+    d: dict,
+    raw_text: str,
+    llm_model: str,
+    vocabulary: TaskSpecVocabulary | None = None,
+) -> TaskSpec:
     """Validate dict against schema, then build typed TaskSpec.
 
     Raises ValueError on any schema violation.
     """
-    for k in TASK_SPEC_JSON_SCHEMA["required"]:
+    values = vocabulary or DEFAULT_TASK_SPEC_VOCABULARY
+    schema = task_spec_json_schema(values)
+    for k in schema["required"]:
         if k not in d:
             raise ValueError(f"TaskSpec missing field {k!r}")
     rid = d["robot_id"]
-    if rid not in KNOWN_ROBOT_IDS:
-        raise ValueError(f"robot_id {rid!r} not in known set")
-    if d["task_class"] not in KNOWN_TASK_CLASSES:
+    if rid not in values.robot_ids:
+        raise ValueError(f"robot_id {rid!r} not in product vocabulary")
+    if d["task_class"] not in values.task_classes:
         raise ValueError(f"task_class {d['task_class']!r} not known")
-    if d["terrain"] not in KNOWN_TERRAINS:
+    if d["terrain"] not in values.terrains:
         raise ValueError(f"terrain {d['terrain']!r} not known")
-    if d["ambition"] not in KNOWN_AMBITION_LEVELS:
+    if d["ambition"] not in values.ambition_levels:
         raise ValueError(f"ambition {d['ambition']!r} not known")
     mv = d["max_command_lin_vel_mps"]
     if not (0.1 <= float(mv) <= 3.0):

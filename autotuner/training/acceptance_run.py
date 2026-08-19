@@ -1,7 +1,7 @@
-"""兼容入口；Taili 验收命令已迁至 :mod:`autotuner.taili_ops.acceptance_run`。"""
+"""兼容入口；Taili 验收命令已迁至 :mod:`products.taili.ops.acceptance_run`。"""
 
-from autotuner.taili_ops import acceptance_run as _implementation
-from autotuner.taili_ops.acceptance_run import *  # noqa: F401,F403
+from products.taili.ops import acceptance_run as _implementation
+from products.taili.ops.acceptance_run import *  # noqa: F401,F403
 
 
 def __getattr__(name: str):

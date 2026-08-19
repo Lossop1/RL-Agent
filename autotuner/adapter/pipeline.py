@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional
 
 from autotuner.adapter.adapt import adapt
 from autotuner.adapter.materialize import materialize, roundtrip_verify, Edit
@@ -24,24 +25,29 @@ from autotuner.adapter.deploy import build_plan, render_plan, DeployPlan
 from autotuner.framework_library import (
     get_composition, validate_composition, adapt_plan as _component_adapt_plan,
 )
+from autotuner.product import resolve_product_adapter, resolve_product_contract
 
-_DEFAULT_CAPS = ("quadruped_12dof", "blind_actor", "amp_reference")
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
 class ConfigSet:
-    """Operational unit (§2), backend twin of the console's ConfigSet: robot + framework + remote dests."""
+    """一次产品适配的确定性输入，不携带产品实现对象。"""
     urdf: str
-    env_cfg_src: str                                   # local source env_cfg to adapt+ship
-    asset_src: str                                     # local source asset to adapt+ship
-    remote_env_cfg: str                                # remote destination for env_cfg
-    remote_asset: str                                  # remote destination for asset
+    env_cfg_src: str
+    asset_src: str
+    product_id: str = ""
+    product_contract_digest: str = ""
+    remote_env_cfg: str = ""
+    remote_asset: str = ""
     mass: Optional[float] = None
-    regenerate_clips: bool = False                     # regenerate AMP references into work_dir (§6)
-    clip_remote_dir: Optional[str] = None              # remote dir for regenerated clips
+    regenerate_clips: bool = False
+    clip_remote_dir: Optional[str] = None
     launch_cmd: Optional[str] = None
-    framework_composition: str = "taili_amp_proven"    # ② framework instance (Taili strategy)
-    robot_capabilities: tuple = _DEFAULT_CAPS          # morphology caps for §② applicability check
+    framework_composition: str = ""
+    robot_capabilities: tuple[str, ...] = ()
+    legacy_deploy_enabled: bool = False
 
 
 @dataclass
@@ -57,30 +63,120 @@ class AdaptationBundle:
     composition_valid: bool = True
     composition_issues: List[str] = field(default_factory=list)
     component_adapt_plan: Dict[str, List[str]] = field(default_factory=dict)
+    references_required: bool = False
+    legacy_deploy_enabled: bool = False
+
+
+def _mapping(value: Any, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return value
+
+
+def _workspace_path(value: Any, name: str) -> str:
+    relative = Path(str(value or ""))
+    if not str(relative) or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{name} must be a workspace-relative path")
+    resolved = (_PROJECT_ROOT / relative).resolve()
+    try:
+        resolved.relative_to(_PROJECT_ROOT)
+    except ValueError as exc:
+        raise ValueError(f"{name} escapes the workspace") from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{name} does not exist: {relative.as_posix()}")
+    return str(resolved)
+
+
+def _asset_path(contract: Any, asset_id: str) -> str:
+    for asset in contract.assets:
+        if asset.id == asset_id:
+            if not asset.exists:
+                raise FileNotFoundError(f"product asset is missing: {asset_id}")
+            return _workspace_path(asset.resolved_path, f"asset {asset_id}")
+    raise ValueError(f"product adaptation references unknown asset: {asset_id!r}")
+
+
+def build_config_set(product_id: str | None = None, composition: str | None = None) -> ConfigSet:
+    """从产品合同构造适配输入；系统中不再维护机器人 preset 字典。"""
+    contract = resolve_product_contract(product_id)
+    adapter = resolve_product_adapter(contract)
+    settings = _mapping(adapter.adaptation, "adaptation")
+    materialization = _mapping(settings.get("materialization"), "adaptation.materialization")
+    legacy = _mapping(settings.get("legacy_deploy", {}), "adaptation.legacy_deploy")
+    capabilities = contract.robot.get("capabilities")
+    if not isinstance(capabilities, (list, tuple)):
+        raise ValueError("robot.capabilities must be a list")
+    selected_composition = str(composition or settings.get("composition") or "").strip()
+    if not selected_composition:
+        raise ValueError("adaptation.composition is required")
+    return ConfigSet(
+        product_id=contract.product_id,
+        product_contract_digest=contract.contract_digest,
+        urdf=_asset_path(contract, str(settings.get("urdf_asset") or "")),
+        env_cfg_src=_workspace_path(materialization.get("env_source"), "materialization.env_source"),
+        asset_src=_workspace_path(materialization.get("asset_source"), "materialization.asset_source"),
+        remote_env_cfg=str(legacy.get("remote_env_cfg") or ""),
+        remote_asset=str(legacy.get("remote_asset") or ""),
+        clip_remote_dir=str(legacy.get("clip_remote_dir") or "") or None,
+        launch_cmd=str(legacy.get("launch_cmd") or "") or None,
+        framework_composition=selected_composition,
+        robot_capabilities=tuple(str(item) for item in capabilities),
+        legacy_deploy_enabled=bool(legacy.get("enabled", False)),
+    )
 
 
 def plan_adaptation(cs: ConfigSet, work_dir: str, stamp: str,
-                    require_refs: bool = True) -> AdaptationBundle:
+                    require_refs: bool | None = None) -> AdaptationBundle:
     """Run the full offline adaptation→deploy-plan chain. No remote writes.
 
     Resolves the ② framework composition first (§5 ConfigSet{framework} → Adapter): validates the
     robot supports every component's morphology, and records the per-component adapt_plan
     (invariant/derive/regenerate/scale) so the bundle documents what the Adapter touched and why.
     """
-    comp = get_composition(cs.framework_composition)
+    contract = resolve_product_contract(cs.product_id or None)
+    if cs.product_contract_digest and cs.product_contract_digest != contract.contract_digest:
+        raise ValueError(
+            "product contract changed after ConfigSet creation; rebuild the ConfigSet before adaptation"
+        )
+    adapter = resolve_product_adapter(contract)
+    settings = _mapping(adapter.adaptation, "adaptation")
+    materialization = _mapping(settings.get("materialization"), "adaptation.materialization")
+    legacy = _mapping(settings.get("legacy_deploy", {}), "adaptation.legacy_deploy")
+    references_required = (
+        bool(legacy.get("require_reference_clips", False))
+        if require_refs is None
+        else bool(require_refs)
+    )
+    composition_id = cs.framework_composition or str(settings.get("composition") or "")
+    comp = get_composition(composition_id, contract.product_id)
     comp_issues = validate_composition(comp, tuple(cs.robot_capabilities))
     comp_plan = _component_adapt_plan(comp)
 
     wd = Path(work_dir)
-    adapted = adapt(cs.urdf, mass=cs.mass,
-                    regenerate_clips_to=str(wd) if cs.regenerate_clips else None)
-    edits = materialize(adapted, cs.env_cfg_src, cs.asset_src, work_dir)
-    bad = roundtrip_verify(adapted, str(wd / Path(cs.env_cfg_src).name))
+    adapted = adapt(
+        cs.urdf,
+        mass=cs.mass,
+        regenerate_clips_to=str(wd) if cs.regenerate_clips else None,
+        contract=contract,
+    )
+    edits = materialize(
+        adapted,
+        cs.env_cfg_src,
+        cs.asset_src,
+        work_dir,
+        spec=materialization,
+    )
+    bad = roundtrip_verify(
+        adapted,
+        str(wd / Path(cs.env_cfg_src).name),
+        spec=materialization,
+    )
 
-    remote_map = {
-        Path(cs.env_cfg_src).name: cs.remote_env_cfg,
-        Path(cs.asset_src).name: cs.remote_asset,
-    }
+    remote_map: dict[str, str] = {}
+    if cs.remote_env_cfg:
+        remote_map[Path(cs.env_cfg_src).name] = cs.remote_env_cfg
+    if cs.remote_asset:
+        remote_map[Path(cs.asset_src).name] = cs.remote_asset
     # regenerated reference clips (if any) ship to clip_remote_dir under their own basename
     for clip in (adapted.get("reference_clips") or []):
         name = Path(clip).name
@@ -88,7 +184,7 @@ def plan_adaptation(cs: ConfigSet, work_dir: str, stamp: str,
             remote_map[name] = f"{cs.clip_remote_dir.rstrip('/')}/{name}"
 
     plan = build_plan(work_dir, remote_map, launch_cmd=cs.launch_cmd, stamp=stamp,
-                      require_refs=require_refs)
+                      require_refs=references_required)
 
     a, r, h = adapted["actuator"], adapted["reward_thresholds"], adapted["health_band"]
     derived = {
@@ -102,7 +198,9 @@ def plan_adaptation(cs: ConfigSet, work_dir: str, stamp: str,
                             roundtrip_bad=bad, plan=plan, work_dir=str(wd),
                             derived_summary=derived,
                             composition_id=comp.id, composition_valid=not comp_issues,
-                            composition_issues=comp_issues, component_adapt_plan=comp_plan)
+                            composition_issues=comp_issues, component_adapt_plan=comp_plan,
+                            references_required=references_required,
+                            legacy_deploy_enabled=cs.legacy_deploy_enabled)
 
 
 def consistency_report(b: AdaptationBundle) -> dict:
@@ -148,8 +246,10 @@ def deploy_readiness(b: AdaptationBundle) -> dict:
         blockers.append(f"framework composition invalid for robot: {b.composition_issues}")
     if b.plan.missing:
         blockers.append(f"mapped files missing from work_dir: {b.plan.missing}")
-    if not any(it.role == "reference_clip" for it in b.plan.items):
+    if b.references_required and not any(it.role == "reference_clip" for it in b.plan.items):
         blockers.append("no reference clips in plan (§6: regenerate the full reference set before deploy)")
+    if not b.legacy_deploy_enabled:
+        blockers.append("legacy source-file deployment is disabled; build and deploy the product payload")
     return {"ready": not blockers, "blockers": blockers}
 
 
@@ -172,21 +272,12 @@ def render_bundle(b: AdaptationBundle) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
-    import tempfile
-    from autotuner.adapter.adapt import _DEFAULT_URDF
-
-    cs = ConfigSet(
-        urdf=_DEFAULT_URDF,
-        env_cfg_src="autotuner/blind_locomotion/env_edit/taili_amp_env_cfg.py",
-        asset_src="autotuner/blind_locomotion/assets/taili.py",
-        remote_env_cfg=("/root/gpufree-data/robot_lab/source/robot_lab/robot_lab/tasks/"
-                        "direct/taili_amp/taili_amp_env_cfg.py"),
-        remote_asset="/root/gpufree-data/robot_lab/.../asset/taili.py",
-        launch_cmd="/opt/conda/envs/isaaclab/bin/python3 /root/tp_train_real.py",
-    )
-    wd = tempfile.mkdtemp(prefix="adapter_pipeline_")
-    bundle = plan_adaptation(cs, wd, stamp="20260629-231500")
-    print(render_bundle(bundle))
-    print("\n(Taili identity: env_cfg edits all no-op, asset calf velocity already URDF-correct at 8.27, "
-          "roundtrip PASS. DRY-RUN — deploy.execute(confirm=True) required to write remote.)")
+__all__ = [
+    "AdaptationBundle",
+    "ConfigSet",
+    "build_config_set",
+    "consistency_report",
+    "deploy_readiness",
+    "plan_adaptation",
+    "render_bundle",
+]

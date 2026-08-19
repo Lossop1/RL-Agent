@@ -105,6 +105,11 @@ class ResolvedProductContract:
     deployment: Mapping[str, Any]
     runtime: Mapping[str, Any]
     compatibility: Mapping[str, Any]
+    simulation: Mapping[str, Any] = field(default_factory=dict)
+    asset_reuse: Mapping[str, Any] = field(default_factory=dict)
+    framework: Mapping[str, Any] = field(default_factory=dict)
+    adaptation: Mapping[str, Any] = field(default_factory=dict)
+    plugins: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     assets: tuple[ResolvedAsset, ...] = ()
     issues: tuple[str, ...] = ()
     contract_digest: str = field(default="")
@@ -208,6 +213,10 @@ def resolve_product_contract(
         manifest.diagnostics,
         {"entrypoint": manifest.diagnose_entrypoint, "spec": manifest.robot.diagnostic_spec},
     )
+    simulation = _section_with_defaults(
+        manifest.simulation,
+        {"worlds": [], "sim2sim": {"required": False}},
+    )
     deployment = _section_with_defaults(
         manifest.deployment,
         {"payload_builder": manifest.payload_builder, "payload_package": manifest.payload_package},
@@ -227,6 +236,7 @@ def resolve_product_contract(
         "source_roots": list(manifest.source_roots),
         "sources": dict(manifest.sources),
         "requirements": dict(manifest.task_requirements),
+        "intake": dict(manifest.task_vocabulary),
         "knowledge": dict(manifest.knowledge),
     }
     contract = ResolvedProductContract(
@@ -244,6 +254,11 @@ def resolve_product_contract(
         deployment=deployment,
         runtime=runtime,
         compatibility=compatibility,
+        simulation=simulation,
+        asset_reuse=dict(manifest.asset_reuse),
+        framework=dict(manifest.framework),
+        adaptation=dict(manifest.adaptation),
+        plugins={role: dict(operations) for role, operations in manifest.plugins.items()},
         assets=tuple(resolved_assets),
         issues=tuple(issues),
     )

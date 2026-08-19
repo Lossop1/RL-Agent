@@ -28,11 +28,16 @@ class KnownUrdfsInfo(BaseModel):
 
 
 def known_urdfs() -> KnownUrdfsInfo:
-    from autotuner.adapter.__main__ import PRESETS
-    return KnownUrdfsInfo(urdfs={robot: p["urdf"] for robot, p in PRESETS.items()})
+    from autotuner.adapter.pipeline import build_config_set
+    from autotuner.product import ProductRegistry
+
+    result: Dict[str, str] = {}
+    for product in ProductRegistry().list(valid_only=True):
+        result[product.product_id] = build_config_set(product.product_id).urdf
+    return KnownUrdfsInfo(urdfs=result)
 
 
-def build_robot_import(urdf: str) -> RobotImportInfo:
+def build_robot_import(urdf: str, product_id: str = "") -> RobotImportInfo:
     # Confine the (unauthenticated, GET) urdf path to the known robot-asset roots BEFORE any parse,
     # so this endpoint can't be used as an arbitrary-file parse / existence oracle (?urdf=/etc/passwd).
     from autotuner.adapter._safe_xml import resolve_within_roots
@@ -44,7 +49,7 @@ def build_robot_import(urdf: str) -> RobotImportInfo:
                                message="URDF path is not an allowed robot-asset path")
     try:
         from autotuner.adapter.robot_import import validate_robot_urdf
-        r = validate_robot_urdf(safe_path)
+        r = validate_robot_urdf(safe_path, product_id=product_id or None)
         return RobotImportInfo(
             urdf=urdf, available=True, adaptable=r.adaptable, n_joints=r.n_joints,
             mass_kg=r.mass_kg, leg_length_m=r.leg_length_m, roles=list(r.roles),

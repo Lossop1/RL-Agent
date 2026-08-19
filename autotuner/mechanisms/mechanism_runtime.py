@@ -343,10 +343,14 @@ def load_mechanism_runtime(path: str | Path, *, reload_if_changed: bool = False)
 
 
 def runtime_from_environment() -> MechanismRuntime | None:
-    path = os.environ.get("TAILI_MECHANISM_BUNDLE", "").strip()
+    path = (
+        os.environ.get("RL_MECHANISM_BUNDLE", "").strip()
+    )
     if not path:
         return None
-    reload_if_changed = os.environ.get("TAILI_MECHANISM_RELOAD", "0") == "1"
+    reload_if_changed = (
+        os.environ.get("RL_MECHANISM_RELOAD", "0").strip()
+    ) == "1"
     return load_mechanism_runtime(path, reload_if_changed=reload_if_changed)
 
 

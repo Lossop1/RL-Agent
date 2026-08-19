@@ -20,7 +20,7 @@
 
 文件：
 
-`autotuner/blind_locomotion/taili_amp_env.py`
+`products/taili/blind_locomotion/taili_amp_env.py`
 
 主要职责：
 
@@ -55,7 +55,7 @@
 
 文件：
 
-`autotuner/blind_locomotion/blind_tp_env.py`
+`products/taili/blind_locomotion/blind_tp_env.py`
 
 主要职责：
 

@@ -74,7 +74,7 @@ available for reproduction.
 | `autotuner/execution/` | system source | generic hashes, changesets, compatibility, staging |
 | `autotuner/product/` | system contract layer | product manifests and resolved contracts |
 | `config/products/` | product input | robot/task asset declarations, not executable runtime code |
-| `autotuner/blind_locomotion/` | product adapter | current Taili/IsaacLab adapter and payload recipe |
+| `products/taili/blind_locomotion/` | product adapter | current Taili/IsaacLab adapter and payload recipe |
 | `autotuner/training_payloads/` | generated-product boundary | reproducible payload build recipe and archives |
 | `output/`, `strategy_backups/`, `docs/archive/` | run/history artifacts | never imported as source |
 

@@ -16,7 +16,7 @@ from autotuner.research.research_supervisor import BackendHandle, BackendStatus,
 class PassingBackend:
     def start(self, plan, workspace, environment):
         assert environment["RL_RESEARCH_EXPERIMENT_REF"] == plan.id
-        bundle = Path(environment["TAILI_MECHANISM_BUNDLE"])
+        bundle = Path(environment["RL_MECHANISM_BUNDLE"])
         assert bundle.name == "mechanisms.json"
         assert bundle.parent.name == "candidate"
         return BackendHandle("passing", 0.0)

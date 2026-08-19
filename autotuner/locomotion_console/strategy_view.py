@@ -1,12 +1,16 @@
 """Structured, read-only view of the detailed TUNING STRATEGY (reward weights, curriculum phases +
-advancement gates, AMP hyperparameters) from taili_blind_config.yaml — so the operator can SEE the
-detailed settings in the panel (not just monitor telemetry) and the copilot can annotate them.
+advancement gates and model hyperparameters) from the active product's declared strategy config,
+so the operator can see the detailed settings in the panel and the copilot can annotate them.
 
 Pure + defensive: never raises into the request path; on any failure returns {available: False}.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _find_all(obj: Any, pred, path: str = "") -> dict[str, Any]:
@@ -24,10 +28,14 @@ def _find_all(obj: Any, pred, path: str = "") -> dict[str, Any]:
     return out
 
 
-def build_strategy_view() -> dict[str, Any]:
+def build_strategy_view(*, product_id: str | None = None, contract: Any = None) -> dict[str, Any]:
     try:
-        from autotuner.blind_locomotion.taili_blind_config import load_taili_blind_config
-        cfg = load_taili_blind_config()
+        from autotuner.product import load_product_plugin, resolve_product_contract
+
+        product = contract or resolve_product_contract(product_id)
+        config_path = _ROOT / str(product.training.get("config_path") or "")
+        load_config = load_product_plugin(product, "strategy", "load_config")
+        cfg = load_config(config_path)
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "reason": f"could not load strategy config: {exc}"}
 
@@ -57,6 +65,8 @@ def build_strategy_view() -> dict[str, Any]:
 
     return {
         "available": True,
+        "product_id": product.product_id,
+        "config_path": str(config_path),
         "profile": cfg.get("profile"),
         "reward": {
             "tracking": tracking,
@@ -73,6 +83,6 @@ def build_strategy_view() -> dict[str, Any]:
         "amp": amp,
         "counts": {"reward_weights": len(weights), "phases": len(phases),
                    "advancement_gates": len(phase_gates)},
-        "note": ("Read-only view of the editable strategy contract (taili_blind_config.yaml). Changes "
+        "note": ("Read-only view of the product-declared editable strategy contract. Changes "
                  "are applied via the edit_config action (rollback available), not here."),
     }

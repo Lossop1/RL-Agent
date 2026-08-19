@@ -4,15 +4,15 @@
 
 本文档描述当前本地准备部署的完整训练策略。它不参与运行，实际权威来源仍是：
 
-`autotuner/blind_locomotion/taili_blind_config.yaml`
+`products/taili/blind_locomotion/taili_blind_config.yaml`
 
 训练实现由以下文件共同完成：
 
-- `autotuner/blind_locomotion/blind_tp_env.py`：盲态观测、奖励输入、接触事件和遥测。
-- `autotuner/taili_core/taili_reward.py`：平地与地形共用奖励。
-- `autotuner/taili_core/terrain_curriculum.py`：楼梯事件、阶段势能和地形课程判定。
-- `autotuner/blind_locomotion/taili_amp_env.py`：phase、地形和 DR 推进。
-- `autotuner/training_payloads/taili_blind_runtime/payload_manifest.py`：部署文件边界。
+- `products/taili/blind_locomotion/blind_tp_env.py`：盲态观测、奖励输入、接触事件和遥测。
+- `products/taili/core/taili_reward.py`：平地与地形共用奖励。
+- `products/taili/core/terrain_curriculum.py`：楼梯事件、阶段势能和地形课程判定。
+- `products/taili/blind_locomotion/taili_amp_env.py`：phase、地形和 DR 推进。
+- `products/taili/payload/payload_manifest.py`：部署文件边界。
 
 ## 全局目标
 
@@ -188,15 +188,15 @@ Actor 的部署输入仍是 `body57 + history25x54`，但训练专用风险标�
 ## 本轮产物
 
 - 修改前快照：`strategy_backups/pre_global_flat_terrain_20260716_143900`
-- 本地 payload：`autotuner/training_payloads/taili_blind_runtime/dist/taili_blind_runtime_20260717_structural_stair_fix.tar.gz`
+- 本地 payload：`products/taili/payload/dist/taili_blind_runtime_20260717_structural_stair_fix.tar.gz`
 - payload SHA-256：`5af99c29033cf96bad461d3374bfd735024cb1d4f15cee50c0d0964bd529d888`
 - 本轮没有修改远程训练状态。
 
 验证命令：
 
 ```powershell
-python -m py_compile autotuner/taili_core/terrain_curriculum.py autotuner/taili_core/taili_reward.py autotuner/blind_locomotion/blind_tp_env.py autotuner/blind_locomotion/taili_amp_env_cfg.py autotuner/blind_locomotion/taili_blind_config.py
-python -m pytest tests/autotuner/taili_core tests/autotuner/blind_locomotion -q --basetemp=.pytest-tmp-global-terrain-all
-python -m autotuner.training_payloads.taili_blind_runtime.payload_manifest
-python -m autotuner.training_payloads.taili_blind_runtime.build_payload --out output --stamp global_rebalance_20260716
+python -m py_compile products/taili/core/terrain_curriculum.py products/taili/core/taili_reward.py products/taili/blind_locomotion/blind_tp_env.py products/taili/blind_locomotion/taili_amp_env_cfg.py products/taili/blind_locomotion/taili_blind_config.py
+python -m pytest tests/products/taili/core tests/products/taili/blind_locomotion -q --basetemp=.pytest-tmp-global-terrain-all
+python -m products.taili.payload.payload_manifest
+python -m products.taili.payload.build_payload --out output --stamp global_rebalance_20260716
 ```

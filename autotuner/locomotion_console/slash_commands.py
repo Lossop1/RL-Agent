@@ -28,7 +28,7 @@ HELP = """/status：读取实时 telemetry，总结 step/ETA/reward/课程状态
 /run diag <preset>：生成启动诊断的确认动作，不直接执行
 /probe checkpoints：通过白名单 diagnostics.catalog 探测 checkpoint
 /probe telemetry：只读检查远程 telemetry JSONL/log/emitter 是否真的部署
-/context [query]：读取 Taili spec/策略/YAML 白名单知识包摘要
+/context [query]：读取当前产品 spec/策略/YAML 白名单知识包摘要
 /ask <问题> 或 /llm <问题>：跳过快速命令层，强制走 LLM Agent
 / 开头不等于一定调用 LLM；/status、/log、/probe 等默认是快速只读命令，/diag explain 会调用 LLM 解读
 /help：显示命令列表"""
@@ -728,9 +728,21 @@ def _probe_telemetry(settings: LocomotionConsoleSettings, source: RunDataSource)
         )
         raw = remote.exec_out(inspect_cmd) or ""
         checks.extend(line.strip() for line in raw.splitlines() if line.strip())
+        from autotuner.product import resolve_product_runtime
+
+        try:
+            runtime = resolve_product_runtime(getattr(settings, "product_id", "") or None)
+            declared_modules = runtime.telemetry.get("module_candidates", ())
+            modules = [str(item) for item in declared_modules if str(item).strip()]
+            if not modules:
+                package = str(runtime.deployment.get("runtime_package") or "").strip()
+                modules = ([f"{package}.telemetry_emit"] if package else []) + ["telemetry_emit"]
+        except Exception:
+            modules = ["telemetry_emit"]
+        module_literal = json.dumps(modules, ensure_ascii=False)
         emitter_probe = (
             "python - <<'PY'\n"
-            "mods=['taili_blind_runtime.telemetry_emit','telemetry_emit','autotuner.blind_locomotion.telemetry_emit']\n"
+            f"mods={module_literal}\n"
             "ok=[]\n"
             "for m in mods:\n"
             "    try:\n"
@@ -801,10 +813,11 @@ def handle_slash_command(message: str, settings: LocomotionConsoleSettings, sour
         from . import knowledge
 
         query = " ".join(args)
-        pack = knowledge.build_taili_context_pack(query=query, include_docs=True)
+        product_id = getattr(getattr(src, "settings", None), "product_id", "") or None
+        pack = knowledge.build_context_pack(query=query, include_docs=True, product_id=product_id)
         return {
             "reply": _context_pack_reply(pack),
-            "transcript": [{"tool": "taili_context_pack", "args": {"query": query}, "result": pack}],
+            "transcript": [{"tool": "product_context_pack", "args": {"query": query}, "result": pack}],
             "steps": 1,
         }
 

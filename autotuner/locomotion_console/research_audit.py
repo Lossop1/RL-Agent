@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 from .code_knowledge import _ROOT as PROJECT_ROOT
+from autotuner.product import ResolvedProductContract, resolve_product_contract
 from autotuner.research.gate_calibration import extract_gate_definitions, gate_passes, quantiles
 from .knowledge_model.reward_deriver import derive_reward_terms
 from .knowledge_model.robot_sources import get_robot_sources
@@ -174,7 +175,7 @@ class CheckpointCapabilityRegistry(BaseModel):
 class ResearchAuditReport(BaseModel):
     schema_version: str = "rl-agent.research-audit/v1"
     generated_at: str
-    program_id: str = "taili_blind_locomotion"
+    program_id: str = ""
     root: str
     status: AuditStatus
     runtime_execution: RuntimeExecutionProof
@@ -360,26 +361,32 @@ def _same_number(left: Any, right: Any, *, tolerance: float = 1e-9) -> bool:
     return abs(lhs - rhs) <= tolerance * max(1.0, abs(lhs), abs(rhs))
 
 
-def _source_files(root: Path) -> list[str]:
-    sources = get_robot_sources()
-    return list(dict.fromkeys([
-        sources.reward_file,
-        sources.env_reward_file,
-        sources.curriculum_file,
-        "autotuner/blind_locomotion/taili_blind_config.yaml",
-        "autotuner/blind_locomotion/train_taili.py",
-        "autotuner/blind_locomotion/acceptance_score.py",
-        "autotuner/blind_locomotion/telemetry_emit.py",
-        "autotuner/blind_locomotion/telemetry_payloads.py",
-        "autotuner/blind_locomotion/runtime_manifest.py",
-    ]))
+def _contract(contract: ResolvedProductContract | None, product_id: str | None) -> ResolvedProductContract:
+    return contract or resolve_product_contract(product_id)
 
 
-def _duplicate_modules(root: Path) -> dict[str, list[str]]:
+def _knowledge(contract: ResolvedProductContract) -> dict[str, Any]:
+    value = contract.training.get("knowledge")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _source_files(contract: ResolvedProductContract) -> list[str]:
+    training_sources = contract.training.get("sources")
+    values = list(training_sources.values()) if isinstance(training_sources, dict) else []
+    values.append(str(contract.training.get("config_path") or ""))
+    knowledge = _knowledge(contract)
+    values.extend(
+        str(knowledge.get(key) or "")
+        for key in ("reward_file", "env_reward_file", "asset_file", "curriculum_file")
+    )
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _duplicate_modules(root: Path, source_files: Iterable[str]) -> dict[str, list[str]]:
     backup_root = root / "strategy_backups"
     if not backup_root.is_dir():
         return {}
-    names = ("taili_reward.py", "acceptance_score.py", "blind_tp_env.py", "taili_blind_config.yaml")
+    names = tuple(dict.fromkeys(Path(value).name for value in source_files if value))
     duplicates: dict[str, list[str]] = {}
     for name in names:
         paths = sorted(_rel(root, p) for p in backup_root.rglob(name) if p.is_file())
@@ -391,20 +398,23 @@ def _duplicate_modules(root: Path) -> dict[str, list[str]]:
 def build_runtime_execution_proof(
     root: Path = PROJECT_ROOT,
     manifest: dict[str, Any] | None = None,
+    *,
+    product_id: str | None = None,
+    contract: ResolvedProductContract | None = None,
 ) -> RuntimeExecutionProof:
     """Prove the local source path and surface shadowing risks without importing training code."""
-    files = [_digest(root, rel) for rel in _source_files(root)]
+    product = _contract(contract, product_id)
+    source_files = _source_files(product)
+    files = [_digest(root, rel) for rel in source_files]
     missing = [item.path for item in files if not item.exists]
     symbols: dict[str, bool] = {}
-    reward_path = root / "autotuner/taili_core/taili_reward.py"
-    env_path = root / "autotuner/blind_locomotion/blind_tp_env.py"
-    for label, path, names in (
-        ("reward.compute_reward_components", reward_path, ("compute_reward_components",)),
-        ("env.TailiBlindTPEnv", env_path, ("TailiBlindTPEnv",)),
-        ("env.TailiBlindTPEnv._get_rewards", env_path, ("_get_rewards",)),
-        ("env.TailiBlindTPEnv._reset_idx", env_path, ("_reset_idx",)),
-        ("env.TailiBlindTPEnv._resample_commands", env_path, ("_resample_commands",)),
-    ):
+    symbol_specs = _knowledge(product).get("runtime_symbols")
+    for label, spec in (symbol_specs.items() if isinstance(symbol_specs, dict) else ()):
+        if not isinstance(spec, dict):
+            symbols[str(label)] = False
+            continue
+        path = root / str(spec.get("source") or "")
+        names = tuple(str(item) for item in spec.get("names", ()) if str(item))
         found = False
         if path.is_file():
             try:
@@ -416,9 +426,9 @@ def build_runtime_execution_proof(
                 )
             except (OSError, SyntaxError, UnicodeError):
                 found = False
-        symbols[label] = found
+        symbols[str(label)] = found
 
-    duplicates = _duplicate_modules(root)
+    duplicates = _duplicate_modules(root, source_files)
     notes: list[str] = [
         "本证明只覆盖本地源码；远端 payload、sys.path 和实际部署 import 尚未核验。",
     ]
@@ -460,8 +470,13 @@ def build_runtime_execution_proof(
 def _reward_records(
     root: Path,
     manifest: dict[str, Any] | None = None,
+    *,
+    product_id: str | None = None,
+    contract: ResolvedProductContract | None = None,
 ) -> tuple[list[RewardAuditRecord], list[AuditFinding]]:
-    relative = "autotuner/taili_core/taili_reward.py"
+    product = _contract(contract, product_id)
+    knowledge = _knowledge(product)
+    relative = str(knowledge.get("reward_file") or "")
     path = root / relative
     findings: list[AuditFinding] = []
     if not path.is_file():
@@ -471,7 +486,14 @@ def _reward_records(
         )]
     try:
         text = path.read_text(encoding="utf-8")
-        derived = derive_reward_terms(text, relative)
+        derived = derive_reward_terms(
+            text,
+            relative,
+            func_name=str(knowledge.get("reward_func") or "compute_reward_components"),
+            cfg_class=str(knowledge.get("reward_cfg_class") or "RewardConfig"),
+            gate_const=str(knowledge.get("reward_gate_const") or "REWARD_GROUP_GATES"),
+            group_const=str(knowledge.get("reward_group_const") or "_REWARD_GROUP_OF"),
+        )
     except (OSError, UnicodeError, SyntaxError) as exc:
         return [], [AuditFinding(
             id="reward.parse_failed", severity="error", message=f"奖励 AST 推导失败: {type(exc).__name__}: {exc}",
@@ -531,20 +553,34 @@ def _reward_records(
     return records, findings
 
 
-def build_metric_alignment(root: Path = PROJECT_ROOT, manifest: dict[str, Any] | None = None) -> tuple[list[MetricAlignmentContract], list[AuditFinding]]:
+def build_metric_alignment(
+    root: Path = PROJECT_ROOT,
+    manifest: dict[str, Any] | None = None,
+    *,
+    product_id: str | None = None,
+    contract: ResolvedProductContract | None = None,
+) -> tuple[list[MetricAlignmentContract], list[AuditFinding]]:
     """Build conservative train/eval mappings; a manifest is required for ``proven``."""
     manifest_rows = {str(item.get("id")): item for item in (manifest or {}).get("metric_alignment", []) if isinstance(item, dict)}
-    reward_text = (root / "autotuner/taili_core/taili_reward.py").read_text(encoding="utf-8") if (root / "autotuner/taili_core/taili_reward.py").is_file() else ""
-    score_text = (root / "autotuner/blind_locomotion/acceptance_score.py").read_text(encoding="utf-8") if (root / "autotuner/blind_locomotion/acceptance_score.py").is_file() else ""
+    product = _contract(contract, product_id)
+    knowledge = _knowledge(product)
+    training_sources = product.training.get("sources")
+    sources = dict(training_sources) if isinstance(training_sources, dict) else {}
+    reward_relative = str(knowledge.get("reward_file") or sources.get("reward") or "")
+    score_relative = str(sources.get("acceptance_score") or "")
+    reward_path = root / reward_relative
+    score_path = root / score_relative
+    reward_text = reward_path.read_text(encoding="utf-8") if reward_path.is_file() else ""
+    score_text = score_path.read_text(encoding="utf-8") if score_path.is_file() else ""
     out: list[MetricAlignmentContract] = []
     findings: list[AuditFinding] = []
     for spec in _DEFAULT_ALIGNMENT_SPECS:
         row = manifest_rows.get(spec["id"], {})
         train_ok = all(signal in reward_text for signal in spec["train_signals"][:1])
         eval_ok = all(signal in score_text for signal in spec["eval_signals"])
-        evidence = ["autotuner/taili_core/taili_reward.py"] if train_ok else []
+        evidence = [reward_relative] if train_ok else []
         if eval_ok:
-            evidence.append("autotuner/blind_locomotion/acceptance_score.py")
+            evidence.append(score_relative)
         gaps: list[str] = []
         if not train_ok:
             gaps.append("训练信号未在当前奖励源中确认。")
@@ -1077,12 +1113,15 @@ def build_research_audit(
     *,
     manifest_path: Path | None = None,
     checkpoint_root: Path | None = None,
+    product_id: str | None = None,
+    contract: ResolvedProductContract | None = None,
 ) -> ResearchAuditReport:
     root = root.resolve()
+    product = _contract(contract, product_id)
     manifest = _load_manifest(root, manifest_path)
-    runtime = build_runtime_execution_proof(root, manifest)
-    rewards, reward_findings = _reward_records(root, manifest)
-    alignment, alignment_findings = build_metric_alignment(root, manifest)
+    runtime = build_runtime_execution_proof(root, manifest, contract=product)
+    rewards, reward_findings = _reward_records(root, manifest, contract=product)
+    alignment, alignment_findings = build_metric_alignment(root, manifest, contract=product)
     gates, gate_findings = build_gate_calibration(root, manifest)
     coverage, coverage_findings = build_command_coverage(manifest)
     optimization, optimization_findings = build_optimization_state(manifest)
@@ -1117,6 +1156,7 @@ def build_research_audit(
     }
     return ResearchAuditReport(
         generated_at=_utc_now(),
+        program_id=str(product.training.get("task_id") or product.product_id),
         root=str(root),
         status=status,
         runtime_execution=runtime,

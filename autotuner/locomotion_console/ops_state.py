@@ -1,132 +1,261 @@
-"""System SELF-AWARENESS for the LLM brain: what the system itself is doing right now, plus a
-codified stall classifier so "卡住了吗" gets the OPERATOR's answer (the known GPU-kernel-stall
-pattern, auto-recovery expectations), not an outsider's guess from raw telemetry.
+"""向研究代理提供产品无关的系统自我状态。
 
-Read-only; best-effort; never raises into the request path.
+这里仅做只读状态汇总。运行目录、训练进程、阶段环境变量和自动化入口都由产品
+合同声明；缺少声明时返回不确定状态，绝不根据机器人目录名猜测。
 """
 from __future__ import annotations
 
 import glob
+import os
 import re
-import shlex as _shlex
-from typing import Any
+import shlex
+from typing import Any, Mapping
 
-# local automation entrypoints worth reporting (the "who is driving the box" inventory)
-_AUTOMATION_MARKERS = {
-    "-m autotuner.taili_ops.tune_orchestrator": "campaign/produce（Taili 旧式调参管线）",
-    "auto_drive.py": "auto_drive（自愈驾驶：停滞检测+自动重启）",
-    "-m autotuner.taili_ops.acceptance_run": "acceptance_run（Taili 验收测评）",
-}
+from autotuner.product import resolve_product_runtime
 
 
-def _local_automations() -> list[dict[str, str]]:
-    found = []
-    for p in glob.glob("/proc/[0-9]*/cmdline"):
+_SAFE_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _runtime_declaration(view: Any) -> Mapping[str, Any]:
+    """读取产品声明的运行字段，不改变 RuntimeIdentity 的外部结构。"""
+    runtime = _mapping(getattr(view, "runtime", {}))
+    return _mapping(runtime.get("declaration"))
+
+
+def _local_automations(src: Any) -> list[dict[str, str]]:
+    """读取合同声明的本地自动化标记，不维护系统级产品名单。"""
+    settings = getattr(src, "settings", None)
+    try:
+        runtime = resolve_product_runtime(getattr(settings, "product_id", "") or None)
+        markers = _runtime_declaration(runtime).get("automation_markers", {})
+    except Exception:
+        markers = {}
+    if not isinstance(markers, Mapping):
+        return []
+
+    found: list[dict[str, str]] = []
+    for path in glob.glob("/proc/[0-9]*/cmdline"):
         try:
-            cmd = open(p, "rb").read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            command = open(path, "rb").read().replace(b"\x00", b" ").decode("utf-8", "ignore")
         except Exception:  # noqa: BLE001
             continue
-        for marker, label in _AUTOMATION_MARKERS.items():
-            if marker in cmd:
-                found.append({"pid": p.split("/")[2], "what": label, "cmd": cmd.strip()[:160]})
+        for marker, label in markers.items():
+            if str(marker) in command:
+                found.append({
+                    "pid": path.split("/")[2],
+                    "what": str(label),
+                    "cmd": command.strip()[:160],
+                })
                 break
     return found
 
 
+def _declarations(src: Any) -> dict[str, Any]:
+    settings = getattr(src, "settings", None)
+    product_id = getattr(settings, "product_id", "") or None
+    try:
+        view = resolve_product_runtime(product_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    deployment = dict(view.deployment)
+    launch = _mapping(deployment.get("training_launch"))
+    state_environment = _mapping(launch.get("resume_state_environment"))
+    declared_environment = _mapping(launch.get("environment"))
+    environment_names = {str(key).strip() for key in declared_environment}
+    environment_names.update(str(value).strip() for value in state_environment.values() if str(value).strip())
+    environment_names.update({"PYTHONPATH"})
+    invalid_names = sorted(name for name in environment_names if not _SAFE_ENVIRONMENT_NAME.fullmatch(name))
+    if invalid_names:
+        return {"error": "invalid environment names in product contract: " + ", ".join(invalid_names)}
+
+    raw_prefixes = launch.get("environment_prefixes", ())
+    if raw_prefixes is None:
+        raw_prefixes = ()
+    if not isinstance(raw_prefixes, (list, tuple)):
+        return {"error": "deployment.training_launch.environment_prefixes must be a list"}
+    prefixes = tuple(sorted({str(item).strip() for item in raw_prefixes if str(item).strip()}))
+    invalid_prefixes = sorted(
+        prefix
+        for prefix in prefixes
+        if not _SAFE_ENVIRONMENT_NAME.fullmatch(prefix) or not prefix.endswith("_")
+    )
+    if invalid_prefixes:
+        return {
+            "error": "environment prefixes must be safe names ending in '_': "
+            + ", ".join(invalid_prefixes)
+        }
+
+    process_pattern = ""
+    resolver = getattr(src, "_training_process_pattern", None)
+    if callable(resolver):
+        try:
+            process_pattern = str(resolver() or "").strip()
+        except Exception:  # noqa: BLE001
+            process_pattern = ""
+    if not process_pattern:
+        process_pattern = str(_runtime_declaration(view).get("training_process_pattern") or "").strip()
+
+    run_root = str(deployment.get("runs_root") or "").strip().rstrip("/")
+    run_glob = f"{run_root}/*/" if run_root.startswith("/") else ""
+    if not run_glob:
+        # 部署未给出单一运行根目录时，使用当前框架档案声明的首个监控 glob。
+        try:
+            profiles = view.framework_profiles()
+            profile = _mapping(profiles.get(view.default_framework_id()))
+            run_globs = profile.get("run_globs", ())
+            if isinstance(run_globs, (list, tuple)):
+                run_glob = next((str(item).strip() for item in run_globs if str(item).strip()), "")
+        except Exception:  # noqa: BLE001
+            run_glob = ""
+    log_files = deployment.get("monitor_log_files", ("train.log", "console.log"))
+    if not isinstance(log_files, (list, tuple)):
+        log_files = ("train.log", "console.log")
+    safe_log_files = tuple(
+        str(item).strip().lstrip("/")
+        for item in log_files
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", str(item).strip().lstrip("/"))
+    )
+    return {
+        "product_id": view.product_id,
+        "run_glob": run_glob,
+        "process_pattern": process_pattern,
+        "log_files": safe_log_files,
+        "environment_names": tuple(sorted(environment_names)),
+        "environment_prefixes": prefixes,
+        "phase_environment": str(state_environment.get("phase") or "").strip(),
+    }
+
+
+def _build_remote_probe_script(declarations: Mapping[str, Any]) -> str:
+    """根据产品声明构造一次性只读 shell 探针。"""
+    run_glob = str(declarations.get("run_glob") or "")
+    process_pattern = str(declarations.get("process_pattern") or "")
+    if not run_glob or not process_pattern:
+        return "printf '__ERROR__product runtime declarations are incomplete\\n'"
+
+    log_files = tuple(str(item) for item in declarations.get("log_files", ()))
+    log_candidates = " ".join(f'"$run/{item}"' for item in log_files)
+    environment_names = tuple(str(item) for item in declarations.get("environment_names", ()))
+    prefixes = tuple(str(item) for item in declarations.get("environment_prefixes", ()))
+    # 精确名称避免漏掉离散配置；显式前缀用于产品自行声明的一族动态开关。
+    env_alternatives = [re.escape(item) for item in environment_names]
+    env_alternatives.extend(re.escape(item) + "[A-Za-z0-9_]*" for item in prefixes)
+    env_pattern = "^(" + "|".join(env_alternatives) + ")=" if env_alternatives else "^$"
+    phase_name = str(declarations.get("phase_environment") or "")
+    phase_tag = shlex.quote(phase_name) if phase_name else "''"
+    return (
+        "run=$(ls -1td " + run_glob + " 2>/dev/null | head -1 | sed 's:/*$::'); "
+        "printf '__RUN__%s\\n' \"$run\"; "
+        "pid=$(pgrep -f " + shlex.quote(process_pattern) + " | head -1); "
+        "printf '__PID__%s\\n' \"$pid\"; "
+        "if [ -n \"$run\" ]; then "
+        "  log=''; "
+        "  for candidate in " + log_candidates + "; do "
+        "    if [ -s \"$candidate\" ]; then log=\"$candidate\"; break; fi; "
+        "  done; "
+        "  printf '__STEP__%s\\n' \"$(grep -oE 'step=[0-9]+' \"$log\" 2>/dev/null | tail -1)\"; "
+        "  printf '__AGE__%s\\n' \"$(( $(date +%s) - $(stat -c %Y \"$log\" 2>/dev/null || echo 0) ))\"; "
+        "  printf '__TPCURR__%s\\n' \"$(grep 'TPCURR' \"$log\" 2>/dev/null | tail -1)\"; "
+        "fi; "
+        "printf '__GPU__%s\\n' \"$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader 2>/dev/null | head -1)\"; "
+        "if [ -n \"$pid\" ]; then "
+        "  printf '__ENV__%s\\n' \"$(tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -E '" + env_pattern + "' | tr '\\n' ';')\"; "
+        "  printf '__CMD__%s\\n' \"$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\"; "
+        "fi; "
+        "printf '__PHASE_ENV__%s\\n' " + phase_tag
+    )
+
+
 def build_operations_state(src: Any) -> dict[str, Any]:
-    out: dict[str, Any] = {"automations_running": _local_automations()}
+    """汇总本地自动化和远程训练状态；所有失败均降级为可解释的只读结果。"""
+    out: dict[str, Any] = {
+        "automations_running": _local_automations(src),
+        "product_id": getattr(getattr(src, "settings", None), "product_id", "") or "",
+    }
+    declarations = _declarations(src)
+    if declarations.get("error"):
+        out["diagnosis"] = f"UNKNOWN：产品运行合同不可用：{declarations['error']}"
+        out["instruction"] = "先修复或选择有效的产品合同，再解释训练状态。"
+        return out
+    out["product_id"] = declarations.get("product_id", out["product_id"])
+
     try:
         remote = src._get_remote()
-        # 监控热路径一次读取运行目录、步数、日志年龄、进程、GPU 和环境变量，再按标签解析；
-        # 缺少某一段时保留为空，监控仍可降级工作。
-        _script = (
-            "run=$(ls -1td /root/gpufree-data/taili_runs/*/ 2>/dev/null | head -1 | sed 's:/*$::'); "
-            "printf '__RUN__%s\\n' \"$run\"; "
-            "printf '__STEP__%s\\n' \"$(grep -oE 'step=[0-9]+' \"$run/train.log\" 2>/dev/null | tail -1)\"; "
-            "printf '__AGE__%s\\n' \"$(( $(date +%s) - $(stat -c %Y \"$run/train.log\" 2>/dev/null || echo 0) ))\"; "
-            "pid=$(pgrep -f 'taili_blind_runtime.train_taili' | grep -v pgrep | head -1); "
-            "printf '__PID__%s\\n' \"$pid\"; "
-            "printf '__GPU__%s\\n' \"$(nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader | head -1)\"; "
-            "if [ -n \"$pid\" ]; then "
-            "  printf '__ENV__%s\\n' \"$(tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -E '^(PYTHONPATH|TAILI_)' | tr '\\n' ';')\"; "
-            "  printf '__CMD__%s\\n' \"$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null)\"; "
-            "fi; "
-            "printf '__TPCURR__%s\\n' \"$(grep 'TPCURR' \"$run/train.log\" 2>/dev/null | tail -1)\""
-        )
-        blob = remote.exec_out("bash -lc " + _shlex.quote(_script)) or ""
-        _sec: dict[str, str] = {}
+        script = _build_remote_probe_script(declarations)
+        blob = remote.exec_out("bash -lc " + shlex.quote(script)) or ""
+        sections: dict[str, str] = {}
         for line in blob.splitlines():
-            for tag in ("__RUN__", "__STEP__", "__AGE__", "__PID__", "__GPU__", "__ENV__", "__CMD__", "__TPCURR__"):
+            for tag in (
+                "__RUN__", "__STEP__", "__AGE__", "__PID__", "__GPU__",
+                "__ENV__", "__CMD__", "__TPCURR__", "__PHASE_ENV__", "__ERROR__",
+            ):
                 if line.startswith(tag):
-                    _sec[tag] = line[len(tag):]
+                    sections[tag] = line[len(tag):]
                     break
-        run_dir = (_sec.get("__RUN__", "") or "").strip().rstrip("/")
-        out["latest_run"] = run_dir.split("/")[-1] if run_dir else ""
-        m = re.search(r"(\d+)", _sec.get("__STEP__", "") or "")
-        step = int(m.group(1)) if m else None
+        if sections.get("__ERROR__"):
+            out["diagnosis"] = f"UNKNOWN：{sections['__ERROR__'].strip()}"
+            return out
+
+        run_dir = (sections.get("__RUN__", "") or "").strip().rstrip("/")
+        out["latest_run"] = run_dir.rsplit("/", 1)[-1] if run_dir else ""
+        step_match = re.search(r"(\d+)", sections.get("__STEP__", "") or "")
+        step = int(step_match.group(1)) if step_match else None
         out["last_step"] = step
         try:
-            out["step_age_s"] = int((_sec.get("__AGE__", "") or "").strip())
-        except Exception:  # noqa: BLE001
+            out["step_age_s"] = int((sections.get("__AGE__", "") or "").strip())
+        except ValueError:
             out["step_age_s"] = None
-        pid = (_sec.get("__PID__", "") or "").strip()
+        pid = (sections.get("__PID__", "") or "").strip()
         out["training_process_alive"] = bool(pid)
-        gpu = (_sec.get("__GPU__", "") or "").strip()
-        out["gpu"] = gpu
-        # 给研究系统提供实际 phase、resume 和 payload 信息，避免仅凭总步数推断训练状态。
-        tp: dict[str, Any] = {}
+        out["gpu"] = (sections.get("__GPU__", "") or "").strip()
+
+        progress: dict[str, Any] = {
+            "is_resume": False,
+            "resumed_from_checkpoint": None,
+            "phase_environment": (sections.get("__PHASE_ENV__", "") or "").strip() or None,
+        }
         if pid:
-            cmdline = _sec.get("__CMD__", "") or ""
-            ck = re.search(r"--checkpoint\s+(\S+)", cmdline)
-            tp["resumed_from_checkpoint"] = ck.group(1).split("/")[-3] + "/" + ck.group(1).split("/")[-1] if ck else None
-            tp["is_resume"] = bool(ck)
-            # 训练架构由 TAILI_* 环境变量覆盖；把实际生效的变量一并呈现，避免只看 payload 名称。
-            arch_flags = {}
-            for line in (_sec.get("__ENV__", "") or "").split(";"):
-                if line.startswith("PYTHONPATH="):
-                    tp["loaded_payload"] = line.split("=", 1)[1].split(":")[0].split("/")[-1]
-                elif line.startswith("TAILI_INIT_PHASE="):
-                    tp["init_phase_env"] = line.split("=", 1)[1].strip()
-                elif line.startswith("TAILI_") and "=" in line:
-                    _k, _v = line.split("=", 1)
-                    if _k not in ("TAILI_INIT_PHASE",):
-                        arch_flags[_k] = _v.strip()
-            if arch_flags:
-                tp["arch_flags"] = arch_flags
+            command = sections.get("__CMD__", "") or ""
+            checkpoint = re.search(r"--checkpoint\s+(\S+)", command)
+            progress["resumed_from_checkpoint"] = checkpoint.group(1) if checkpoint else None
+            progress["is_resume"] = bool(checkpoint)
+            flags: dict[str, str] = {}
+            for item in (sections.get("__ENV__", "") or "").split(";"):
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    if key and key != "PYTHONPATH":
+                        flags[key] = value.strip()
+            if flags:
+                progress["environment_overrides"] = flags
         if run_dir:
-            curr = _sec.get("__TPCURR__", "") or ""
-            ph = re.search(r"phase=(phi\d)", curr)
-            blk = re.search(r"blocked_by=(\w+)", curr)
-            tp["current_phase"] = ph.group(1) if ph else None
-            tp["blocked_by"] = blk.group(1) if blk else None
-        tp["regime"] = (
-            "1.5M --total-steps 是启动上限,不是目标。每一轮训练都是从一个已会走的 checkpoint 续训,"
-            "在 ~18k 续训步停下做全覆盖复测(练更久会过训退化 B4/A2——已成文规律)。所以'才几百/几千步、"
-            "离 1.5M 还远'是错误心智模型;看的是'离 18k 续训步还有多少'。刚改过奖励/curriculum 或从 phi0 "
-            "重启后,前几千步 progress/slip 等指标会先降后升(重新预热),不要据此判定结构瓶颈。")
-        out["training_progress"] = tp
-        # ── the codified stall classifier (ops runbook pattern #1) ──────────────────────────────
+            current = sections.get("__TPCURR__", "") or ""
+            phase = re.search(r"phase=([A-Za-z0-9_.-]+)", current)
+            blocked = re.search(r"blocked_by=([A-Za-z0-9_.-]+)", current)
+            progress["current_phase"] = phase.group(1) if phase else None
+            progress["blocked_by"] = blocked.group(1) if blocked else None
+        out["training_progress"] = progress
+
         age = out.get("step_age_s")
-        alive = out["training_process_alive"]
+        alive = bool(out["training_process_alive"])
         if not alive:
-            out["diagnosis"] = "STOPPED：训练进程不存在（正常停止、OOM 或已被自动化重启中——看 automations_running）"
+            out["diagnosis"] = "STOPPED：未发现合同声明的训练进程。"
         elif age is not None and age < 90:
-            out["diagnosis"] = f"HEALTHY：训练正常步进（step={step}，{age}s 前仍在写日志）"
+            out["diagnosis"] = f"HEALTHY：训练正在写入日志（step={step}，{age}s 前更新）。"
         elif age is not None and age >= 180:
-            out["diagnosis"] = (
-                f"KNOWN_GPU_STALL：已知 GPU 内核挂起模式——步数冻结在 {step}（{age}s 未写日志）、进程仍存活、"
-                f"GPU={gpu}。这是租用盒子的透明故障（本项目已发生 10+ 次），与代码无关。"
-                f"{'auto_drive 在运行,预计 ~10 分钟内自动杀掉并从最新 checkpoint 重启' if any('auto_drive' in a['what'] for a in out['automations_running']) else '当前无自愈驾驶在运行——需要手动杀掉进程并从最新 checkpoint 重启'}。"
-                "不要猜测日志线程死锁/磁盘IO——从未发生过（见 taili_ops_runbook.md）。")
+            out["diagnosis"] = f"STALE：进程仍存在，但日志已 {age}s 未更新；需要交叉检查 GPU 和进程状态。"
         else:
-            out["diagnosis"] = f"UNCERTAIN：{age}s 未更新，再观察一个周期（<180s 不足以判停滞）"
-    except Exception as e:  # noqa: BLE001
-        out["remote_error"] = f"{type(e).__name__}: {e}"
-        out["diagnosis"] = "UNKNOWN：训练机暂不可达（可能 SSH 瞬断，运营手册模式#3——重试即可）"
+            out["diagnosis"] = f"UNCERTAIN：日志已 {age}s 未更新，继续观察后再判断。"
+    except Exception as exc:  # noqa: BLE001
+        out["remote_error"] = f"{type(exc).__name__}: {exc}"
+        out["diagnosis"] = f"UNKNOWN：远程状态暂不可达：{type(exc).__name__}: {exc}"
     out["instruction"] = (
-        "这是系统的自我状态：automations_running 告诉你系统自己正在做什么（run 换名+从 checkpoint 续起="
-        "自愈重启，不是异常）；diagnosis 是运营手册模式匹配的结论，直接引用它回答'卡住了吗'类问题，"
-        "不要脱离它自行猜测新故障机制。training_progress 给你训练进度的事实（是否续训、来源 checkpoint、"
-        "当前 phase、加载的代码 payload、目标区间 regime）——回答'训练怎么样/还要多久/进展如何'时必须先读它，"
-        "尤其 regime：不要把 1.5M 当目标、不要建议'再跑几万步'(会过训)、不要把续训当从零开始。")
+        "这是系统自我状态的只读摘要。先依据 training_progress、diagnosis 和实际证据判断，"
+        "不要把缺失字段当成产品事实，也不要从旧产品名称推断运行状态。"
+    )
     return out

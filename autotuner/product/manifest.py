@@ -17,6 +17,7 @@ import yaml
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _RELATIVE_PATH_RE = re.compile(r"^[^\\/].*$")
+_ENTRYPOINT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ProductManifestError(ValueError):
@@ -100,6 +101,8 @@ class ProductManifest:
     source_roots: tuple[str, ...] = ()
     sources: Mapping[str, str] = field(default_factory=dict)
     assets: tuple[AssetSpec, ...] = ()
+    # 资产复用策略是产品声明，不由执行层根据目录名称猜测。
+    asset_reuse: Mapping[str, Any] = field(default_factory=dict)
     payload_builder: str = ""
     payload_package: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -107,12 +110,21 @@ class ProductManifest:
     # kept separately because an IsaacLab/Gym process may expose aliases.
     runtime_task_ids: tuple[str, ...] = ()
     task_requirements: Mapping[str, Any] = field(default_factory=dict)
+    # LLM 任务接收只能使用产品明确声明的词表，不能从系统代码猜测。
+    task_vocabulary: Mapping[str, Any] = field(default_factory=dict)
     telemetry: Mapping[str, Any] = field(default_factory=dict)
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    # 仿真世界与 sim2sim 约束属于产品输入，而不是执行层的隐式默认值。
+    simulation: Mapping[str, Any] = field(default_factory=dict)
     deployment: Mapping[str, Any] = field(default_factory=dict)
     runtime: Mapping[str, Any] = field(default_factory=dict)
     compatibility: Mapping[str, Any] = field(default_factory=dict)
+    framework: Mapping[str, Any] = field(default_factory=dict)
     knowledge: Mapping[str, Any] = field(default_factory=dict)
+    # 适配策略由产品声明；系统适配器只执行其中的通用算法和插件入口。
+    adaptation: Mapping[str, Any] = field(default_factory=dict)
+    # 产品专用能力通过角色化入口接入；系统层只依赖角色，不依赖产品包名。
+    plugins: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ProductManifest":
@@ -170,15 +182,27 @@ class ProductManifest:
             source_roots=_tuple_strings(sources.get("roots"), "sources.roots"),
             sources={str(key): _string(value, f"sources.{key}") for key, value in sources.items() if key != "roots"},
             task_requirements=dict(_mapping(task.get("requirements"), "task.requirements")),
+            task_vocabulary=dict(_mapping(task.get("intake"), "task.intake")),
             assets=assets,
+            asset_reuse=dict(_mapping(data.get("asset_reuse"), "asset_reuse")),
             payload_builder=_string(build.get("payload_builder", ""), "build.payload_builder", required=False),
             payload_package=_string(build.get("payload_package", ""), "build.payload_package", required=False),
             telemetry=dict(_mapping(data.get("telemetry"), "telemetry")),
             diagnostics=dict(_mapping(data.get("diagnostics"), "diagnostics")),
+            simulation=dict(_mapping(data.get("simulation"), "simulation")),
             deployment=dict(_mapping(data.get("deployment"), "deployment")),
             runtime=dict(runtime),
             compatibility=dict(_mapping(data.get("compatibility"), "compatibility")),
+            framework=dict(_mapping(data.get("framework"), "framework")),
             knowledge=dict(_mapping(data.get("knowledge"), "knowledge")),
+            adaptation=dict(_mapping(data.get("adaptation"), "adaptation")),
+            plugins={
+                str(role): {
+                    str(operation): _string(reference, f"plugins.{role}.{operation}")
+                    for operation, reference in _mapping(value, f"plugins.{role}").items()
+                }
+                for role, value in _mapping(data.get("plugins"), "plugins").items()
+            },
             metadata=dict(_mapping(data.get("metadata"), "metadata")),
         )
         return manifest
@@ -211,6 +235,117 @@ class ProductManifest:
             issues.append("task.train_entrypoint must use module:callable form")
         if not self.diagnose_entrypoint or ":" not in self.diagnose_entrypoint:
             issues.append("task.diagnose_entrypoint must use module:callable form")
+
+        # 这些字段会直接驱动后续的解析、诊断和运行期探针，不能等到执行时
+        # 才因类型错误失败；这里只校验结构，不替产品决定具体语义。
+        if not isinstance(self.task_vocabulary, Mapping):
+            issues.append("task.intake must be a mapping")
+        else:
+            for name, values in self.task_vocabulary.items():
+                if not _ID_RE.fullmatch(str(name)):
+                    issues.append(f"task.intake has unsafe field: {name!r}")
+                if not isinstance(values, (list, tuple)) or not values or any(not str(item).strip() for item in values):
+                    issues.append(f"task.intake.{name} must be a non-empty list of strings")
+
+        profiles = self.framework.get("profiles")
+        if profiles is not None and not isinstance(profiles, Mapping):
+            issues.append("framework.profiles must be a mapping")
+        elif isinstance(profiles, Mapping):
+            default_profile = str(self.framework.get("default_profile") or "").strip()
+            if default_profile and default_profile not in profiles:
+                issues.append(f"framework.default_profile is not declared: {default_profile!r}")
+            for identifier, declaration in profiles.items():
+                name = str(identifier)
+                if not _ID_RE.fullmatch(name):
+                    issues.append(f"framework profile has unsafe id: {name!r}")
+                    continue
+                if not isinstance(declaration, Mapping):
+                    issues.append(f"framework.profiles.{name} must be a mapping")
+                    continue
+                for field_name in ("run_globs", "checkpoint_roots"):
+                    value = declaration.get(field_name)
+                    if value is not None and (not isinstance(value, (list, tuple)) or any(not str(item).strip() for item in value)):
+                        issues.append(f"framework.profiles.{name}.{field_name} must be a list of strings")
+                commands = declaration.get("commands")
+                if commands is not None and not isinstance(commands, Mapping):
+                    issues.append(f"framework.profiles.{name}.commands must be a mapping")
+
+        payload = self.diagnostics.get("payload")
+        if payload is not None and not isinstance(payload, Mapping):
+            issues.append("diagnostics.payload must be a mapping")
+        elif isinstance(payload, Mapping):
+            for field_name in ("payload_roots", "payload_globs", "required_files"):
+                value = payload.get(field_name)
+                if value is not None and (not isinstance(value, (list, tuple)) or any(not str(item).strip() for item in value)):
+                    issues.append(f"diagnostics.payload.{field_name} must be a list of strings")
+        presets = self.diagnostics.get("presets")
+        if presets is not None:
+            if not isinstance(presets, (list, tuple)):
+                issues.append("diagnostics.presets must be a list")
+            else:
+                preset_ids: list[str] = []
+                for index, preset in enumerate(presets):
+                    if not isinstance(preset, Mapping):
+                        issues.append(f"diagnostics.presets[{index}] must be a mapping")
+                        continue
+                    preset_id = str(preset.get("id") or "").strip()
+                    if not _ID_RE.fullmatch(preset_id):
+                        issues.append(f"diagnostics.presets[{index}].id is unsafe or missing")
+                    preset_ids.append(preset_id)
+                    stages = preset.get("stages")
+                    if stages is not None and (not isinstance(stages, (list, tuple)) or not stages):
+                        issues.append(f"diagnostics.presets[{index}].stages must be a non-empty list")
+                if len(set(preset_ids)) != len(preset_ids):
+                    issues.append("diagnostics.presets contains duplicate ids")
+
+        artifact_names = self.deployment.get("configuration_artifacts")
+        if artifact_names is not None:
+            if not isinstance(artifact_names, Mapping):
+                issues.append("deployment.configuration_artifacts must be a mapping")
+            else:
+                for key, value in artifact_names.items():
+                    if not _ID_RE.fullmatch(str(key)) or not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+                        issues.append(f"deployment.configuration_artifacts.{key} must be a safe file name")
+        for role, operations in self.plugins.items():
+            if not _ID_RE.fullmatch(role) or not isinstance(operations, Mapping):
+                issues.append(f"plugins.{role} must be a mapping")
+                continue
+            for operation, reference in operations.items():
+                if not _ID_RE.fullmatch(operation):
+                    issues.append(f"plugins.{role} has unsafe operation id: {operation!r}")
+                if not _ENTRYPOINT_RE.fullmatch(str(reference)):
+                    issues.append(
+                        f"plugins.{role}.{operation} must use module:callable form: {reference!r}"
+                    )
+        compositions = self.framework.get("compositions")
+        if compositions is not None and not isinstance(compositions, Mapping):
+            issues.append("framework.compositions must be a mapping")
+        elif isinstance(compositions, Mapping):
+            for identifier, declaration in compositions.items():
+                name = str(identifier)
+                if not _ID_RE.fullmatch(name):
+                    issues.append(f"framework composition has unsafe id: {name!r}")
+                    continue
+                if not isinstance(declaration, Mapping):
+                    issues.append(f"framework.compositions.{name} must be a mapping")
+                    continue
+                component_ids = declaration.get("component_ids")
+                if not isinstance(component_ids, (list, tuple)) or not component_ids:
+                    issues.append(
+                        f"framework.compositions.{name}.component_ids must be a non-empty list"
+                    )
+                    continue
+                normalized_ids = [str(item).strip() for item in component_ids]
+                if any(not item for item in normalized_ids):
+                    issues.append(
+                        f"framework.compositions.{name}.component_ids contains an empty id"
+                    )
+                if len(set(normalized_ids)) != len(normalized_ids):
+                    issues.append(
+                        f"framework.compositions.{name}.component_ids contains duplicates"
+                    )
+        if not isinstance(self.adaptation, Mapping):
+            issues.append("adaptation must be a mapping")
         paths = [self.config_path, *self.source_roots, *self.sources.values(), *(asset.path for asset in self.assets)]
         for value in paths:
             path = Path(value)

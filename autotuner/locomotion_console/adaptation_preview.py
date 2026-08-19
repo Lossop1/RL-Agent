@@ -43,25 +43,26 @@ class AdaptationPreviewInfo(BaseModel):
 
 
 def available_robots() -> List[str]:
-    from autotuner.adapter.__main__ import PRESETS
-    return list(PRESETS)
+    from autotuner.adapter.__main__ import available_products
+
+    return available_products()
 
 
-def build_adaptation_preview(robot: str = "taili") -> AdaptationPreviewInfo:
+def build_adaptation_preview(robot: str = "") -> AdaptationPreviewInfo:
     try:
-        from autotuner.adapter.__main__ import build_config_set
+        from autotuner.adapter.pipeline import build_config_set
         from autotuner.adapter.pipeline import (
             plan_adaptation, consistency_report, deploy_readiness,
         )
-        cs = build_config_set(robot)
-        wd = tempfile.mkdtemp(prefix=f"preview_{robot}_")
+        cs = build_config_set(robot or None)
+        wd = tempfile.mkdtemp(prefix=f"preview_{cs.product_id}_")
         bundle = plan_adaptation(cs, wd, stamp="preview")
         rep = consistency_report(bundle)
         rd = deploy_readiness(bundle)
         a = bundle.adapted["actuator"]
         prov = bundle.adapted["provenance"]
         return AdaptationPreviewInfo(
-            robot=robot, available=True,
+            robot=cs.product_id, available=True,
             composition_id=bundle.composition_id, composition_valid=bundle.composition_valid,
             effort={k: float(v) for k, v in a["effort"].items()},
             kp={k: float(v) for k, v in a["Kp"].items()},

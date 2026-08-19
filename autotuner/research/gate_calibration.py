@@ -38,7 +38,7 @@ class GateDefinition:
 
 # ``metric_field`` names are keys in the runtime telemetry ``curriculum``
 # payload.  These mappings mirror the comparisons in
-# TailiBlindAMPEnv._log_training_diag; no threshold number is copied here.
+# 产品环境负责产出门控遥测；本层不复制任何任务阈值。
 _PHASE_METRICS: dict[str, tuple[str, str]] = {
     "prog": ("phase_gate_progress_value", "gte"),
     "slip": ("phase_gate_slip_value", "lte"),

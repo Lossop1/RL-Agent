@@ -230,7 +230,7 @@ def test_effective_gate_calibration_is_recomputed_from_raw_trace():
             }
         }
         config_paths = {
-            "source_config": root / "taili_blind_config.yaml",
+            "source_config": root / "source_config.yaml",
             "effective_config": root / "effective_config.yaml",
             "agent_config": root / "agent.skrl.yaml",
         }

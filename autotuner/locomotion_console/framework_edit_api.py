@@ -34,13 +34,13 @@ def editable_knobs() -> EditableKnobsInfo:
     return EditableKnobsInfo(knobs=list_editable())
 
 
-def build_edit_validation(field: str, value: float, robot: str = "taili") -> EditValidationInfo:
+def build_edit_validation(field: str, value: float, robot: str = "") -> EditValidationInfo:
     try:
-        from autotuner.adapter.__main__ import build_config_set
+        from autotuner.adapter.pipeline import build_config_set
         from autotuner.adapter.adapt import adapt
         from autotuner.framework_library.framework_edit import validate_edit
-        cs = build_config_set(robot)
-        adapted = adapt(cs.urdf)                     # derived health_band + reward_thresholds (no materialize)
+        cs = build_config_set(robot or None)
+        adapted = adapt(cs.urdf, product_id=cs.product_id)
         s = validate_edit(field, float(value), adapted)
         return EditValidationInfo(
             field=field, available=True, target_field=s.target_field, old=s.old, new=s.new,

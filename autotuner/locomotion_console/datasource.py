@@ -19,6 +19,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -42,6 +43,7 @@ from .schemas import (
     TrainingTelemetry,
 )
 from .telemetry import build_telemetry
+from autotuner.product import resolve_product_runtime
 
 
 class RunDataSource:
@@ -174,22 +176,32 @@ class _RemoteCooldownError(RuntimeError):
 class FakeDataSource(RunDataSource):
     """Synthetic but believable: reward climbs with noise, terrain steps up, phase advances.
 
-    Mirrors the shape of a real Taili AMP run so the frontend can be built and judged
+    Mirrors the shape of a real product run so the frontend can be built and judged
     against realistic curves without touching the GPU.
     """
 
     def __init__(self, settings: LocomotionConsoleSettings):
         self.settings = settings
         self.s = settings
+        try:
+            runtime = resolve_product_runtime(settings.product_id or None)
+            self._product_id = runtime.product_id
+            self._task_id = str(runtime.training.get("task_id") or "product_task")
+            self._robot_id = str(runtime.robot.get("id") or "product_robot")
+        except Exception:
+            self._product_id = settings.product_id or "product"
+            self._task_id = "product_task"
+            self._robot_id = "product_robot"
+        self._run_id = f"fake_{self._product_id}_run"
         self._iter = 4500          # pretend we resumed mid-run
         self._t0 = time.time()
         self._running = True
 
     async def get_status(self) -> RunStatus:
         return RunStatus(
-            run_id="fake_2026-06-22_taili_amp",
-            task="RobotLab-Isaac-Taili-AMP-Direct-v0",
-            robot_id="taili_dog_39kg",
+            run_id=self._run_id,
+            task=self._task_id,
+            robot_id=self._robot_id,
             latest_iter=self._iter,
             total_iter=15000,
             running=self._running,
@@ -303,7 +315,7 @@ class FakeDataSource(RunDataSource):
         return TensorboardScalarCatalog(
             available=True,
             source="fake",
-            run="fake_2026-06-22_taili_amp",
+            run=self._run_id,
             event_file="fake/events.out.tfevents",
             reward_tag="Reward / Total reward (mean)",
             tags=infos,
@@ -331,7 +343,7 @@ class FakeDataSource(RunDataSource):
         return TensorboardSeriesResponse(
             available=True,
             source="fake",
-            run="fake_2026-06-22_taili_amp",
+            run=self._run_id,
             event_file="fake/events.out.tfevents",
             series=series,
         )
@@ -391,7 +403,7 @@ class FakeDataSource(RunDataSource):
                         "stance_slip": 0.10 + 0.02 * math.sin(x / 3.0),
                     },
                     "paths": {
-                        "run_dir": "fake/taili_runs/fake_2026-06-22_taili_amp",
+                        "run_dir": f"fake/runs/{self._run_id}",
                         "telemetry_jsonl": "fake/tp_train.telemetry.jsonl",
                         "log": "fake/tp_train.log",
                         "console_log": "fake/console.log",
@@ -405,7 +417,7 @@ class FakeDataSource(RunDataSource):
 
         telemetry = build_telemetry(
             source="fake",
-            run_id="fake_2026-06-22_taili_amp",
+            run_id=self._run_id,
             running=self._running,
             log_path="fake/tp_train.log",
             telemetry_path="fake/tp_train.telemetry.jsonl",
@@ -476,9 +488,14 @@ class RealDataSource(RunDataSource):
         self._remote_failure_until = 0.0
         self._remote_failure_error = ""
         self._remote_failure_count = 0
+        self._resolved_product_contract = None
+        self._resolved_product_adapter = None
         from .box_profile import BoxProfile
         from .framework_profile import get_framework_profile, merge_box_profile
-        self.framework = get_framework_profile(settings.framework_id)
+        self.framework = get_framework_profile(
+            settings.framework_id,
+            product_id=settings.product_id or None,
+        )
         self.profile = merge_box_profile(BoxProfile.load() or BoxProfile(), self.framework)
 
     def _get_remote(self):
@@ -615,6 +632,7 @@ class RealDataSource(RunDataSource):
     def _fetch_remote_machine_status(self, remote) -> RemoteMachineStatus:
         import csv
         import io
+        import shlex
 
         host = (remote.exec_out("hostname 2>/dev/null || echo unknown", timeout=5) or self.profile.hostname).strip()
         uptime = (remote.exec_out("uptime -p 2>/dev/null || true", timeout=5) or "").strip()
@@ -677,9 +695,10 @@ class RealDataSource(RunDataSource):
             )
 
         training_processes: list[dict[str, object]] = []
+        process_pattern = self._training_process_pattern()
         proc_raw = remote.exec_out(
             "ps -eo pid,etime,pcpu,pmem,cmd --sort=-pcpu | "
-            "grep -E '[t]aili_blind_runtime\\.train_taili|[t]aili_blind_runtime\\.launch_taili_train' | "
+            f"grep -E {shlex.quote(process_pattern)} | "
             "grep -v grep | head -12",
             timeout=8,
         ) or ""
@@ -775,10 +794,11 @@ class RealDataSource(RunDataSource):
     # -- remote resolution (structure from profile, instance resolved live) --
 
     def _run_globs(self) -> tuple[str, ...]:
-        globs = tuple(getattr(self.framework, "run_globs", ()) or ())
-        if globs:
-            return globs
-        return (self.profile.runs_glob,) if self.profile.runs_glob else ()
+        declared_root = str(self._deployment_config().get("runs_root") or "").rstrip("/")
+        declared = (f"{declared_root}/*/",) if declared_root.startswith("/") else ()
+        framework_globs = tuple(getattr(self.framework, "run_globs", ()) or ())
+        fallback = (self.profile.runs_glob,) if self.profile.runs_glob else ()
+        return tuple(dict.fromkeys((*declared, *(framework_globs or fallback))))
 
     def _run_glob_shell(self) -> str:
         return " ".join(self._run_globs())
@@ -802,7 +822,6 @@ class RealDataSource(RunDataSource):
             '[ -f "$d/console.log" ] || '
             '[ -f "$d/effective_config.yaml" ] || '
             '[ -f "$d/agent.skrl.yaml" ] || '
-            '[ -f "$d/taili_blind_config.yaml" ] || '
             '[ -d "$d/checkpoints" ]; then '
             'printf "%s\\n" "$d"; break; '
             "fi; "
@@ -846,8 +865,13 @@ class RealDataSource(RunDataSource):
         """
         import shlex
 
-        from autotuner.blind_locomotion import acceptance_aggregate as AGG
         try:
+            from autotuner.product import load_product_plugin
+
+            contract = self._product_contract()
+            aggregate = load_product_plugin(contract, "acceptance", "aggregate")
+            parse_scorecard = load_product_plugin(contract, "acceptance", "parse_scorecard")
+            merge_runs = load_product_plugin(contract, "acceptance", "merge_runs")
             remote = self._get_remote()
             run = self._newest_run(remote)
             if not run:
@@ -858,10 +882,10 @@ class RealDataSource(RunDataSource):
                 return {"available": False, "reason": "no physeval logs yet — run acceptance_run to measure",
                         "run": run}
             texts = [remote.exec_out(f"cat {shlex.quote(p)}", timeout=15) or "" for p in paths]
-            verdict = AGG.aggregate(texts)
+            verdict = aggregate(texts)
             # per-gate detail (A1[fwd05] -> {ok, detail}) so the copilot can explain WHY a family
             # fails ("median 0.14 > 0.10"), not just that it failed. families[] gives per-family status.
-            merged = AGG.merge_runs(AGG.parse_scorecard(t) for t in texts)
+            merged = merge_runs(parse_scorecard(text) for text in texts)
             verdict["gates"] = {k: {"ok": bool(v.get("ok")), "detail": str(v.get("detail", ""))}
                                 for k, v in merged.items()}
             verdict["available"] = True
@@ -905,19 +929,144 @@ class RealDataSource(RunDataSource):
         # Training status must not match diagnostics just because both commands
         # mention the IsaacLab task name. Only payload-owned training entry
         # points count as training processes here.
-        pattern = r"[t]aili_blind_runtime\.train_taili|[t]aili_blind_runtime\.launch_taili_train"
+        pattern = self._training_process_pattern()
         return remote.exec_out(
             "bash -lc "
             + shlex.quote(f"pgrep -fa {shlex.quote(pattern)} | grep -v pgrep || true"),
             timeout=8,
         ) or ""
 
+    def _product_contract(self, *, refresh: bool = False):
+        """解析并缓存产品合同；部署前显式刷新以绑定最新源码摘要。"""
+        from autotuner.product import resolve_product_contract
+
+        if refresh or self._resolved_product_contract is None:
+            self._resolved_product_contract = resolve_product_contract(self.settings.product_id or None)
+            self._resolved_product_adapter = None
+        return self._resolved_product_contract
+
+    def _product_adapter(self, *, refresh: bool = False):
+        """获取经过校验的产品窄适配器；失败时由调用方决定是否回退。"""
+        from autotuner.product import resolve_product_adapter
+
+        contract = self._product_contract(refresh=refresh)
+        if refresh or self._resolved_product_adapter is None:
+            self._resolved_product_adapter = resolve_product_adapter(contract)
+        return self._resolved_product_adapter
+
+    def _runtime_package_name(self) -> str:
+        """Return the package name declared by the product payload."""
+        try:
+            package = self._product_adapter().runtime_package
+            if package and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", package):
+                return package
+        except Exception:
+            # Status polling must retain the legacy probe if the local product
+            # registry is temporarily unavailable; deployment itself remains
+            # strict and reports the contract error.
+            pass
+        return "payload_runtime"
+
+    def _deployment_config(self) -> dict:
+        """读取产品部署声明；兼容轮询路径时保留旧默认值。"""
+        try:
+            return dict(self._product_adapter().deployment)
+        except Exception:
+            return {}
+
+    def _remote_payload_root(self) -> str:
+        """返回产品声明的远程 CAS 根目录。"""
+        root = str(self._deployment_config().get("remote_root") or "/root/gpufree-data/rl-agent").strip()
+        if not root.startswith("/") or ".." in root.split("/"):
+            return "/root/gpufree-data/rl-agent"
+        return root.rstrip("/")
+
+    def _legacy_payload_root(self) -> str:
+        """旧 payload 目录只用于读取历史运行，不参与新版原子激活。"""
+        root = str(
+            self._deployment_config().get("legacy_payload_root")
+            or "/root/gpufree-data/training_payloads"
+        ).strip()
+        if not root.startswith("/") or ".." in root.split("/"):
+            return "/root/gpufree-data/training_payloads"
+        return root.rstrip("/")
+
+    def _payload_entrypoint_filename(self, role: str, fallback: str) -> str:
+        """取得 payload 内入口文件名，禁止把源码模块路径当成远程路径。"""
+        deployment = self._deployment_config()
+        declared = deployment.get("payload_entrypoints")
+        value = declared.get(role) if isinstance(declared, dict) else None
+        candidate = str(value or "").strip()
+        if not candidate and role == "trainer":
+            candidate = fallback
+        if not candidate:
+            contract = self._product_contract()
+            section = contract.training if role in {"launcher", "trainer"} else contract.diagnostics
+            key = "train_entrypoint" if role in {"launcher", "trainer"} else "entrypoint"
+            entrypoint = str(section.get(key) or "")
+            source_module = entrypoint.split(":", 1)[0]
+            candidate = source_module.rsplit(".", 1)[-1] + ".py" if source_module else ""
+        candidate = candidate.rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.py", candidate):
+            return fallback
+        return candidate
+
+    def _runtime_launch_module(self) -> str:
+        """将产品声明的训练入口映射到 payload 包内模块。"""
+        package = self._runtime_package_name()
+        filename = self._payload_entrypoint_filename("launcher", "launch.py")
+        return f"{package}.{filename[:-3]}"
+
+    def _training_process_pattern(self) -> str:
+        """生成只匹配本产品训练入口的进程正则。"""
+        try:
+            return self._product_adapter().process_pattern()
+        except Exception:
+            # 只读状态路径保留历史兼容；实际启动和停止仍要求产品合同有效。
+            package = self._runtime_package_name()
+            prefix = rf"[{package[0]}]{re.escape(package[1:])}"
+            stems = {
+                self._payload_entrypoint_filename("launcher", "launch.py")[:-3],
+                self._payload_entrypoint_filename("trainer", "train.py")[:-3],
+            }
+            return "|".join(rf"{prefix}\.{re.escape(stem)}" for stem in sorted(stems))
+
+    def _active_payload_root(self, remote) -> str:
+        """Resolve the content-addressed payload selected by the active pointer."""
+        import shlex
+
+        remote_root = self._remote_payload_root()
+        raw = remote.exec_out(f"cat {shlex.quote(remote_root + '/active.json')} 2>/dev/null || true", timeout=8) or ""
+        try:
+            active = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        digest = str(active.get("payload_digest") or "") if isinstance(active, dict) else ""
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return ""
+        root = f"{remote_root}/payloads/{digest}"
+        package = self._runtime_package_name()
+        train_file = self._payload_entrypoint_filename("launcher", "launch.py")
+        probe = remote.exec_out(
+            "bash -lc "
+            + shlex.quote(
+                f"test -f {shlex.quote(root + '/payload_manifest.json')} "
+                f"&& test -f {shlex.quote(root + '/' + package + '/' + train_file)} "
+                "&& printf payload_ok"
+            ),
+            timeout=10,
+        ) or ""
+        return root if probe.strip() == "payload_ok" else ""
+
     def _latest_payload_root(self, remote) -> str:
         import shlex
 
-        roots = [
-            "/root/gpufree-data/training_payloads/taili_blind_runtime_*",
-        ]
+        active = self._active_payload_root(remote)
+        if active:
+            return active
+        legacy_root = self._legacy_payload_root()
+        package = self._runtime_package_name()
+        roots = [f"{shlex.quote(legacy_root)}/{package}_*"]
         # The entries in ``roots`` are trusted framework-owned glob patterns.
         # Do not shell-quote the ``*`` itself: quoting it prevents expansion and
         # makes the console report "payload not found" even when deployment
@@ -1014,7 +1163,9 @@ class RealDataSource(RunDataSource):
             return run.rstrip("/") + "/train.log"
         if profile_log and profile_log not in {"/root/robot_lab/train.log", "/tmp/rl_train.log"}:
             return profile_log
-        return "/root/gpufree-data/logs/taili_train.log"
+        launch = self._deployment_config().get("training_launch")
+        declared_log = launch.get("log_path") if isinstance(launch, dict) else ""
+        return str(declared_log or "")
 
     def _telemetry_jsonl_path(self, log_path: str) -> str:
         if log_path.endswith(".log"):
@@ -1053,7 +1204,7 @@ class RealDataSource(RunDataSource):
 
         The priority is:
         1. explicit LOCOMOTION_CONSOLE_REMOTE_LOG override;
-        2. current run directory contract from taili_blind_runtime/launch_taili_train.py;
+        2. current run directory contract from the product payload launcher;
         3. newest matching telemetry/log file inside the run;
         4. legacy profile/fallback log path.
 
@@ -1450,11 +1601,17 @@ class RealDataSource(RunDataSource):
             message = self._remember_remote_failure(exc)
             return self._remote_unavailable_machine_status(message)
 
+    def _robot_identifier(self) -> str:
+        try:
+            return str(self._product_contract().robot.get("id") or "product_robot")
+        except Exception:
+            return "product_robot"
+
     def _degraded_status(self, error: Exception) -> RunStatus:
         return RunStatus(
             run_id="remote-unavailable",
             task=self.profile.task_id,
-            robot_id="taili_dog_39kg",
+            robot_id=self._robot_identifier(),
             latest_iter=0,
             total_iter=0,
             running=False,
@@ -1502,7 +1659,7 @@ class RealDataSource(RunDataSource):
         return RunStatus(
             run_id=run.split("/")[-1] if run else "(no run found)",
             task=self.profile.task_id,
-            robot_id="taili_dog_39kg",
+            robot_id=self._robot_identifier(),
             latest_iter=latest_iter,
             total_iter=total_iter,
             running=running,
@@ -1636,8 +1793,7 @@ class RealDataSource(RunDataSource):
 
     # -- action helpers --
 
-    @staticmethod
-    def _payload_root_from_run_metadata(raw: str) -> str:
+    def _payload_root_from_run_metadata(self, raw: str) -> str:
         """Read a payload root from a launcher's structured run metadata."""
         try:
             data = json.loads(raw or "")
@@ -1648,7 +1804,7 @@ class RealDataSource(RunDataSource):
         payload = data.get("payload_root") or data.get("payload")
         if not payload and isinstance(data.get("package_dir"), str):
             package_dir = data["package_dir"].rstrip("/")
-            if package_dir.endswith("/taili_blind_runtime"):
+            if package_dir.endswith("/" + self._runtime_package_name()):
                 payload = package_dir.rsplit("/", 1)[0]
         return payload.strip().rstrip("/") if isinstance(payload, str) else ""
 
@@ -1663,7 +1819,13 @@ class RealDataSource(RunDataSource):
 
         if not run:
             return ""
-        managed_root = "/root/gpufree-data/training_payloads"
+        managed_roots = (
+            self._legacy_payload_root(),
+            self._remote_payload_root() + "/payloads",
+        )
+        package_name = self._runtime_package_name()
+        launcher = self._payload_entrypoint_filename("launcher", "launch.py")
+        trainer = self._payload_entrypoint_filename("trainer", "train.py")
         run = run.rstrip("/")
         for name in ("run.json", "console_start.json"):
             path = f"{run}/{name}"
@@ -1674,16 +1836,16 @@ class RealDataSource(RunDataSource):
             payload = self._payload_root_from_run_metadata(raw)
             if not payload:
                 continue
-            if not payload.startswith(managed_root + "/"):
+            if not any(payload.startswith(root + "/") for root in managed_roots):
                 raise RuntimeError(
-                    f"recorded payload for {run} is outside {managed_root}: {payload}"
+                    f"recorded payload for {run} is outside managed payload roots: {payload}"
                 )
-            package = f"{payload}/taili_blind_runtime"
+            package = f"{payload}/{package_name}"
             probe = remote.exec_out(
                 "bash -lc "
                 + shlex.quote(
-                    f"test -f {shlex.quote(package + '/train_taili.py')} "
-                    f"&& test -f {shlex.quote(package + '/launch_taili_train.py')} "
+                    f"test -f {shlex.quote(package + '/' + trainer)} "
+                    f"&& test -f {shlex.quote(package + '/' + launcher)} "
                     "&& printf payload_ok"
                 ),
                 timeout=10,
@@ -1757,57 +1919,45 @@ class RealDataSource(RunDataSource):
         remote.exec_out(f"tmux send-keys -t {session} {shlex.quote(cmd)} Enter")
 
     def _deploy_payload(self, remote) -> tuple[str, str, int]:
+        """通过产品合同和版本化执行层部署 payload。"""
         import shlex
 
-        from autotuner.training_payloads.taili_blind_runtime.build_payload import build_payload
+        from autotuner.adapter.remote_executors import RemoteSSHTransportAdapter
+        from autotuner.execution import RemoteLayout, VersionedRemoteDeployer
+        from autotuner.product import build_product_payload, make_deployment_spec
 
-        result = build_payload()
-        remote_root = "/root/gpufree-data/training_payloads"
-        remote_archive = f"{remote_root}/{result.archive.name}"
-        remote_payload = f"{remote_root}/{result.root_name}"
-        remote.exec_out(f"mkdir -p {shlex.quote(remote_root)}", timeout=10)
-        remote.put(str(result.archive), remote_archive)
-        script = (
-            "set -euo pipefail; "
-            f"archive={shlex.quote(remote_archive)}; "
-            f"payload={shlex.quote(remote_payload)}; "
-            "rm -rf \"$payload\"; "
-            "mkdir -p \"$payload\"; "
-            "tar -xzf \"$archive\" -C \"$payload\"; "
-            "test -f \"$payload/sitecustomize.py\"; "
-            "test -f \"$payload/taili_blind_runtime/train_taili.py\"; "
-            "test -f \"$payload/taili_blind_runtime/launch_taili_train.py\"; "
-            "test -f \"$payload/taili_blind_runtime/blind_tp_env.py\"; "
-            "test -f \"$payload/taili_blind_runtime/telemetry_payloads.py\"; "
-            "test -f \"$payload/taili_blind_runtime/diagnose_taili_cases.py\"; "
-            "test -f \"$payload/taili_blind_runtime/taili_blind_config.yaml\"; "
-            "test -f \"$payload/taili_blind_runtime/assets/robots/taili-dog/robot.urdf\"; "
-            "test -d \"$payload/taili_blind_runtime/assets/robots/taili-dog/meshes\"; "
-            "PYTHONPATH=\"$payload${PYTHONPATH:+:$PYTHONPATH}\" "
-            "/opt/conda/envs/isaaclab/bin/python - <<'PY'\n"
-            "import importlib.util\n"
-            "mods = ['taili_blind_runtime', 'taili_blind_runtime.launch_taili_train', 'taili_blind_runtime.train_taili', 'taili_blind_runtime.telemetry_payloads', 'taili_blind_runtime.diagnose_taili_cases']\n"
-            "missing = [m for m in mods if importlib.util.find_spec(m) is None]\n"
-            "if missing:\n"
-            "    raise SystemExit('missing modules: ' + ','.join(missing))\n"
-            "print('payload_import_ok')\n"
-            "PY\n"
-            "printf '%s\\n' \"$payload\""
+        contract = self._product_contract(refresh=True)
+        payload = build_product_payload(contract)
+        timestamp = self._remote_timestamp(remote)
+        run_id = f"payload_deploy_{contract.product_id}_{timestamp}_{payload.payload_digest[:12]}"
+        run_manifest = {
+            "schema_version": "rl-agent.run/v1",
+            "kind": "payload_deployment",
+            "run_id": run_id,
+            "product": {"id": contract.product_id, "version": contract.product_version},
+            "resolved_contract": contract.to_dict(),
+            "payload": payload.to_dict(),
+            "source": "locomotion_console.versioned_deploy",
+        }
+        spec = make_deployment_spec(contract, payload, run_id=run_id, run_manifest=run_manifest)
+        remote_root = str(contract.deployment.get("remote_root") or "/root/gpufree-data/rl-agent")
+        deployer = VersionedRemoteDeployer(
+            RemoteSSHTransportAdapter(remote),
+            layout=RemoteLayout(remote_root),
         )
-        out = remote.exec_out("bash -lc " + shlex.quote(script), timeout=120)
-        payload_line = ""
-        for line in (out or "").splitlines():
-            if line.startswith(remote_root + "/"):
-                payload_line = line.strip()
-        return payload_line or remote_payload, remote_archive, result.file_count
+        result = deployer.deploy_spec(spec)
+        if result.status != "activated":
+            detail = "; ".join(result.errors) or result.status
+            raise RuntimeError(f"versioned payload deployment failed: {detail}")
+        remote_payload = f"{remote_root.rstrip('/')}/payloads/{payload.payload_digest}"
+        return remote_payload, str(payload.archive), payload.file_count
 
     def _start_payload_training(self, remote, *, resume: bool = False) -> tuple[str, str]:
-        import shlex
+        from autotuner.product import TrainingLaunchRequest, build_training_launch_plan
 
         if self._is_running(remote):
             raise RuntimeError("training is already running")
         payload = ""
-        checkpoint_arg = ""
         checkpoint = ""
         previous_run = ""
         init_phase = None
@@ -1825,90 +1975,46 @@ class RealDataSource(RunDataSource):
                     "resume checkpoint was found, but its source run does not record a usable payload; "
                     "refusing to combine it with the newest payload"
                 )
-            checkpoint_arg = " --checkpoint " + shlex.quote(checkpoint)
             init_phase = self._infer_resume_phase(remote, previous_run, checkpoint)
         else:
             payload = self._latest_payload_root(remote)
             if not payload:
-                raise RuntimeError(
-                    "taili_blind_runtime payload not found under /root/gpufree-data/training_payloads"
-                )
+                raise RuntimeError("no active or compatible legacy product payload was found")
+        adapter = self._product_adapter()
         ts = self._remote_timestamp(remote)
-        run_id = f"taili_train_{ts}" + ("_resume" if resume else "_console")
-        run_dir = f"/root/gpufree-data/taili_runs/{run_id}"
+        run_id = f"{adapter.run_prefix}_{ts}" + ("_resume" if resume else "_console")
         boot_id = self._run_boot_id(remote)
-        remote.exec_out(f"mkdir -p {shlex.quote(run_dir)}", timeout=10)
-        # 1024 与当前有效策略一致，并在 4090 上给四方向、七类地形和轻量 DR 足够的
-        # 同批覆盖；仍可通过 LOCOMOTION_CONSOLE_TRAIN_ENVS 显式覆盖。
-        # checkpoint 每 2000 保存，resume 时恢复检查点附近的课程阶段。
-        # Checkpoints do not store curriculum phase. Resume at the phase observed near the checkpoint
-        # instead of blindly jumping to phi3.
-        init_phase_env = f"export TAILI_INIT_PHASE={int(init_phase)}; " if init_phase is not None else ""
         train_num_envs = max(1, int(os.environ.get("LOCOMOTION_CONSOLE_TRAIN_ENVS", "1024")))
-        inner = (
-            "set -e; "
-            f"cd {shlex.quote(payload)}; "
-            "export PYTHONUNBUFFERED=1; "
-            "export TAILI_CHECKPOINT_INTERVAL=2000; "
-            "export TAILI_WRITE_INTERVAL=auto; "
-            f"{init_phase_env}"
-            f"printf '%s\\n' {shlex.quote(boot_id)} > {shlex.quote(run_dir + '/remote_boot_id.txt')}; "
-            "/opt/conda/envs/isaaclab/bin/python -m taili_blind_runtime.launch_taili_train "
-            "--python /opt/conda/envs/isaaclab/bin/python "
-            "--data-root /root/gpufree-data "
-            f"--run-id {shlex.quote(run_id)} "
-            "--total-steps 1500000 "
-            "--telemetry-interval 10 "
-            f"{checkpoint_arg} "
-            f"--headless -- --num_envs {train_num_envs}"
+        resume_state = {"phase": init_phase} if init_phase is not None else {}
+        plan = build_training_launch_plan(
+            self._product_contract(),
+            TrainingLaunchRequest(
+                payload_root=payload,
+                run_id=run_id,
+                checkpoint=checkpoint,
+                source_run=previous_run,
+                remote_boot_id=boot_id,
+                resume=resume,
+                num_envs=train_num_envs,
+                resume_state=resume_state,
+            ),
         )
-        command = (
-            f"bash -lc {shlex.quote(inner)}; "
-            "rc=$?; "
-            "printf '\\n[locomotion-console] training command exited with rc=%s.\\n' \"$rc\"; "
-            "printf '[locomotion-console] Full stdout/stderr is in the run console.log; this tmux pane is kept for inspection.\\n'; "
-            "printf '[locomotion-console] Start a new run from the console UI or exit this shell manually.\\n'; "
-            "exec bash -l"
-        )
-        self._launch_tmux(remote, "rl_train", command)
-        marker = (
-            "bash -lc "
-            + shlex.quote(
-                f"cat > {shlex.quote(run_dir + '/console_start.json')} <<'JSON'\n"
-                + "{\n"
-                + f"  \"run_id\": \"{run_id}\",\n"
-                + f"  \"run_dir\": \"{run_dir}\",\n"
-                + f"  \"payload\": \"{payload}\",\n"
-                + f"  \"source_run\": \"{previous_run}\",\n"
-                + f"  \"checkpoint\": \"{checkpoint}\",\n"
-                + "  \"tmux_session\": \"rl_train\",\n"
-                + f"  \"remote_boot_id\": \"{boot_id}\",\n"
-                + f"  \"resume\": {str(bool(resume)).lower()}\n"
-                + "}\nJSON"
-            )
-        )
-        remote.exec_out(marker, timeout=10)
-        return run_id, run_dir
+        remote.exec_out(plan.prepare_command(), timeout=10)
+        self._launch_tmux(remote, plan.tmux_session, plan.terminal_command())
+        remote.exec_out(plan.marker_command(), timeout=10)
+        return plan.run_id, plan.run_dir
 
     async def action_kill(self) -> ActionResult:
         self._require_remote_mutation_permission()
         try:
             remote = self._get_remote()
-            import shlex
+            from autotuner.product import build_training_kill_command
 
-            pattern = r"[t]aili_blind_runtime\.train_taili|[t]aili_blind_runtime\.launch_taili_train"
-            command = (
-                "bash -lc "
-                + shlex.quote(
-                    "tmux kill-session -t rl_train 2>/dev/null || true; "
-                    f"pkill -f {shlex.quote(pattern)} 2>/dev/null || true; "
-                    "echo ok"
-                )
-            )
+            product_id, session, command = build_training_kill_command(self._product_contract())
             await asyncio.to_thread(remote.exec_out, command)
             self._remember_remote_success()
             return ActionResult(action="kill", ok=True,
-                                message="stopped rl_train tmux session and Taili training launcher/processes")
+                                message=f"stopped {session} and {product_id} training processes")
         except Exception as e:  # noqa: BLE001
             message = self._remember_remote_failure(e)
             return ActionResult(action="kill", ok=False, message=f"kill failed: {self._remote_unavailable_message(message)}")
@@ -2006,7 +2112,7 @@ class RealDataSource(RunDataSource):
 
     async def action_run_acceptance(self, run: str = "", terrains: str = "flat",
                                     checkpoint: str = "best_agent.pt") -> ActionResult:
-        """Launch a spec-acceptance MEASUREMENT (physeval → taili_spec §2 score). Drives the box via
+        """Launch a product acceptance measurement through the declared product plugin. Drives the box via
         the product `acceptance_run` CLI in a detached LOCAL subprocess (the console is local; the CLI
         SSHes to the box). It self-refuses if training is active (acceptance_run's own GPU guard), so
         this never contends with a converging run. The scored verdict then surfaces via get_acceptance."""
@@ -2018,12 +2124,15 @@ class RealDataSource(RunDataSource):
         from pathlib import Path
 
         try:
+            from autotuner.product import plugin_reference
+
             terr = [t for t in re.split(r"[,\s]+", terrains or "flat") if re.fullmatch(r"[a-z_]+", t)] or ["flat"]
             if checkpoint and not re.fullmatch(r"[A-Za-z0-9._\-]+", checkpoint):
                 return ActionResult(action="run_acceptance", ok=False, message=f"invalid checkpoint name: {checkpoint!r}")
             run_id = run if (run and re.fullmatch(r"[A-Za-z0-9._\-]+", run)) else "newest"
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.taili_ops.acceptance_run", run_id,
+            module = plugin_reference(self._product_contract(), "acceptance", "command").split(":", 1)[0]
+            args = [sys.executable, "-m", module, run_id,
                     "--terrains", *terr, "--checkpoint", checkpoint or "best_agent.pt", "--num-envs", "64"]
             # detached: the measurement outlives the request; result is read later via get_acceptance
             subprocess.Popen(args, cwd=repo_root, stdout=subprocess.DEVNULL,
@@ -2054,13 +2163,16 @@ class RealDataSource(RunDataSource):
         from pathlib import Path
 
         try:
+            from autotuner.product import plugin_reference
+
             if checkpoint and not re.fullmatch(r"[A-Za-z0-9._\-]+", checkpoint):
                 return ActionResult(action="run_campaign", ok=False, message=f"invalid checkpoint: {checkpoint!r}")
             if not (run and re.fullmatch(r"[A-Za-z0-9._\-]+", run)):
                 return ActionResult(action="run_campaign", ok=False, message="a valid run id is required")
             iters = max(1, min(int(max_iters), 12))
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.taili_ops.tune_orchestrator", run, checkpoint,
+            module = plugin_reference(self._product_contract(), "tuning", "command").split(":", 1)[0]
+            args = [sys.executable, "-m", module, run, checkpoint,
                     "--max-iters", str(iters), "--out", f"/tmp/campaign_{run}.json"]
             subprocess.Popen(args, cwd=repo_root, stdout=open(f"/tmp/campaign_{run}.log", "w"),
                              stderr=subprocess.STDOUT, start_new_session=True,
@@ -2087,9 +2199,12 @@ class RealDataSource(RunDataSource):
         from pathlib import Path
 
         try:
+            from autotuner.product import plugin_reference
+
             iters = max(1, min(int(max_iters), 16))
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.taili_ops.tune_orchestrator", "auto", "auto",
+            module = plugin_reference(self._product_contract(), "tuning", "command").split(":", 1)[0]
+            args = [sys.executable, "-m", module, "auto", "auto",
                     "--produce", "--max-iters", str(iters), "--steps-per-iter", "18000",
                     "--num-envs", "1024", "--out", "/tmp/policy_report.json"]
             subprocess.Popen(args, cwd=repo_root, stdout=open("/tmp/produce_policy.log", "w"),

@@ -21,7 +21,7 @@ from autotuner.locomotion_console.knowledge_model.reward_deriver import derive_r
 from autotuner.locomotion_console.knowledge_model.schema import Entity
 from autotuner.locomotion_console.knowledge_model.store import KnowledgeStore
 
-_REL = "autotuner/taili_core/taili_reward.py"
+_REL = "products/taili/core/taili_reward.py"
 _SRC = _read_allowlisted(_REL) or ""
 
 

@@ -85,7 +85,7 @@ def test_ssh_backend_uploads_artifact_quotes_argv_and_returns_evaluation(tmp_pat
             "PATH": "/must/not/be-forwarded",
             "SECRET_TOKEN": "must-not-leak",
             "CUDA_VISIBLE_DEVICES": "0",
-            "TAILI_MODE": "research",
+            "RL_MODE": "research",
         },
     )
     remote = created[0]
@@ -97,7 +97,7 @@ def test_ssh_backend_uploads_artifact_quotes_argv_and_returns_evaluation(tmp_pat
     assert "SECRET_TOKEN" not in runner
     assert "must/not/be-forwarded" not in runner
     assert "CUDA_VISIBLE_DEVICES=0" in runner
-    assert "TAILI_MECHANISM_BUNDLE=" in runner
+    assert "RL_MECHANISM_BUNDLE=" in runner
     assert "/candidate/mechanisms.json" in runner
     assert any(path.endswith("/candidate/mechanisms.json") for path in remote.files)
 

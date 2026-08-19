@@ -109,8 +109,15 @@ def orchestrate(cs: ConfigSet, work_dir: str, stamp: str, *,
     steps.append(ev)
     if not ev.ok:
         return result("EVAL_FAILED")
-    from autotuner.blind_locomotion.acceptance_aggregate import aggregate
-    verdict = aggregate([ev.data.get("scorecard_text", "")])
+    from autotuner.product import call_product_plugin, resolve_product_contract
+
+    contract = resolve_product_contract(cs.product_id or None)
+    verdict = call_product_plugin(
+        contract,
+        "acceptance",
+        "aggregate",
+        [ev.data.get("scorecard_text", "")],
+    )
     return result("DELIVERED" if verdict["passed"] else "EVAL_FAILED_GATES", verdict)
 
 

@@ -49,6 +49,23 @@ def test_recorded_payload_root_falls_back_to_console_marker():
     assert _source()._recorded_payload_root(remote, run) == payload
 
 
+def test_active_payload_root_resolves_content_addressed_pointer():
+    source = _source()
+    digest = "a" * 64
+    active = source._remote_payload_root() + "/active.json"
+    remote = _Remote({active: f'{{"payload_digest":"{digest}"}}'})
+
+    assert source._active_payload_root(remote) == source._remote_payload_root() + f"/payloads/{digest}"
+
+
+def test_active_payload_root_rejects_untrusted_digest():
+    source = _source()
+    active = source._remote_payload_root() + "/active.json"
+    remote = _Remote({active: '{"payload_digest":"../../escape"}'})
+
+    assert source._active_payload_root(remote) == ""
+
+
 def test_resume_refuses_checkpoint_without_payload_provenance(monkeypatch):
     source = _source()
     remote = _Remote()

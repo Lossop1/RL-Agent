@@ -1,7 +1,7 @@
-"""兼容入口；权威实现位于 :mod:`autotuner.taili_ops.early_stop`。"""
+"""兼容入口；权威实现位于 :mod:`products.taili.ops.early_stop`。"""
 
-from autotuner.taili_ops import early_stop as _implementation
-from autotuner.taili_ops.early_stop import *  # noqa: F401,F403
+from products.taili.ops import early_stop as _implementation
+from products.taili.ops.early_stop import *  # noqa: F401,F403
 
 
 def __getattr__(name: str):

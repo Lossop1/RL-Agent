@@ -80,12 +80,12 @@ _SOURCES: dict[str, EvidenceSource] = {
         ),
         freshness="live tail",
     ),
-    "taili_context": EvidenceSource(
-        id="taili_context",
-        label="Taili spec/strategy/YAML knowledge pack",
+    "product_context": EvidenceSource(
+        id="product_context",
+        label="Active product spec/strategy/YAML knowledge pack",
         kind="local_allowlist",
         capabilities=(
-            "taili_spec, strategy decisions, architecture notes, current Taili YAML contract",
+            "active product spec, strategy decisions, architecture notes, and product contract",
             "network/reward/curriculum/control configuration intent",
         ),
         limitations=(
@@ -96,7 +96,7 @@ _SOURCES: dict[str, EvidenceSource] = {
     ),
     "spec_coverage": EvidenceSource(
         id="spec_coverage",
-        label="taili_spec coverage ledger",
+        label="Active product specification coverage ledger",
         kind="local_allowlist",
         capabilities=(
             "acceptance rows mapped to current mechanisms, evaluation coverage, gaps",
@@ -109,7 +109,7 @@ _SOURCES: dict[str, EvidenceSource] = {
     ),
     "acceptance_verdict": EvidenceSource(
         id="acceptance_verdict",
-        label="Measured taili_spec §2 acceptance verdict",
+        label="Measured active-product acceptance verdict",
         kind="remote_readonly",
         capabilities=(
             "MEASURED pass/fail per acceptance family (A1..F2) for the newest run's checkpoint",
@@ -228,10 +228,10 @@ _SOURCES: dict[str, EvidenceSource] = {
     ),
     "code_knowledge": EvidenceSource(
         id="code_knowledge",
-        label="Taili code knowledge / implementation evidence",
+        label="Active product code knowledge / implementation evidence",
         kind="local_allowlist",
         capabilities=(
-            "allowlisted snippets from Taili reward, curriculum, diagnostics, telemetry, model, payload code",
+            "allowlisted snippets from the active product reward, curriculum, diagnostics, telemetry, model, and payload code",
             "literal evidence for whether YAML keys and telemetry fields are consumed in code",
             "source paths/line windows for implementation-level claims",
         ),
@@ -303,7 +303,7 @@ _LEDGER_TERMS = (
     "之前", "刚才", "上次", "历史", "记录", "ledger", "实验", "闭环",
     "改过", "做过", "提案", "proposal", "结果", "复盘",
 )
-_SPEC_TERMS = ("spec", "验收", "要求", "目标", "达标", "覆盖", "taili_spec")
+_SPEC_TERMS = ("spec", "验收", "要求", "目标", "达标", "覆盖")
 _DIAG_TERMS = (
     "诊断", "回放", "测试", "怎么走", "表现", "前进", "后退", "forward",
     "backward", "lateral", "yaw", "偏航", "滑", "撞", "拖", "蹲", "步态差",
@@ -425,12 +425,12 @@ def route_evidence(query: str = "", ui_mode: str = "") -> dict[str, Any]:
         })
 
     if asks_strategy:
-        add("taili_context", "question is about Taili YAML, reward/curriculum/model/strategy, or tuning intent")
+        add("product_context", "question is about product YAML, reward/curriculum/model/strategy, or tuning intent")
         add("definitions", "reward/gate/metric terms need deterministic formulas")
         add("signal_map", "strategy/config questions need the spec-YAML-code-telemetry-diagnostic mapping")
         decomposed.append("distinguish strategy/config intent from observed behavior")
         gap_checks.append({
-            "source": "taili_context",
+            "source": "product_context",
             "blocking": True,
             "gap": "YAML/docs unavailable",
             "impact": "cannot make project-specific strategy/config claims",
@@ -439,7 +439,7 @@ def route_evidence(query: str = "", ui_mode: str = "") -> dict[str, Any]:
     if asks_spec or asks_tuning_root_cause:
         add("spec_coverage", "spec acceptance and coverage gaps constrain tuning decisions")
         add("acceptance_verdict", "the MEASURED §2 verdict grounds which gates actually fail and by how much")
-        decomposed.append("map claims to taili_spec coverage before saying a behavior is acceptable")
+        decomposed.append("map claims to the active product specification before saying a behavior is acceptable")
 
     if asks_diag:
         add("diagnostic_history", "behavior questions require knowing which diagnostic job/checkpoint/test was run")
@@ -464,7 +464,7 @@ def route_evidence(query: str = "", ui_mode: str = "") -> dict[str, Any]:
         add("training_telemetry", "tuning/root-cause needs current optimization signal")
         add("diagnostic_history", "tuning/root-cause needs recent behavior tests when available", required=False)
         add("diagnostic_reports", "tuning/root-cause should check actual behavior before proposing changes", required=False)
-        add("taili_context", "tuning/root-cause needs YAML and strategy constraints")
+        add("product_context", "tuning/root-cause needs YAML and strategy constraints")
         add("definitions", "tuning/root-cause needs reward/gate formulas")
         add("signal_map", "tuning/root-cause must connect spec, YAML, code, telemetry, and diagnostics")
         add("code_knowledge", "tuning/root-cause needs implementation evidence for consumed fields and calculations", required=False)
@@ -488,7 +488,7 @@ def route_evidence(query: str = "", ui_mode: str = "") -> dict[str, Any]:
 
     if asks_asset:
         add("asset", "question mentions robot geometry/actuator/joint/mass/URDF-level facts")
-        add("taili_context", "asset facts need to be compared with the local strategy contract", required=False)
+        add("product_context", "asset facts need to be compared with the active product contract", required=False)
 
     if "当前值" in q or "deployed" in q or "env_cfg" in q or "远程配置" in q:
         add("deployed_config", "question asks for current deployed config rather than only local YAML", required=False)

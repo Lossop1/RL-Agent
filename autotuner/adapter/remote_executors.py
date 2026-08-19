@@ -12,7 +12,70 @@ tmux job (without blocking for hours) is provided for that.
 """
 from __future__ import annotations
 
-from autotuner.adapter.orchestrator import StepResult
+import re
+import shlex
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from autotuner.adapter.orchestrator import StepResult
+
+
+class RemoteSSHTransportAdapter:
+    """将控制台的 RemoteSSH 适配为执行层的最小传输协议。
+
+    控制台历史接口返回 ``(stdout, stderr)``，执行层接口返回
+    ``(stdout, return_code)``。适配只存在于边界处，避免执行层知道
+    控制台的重连和认证细节；新的产品部署因此可以复用同一套校验、
+    staging 和原子激活逻辑。
+
+    ``RemoteSSH`` 为了兼容旧调用者仍然只返回 stderr，不提供退出码。
+    对这种传输，适配器在远端子 shell 中追加一个不可混淆的退出码标记；
+    stderr 是否为空不再参与成功判定。若底层已经提供 ``exec_status``，
+    则直接使用它，避免额外的 shell 包装。
+    """
+
+    _RETURN_CODE_MARKER = "__RL_AGENT_RC__"
+
+    def __init__(self, remote, *, legacy_stderr: bool = True):
+        self.remote = remote
+        self.legacy_stderr = bool(legacy_stderr)
+
+    def exec(self, cmd: str, timeout: int = 30) -> tuple[str, int]:
+        if not self.legacy_stderr:
+            result = self.remote.exec(cmd, timeout=timeout)
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError("remote transport must return (output, return_code)")
+            output, return_code = result
+            if not isinstance(return_code, int):
+                raise RuntimeError("return-code transport returned a non-integer status")
+            return str(output), return_code
+
+        exec_status = getattr(self.remote, "exec_status", None)
+        if callable(exec_status):
+            output, return_code = exec_status(cmd, timeout=timeout)
+            return str(output), int(return_code)
+
+        wrapped = (
+            "set +e; "
+            f"( {cmd} ); "
+            "rc=$?; "
+            f"printf '\\n{self._RETURN_CODE_MARKER}%s\\n' \"$rc\"; "
+            "exit 0"
+        )
+        stdout, stderr = self.remote.exec("bash -lc " + shlex.quote(wrapped), timeout=timeout)
+        output = str(stdout or "")
+        match = re.search(
+            rf"(?:^|\n){re.escape(self._RETURN_CODE_MARKER)}(-?\d+)\s*$",
+            output,
+        )
+        if match is None:
+            detail = str(stderr or "").strip()
+            suffix = f"; stderr={detail!r}" if detail else ""
+            raise RuntimeError(f"legacy remote transport did not return an exit marker{suffix}")
+        return output[: match.start()].rstrip("\n"), int(match.group(1))
+
+    def put(self, local: str, remote: str) -> None:
+        self.remote.put(local, remote)
 
 
 class RemoteDeployExecutor:
@@ -28,6 +91,8 @@ class RemoteDeployExecutor:
         self.do_launch = do_launch
 
     def deploy(self, plan, stamp: str) -> StepResult:
+        from autotuner.adapter.orchestrator import StepResult
+
         from autotuner.adapter.deploy import execute, restore_cmds
         from autotuner.adapter.remote_deploy import from_ssh_json
         try:
@@ -59,6 +124,8 @@ class VersionedPayloadDeployExecutor:
         self.layout = layout
 
     def deploy(self, spec) -> StepResult:
+        from autotuner.adapter.orchestrator import StepResult
+
         from autotuner.execution.deployment import VersionedRemoteDeployer
         from autotuner.adapter.remote_deploy import from_ssh_json
 
@@ -87,7 +154,8 @@ class VersionedPayloadDeployExecutor:
 def launch_training(ssh, train_cmd: str, session: str, log: str) -> StepResult:
     """Fire a long-running training job in a fresh tmux session (non-blocking). The orchestrator does
     NOT wait for it — monitoring is via the poll cron. Returns immediately with launch status."""
-    import shlex
+    from autotuner.adapter.orchestrator import StepResult
+
     visible_cmd = f"set -o pipefail; {train_cmd} 2>&1 | tee -a {shlex.quote(log)}"
     cmd = (
         f"rm -f {shlex.quote(log)}; "

@@ -2,7 +2,7 @@
 
 更新时间：2026-07-16
 
-本文档记录 `TailiBlindTPEnv._get_rewards` 写入 `TrainingTelemetryEmitter` 的结构化字段。字段构造集中在 `autotuner/blind_locomotion/telemetry_payloads.py`，`_get_rewards` 负责计算上下文并调用 builder。它是前端、智能体和人工调参共同依赖的观测契约。
+本文档记录 `TailiBlindTPEnv._get_rewards` 写入 `TrainingTelemetryEmitter` 的结构化字段。字段构造集中在 `products/taili/blind_locomotion/telemetry_payloads.py`，`_get_rewards` 负责计算上下文并调用 builder。它是前端、智能体和人工调参共同依赖的观测契约。
 
 ## 总体原则
 
@@ -250,6 +250,6 @@ progress 和阻塞字段：
 ## 后续整理原则
 
 - telemetry builder 已拆到 `telemetry_payloads.py`，后续整理必须继续保持四类 payload 名称不变。
-- 字段契约测试在 `tests/autotuner/blind_locomotion/test_telemetry_contract.py`，改字段前先改测试和文档。
+- 字段契约测试在 `tests/products/taili/blind_locomotion/test_telemetry_contract.py`，改字段前先改测试和文档。
 - 新增字段可以，但删除或改名需要同步文档、前端、智能体和测试。
 - debug 字段如果要删除，先确认最近训练和诊断没有依赖它。
