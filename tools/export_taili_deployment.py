@@ -376,6 +376,14 @@ def main() -> None:
         trace_error=trace_error,
         zero_output=zero_output,
     )
+    # Export the same resolved contract consumed by sim2sim parity checks.
+    from autotuner.research.policy_contract import contract_from_export_metadata
+
+    metadata["policy_contract"] = contract_from_export_metadata(
+        metadata,
+        contract_id=f"deployment:{checkpoint_path.name}",
+        version="taili_deployment_contract_v2",
+    ).model_dump(mode="json")
     metadata_path = output_path.with_suffix(output_path.suffix + ".json")
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

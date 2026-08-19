@@ -38,6 +38,7 @@ from .taili_blind_config import (
     resolve_config_path,
     write_taili_blind_config,
 )
+from .runtime_manifest import initial_manifest, write_manifest
 
 _DEFAULT_CFG = load_taili_blind_config()
 DEFAULT_TASK = str(_DEFAULT_CFG["task"]["default_id"])
@@ -160,6 +161,8 @@ def _build_env(
     env["TAILI_CHECKPOINT_DIR"] = str(run_dir / "checkpoints")
     env["TAILI_SKRL_CFG_ENTRY_POINT"] = str(agent_cfg)
     env["TAILI_CONFIG_PATH"] = str(agent_cfg.parent / CONFIG_FILENAME)
+    env["TAILI_EFFECTIVE_CONFIG"] = str(run_dir / "effective_config.yaml")
+    env["TAILI_RUNTIME_MANIFEST"] = str(run_dir / "runtime_manifest.json")
     env["TAILI_TELEMETRY_INTERVAL"] = str(max(1, int(telemetry_interval)))
     existing_cuda_alloc = env.get("PYTORCH_CUDA_ALLOC_CONF", "")
     alloc_parts = [part for part in existing_cuda_alloc.split(",") if part]
@@ -178,6 +181,12 @@ def _write_run_metadata(path: Path, data: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Launch Taili blind training from the self-contained payload.")
+    parser.add_argument(
+        "--mode",
+        choices=("train", "gate-calibration"),
+        default="train",
+        help="Run normal training or a bounded frozen-policy gate calibration rollout.",
+    )
     parser.add_argument(
         "--train-entry",
         default=os.environ.get("TAILI_TRAIN_ENTRY", ""),
@@ -238,7 +247,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.headless and not _has_flag(train_args, "--headless"):
         train_args.append("--headless")
 
-    if args.train_entry:
+    if args.mode == "gate-calibration":
+        if args.train_entry:
+            raise ValueError("--train-entry cannot be combined with --mode gate-calibration")
+        if not args.checkpoint:
+            raise ValueError("--mode gate-calibration requires --checkpoint")
+        if args.total_steps <= 0:
+            raise ValueError("--mode gate-calibration requires a positive --total-steps bound")
+        if not _has_flag(train_args, "--steps"):
+            train_args.extend(["--steps", str(args.total_steps)])
+        cmd = [
+            args.python,
+            "-m",
+            "taili_blind_runtime.calibrate_taili_gates",
+            "--agent-yaml",
+            str(agent_cfg),
+            *train_args,
+        ]
+    elif args.train_entry:
         cmd = [args.python, args.train_entry, *train_args]
     else:
         cmd = [args.python, "-m", "taili_blind_runtime.train_taili", "--agent-yaml", str(agent_cfg), *train_args]
@@ -262,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         "effective_config": str(effective_cfg),
         "task": args.task,
         "resume_checkpoint": args.checkpoint,
+        "mode": args.mode,
         "training_recipe": get_config_value(run_config, "training_recipe", {}),
         "command": cmd,
         "paths": {
@@ -271,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             "checkpoint_dir": env["TAILI_CHECKPOINT_DIR"],
             "tensorboard_dir": str(run_dir),
             "effective_config": str(effective_cfg),
+            "runtime_manifest": str(run_dir / "runtime_manifest.json"),
         },
         "observability": {
             "telemetry_interval_steps": int(env["TAILI_TELEMETRY_INTERVAL"]),
@@ -279,11 +307,35 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     _write_run_metadata(run_dir / "run.json", metadata)
+    runtime_manifest = initial_manifest(
+        run_id=run_id,
+        run_dir=run_dir,
+        task=args.task,
+        payload_root=payload_root,
+        source_config=config_copy,
+        effective_config=effective_cfg,
+        agent_config=agent_cfg,
+        resume_checkpoint=args.checkpoint,
+        seed=None,
+    )
+    runtime_manifest["launch"] = {
+        "command": cmd,
+        "train_entry": (
+            "taili_blind_runtime.calibrate_taili_gates"
+            if args.mode == "gate-calibration"
+            else args.train_entry or "taili_blind_runtime.train_taili"
+        ),
+        "mode": args.mode,
+        "headless": bool(args.headless),
+        "telemetry_interval_steps": int(args.telemetry_interval),
+    }
+    write_manifest(run_dir / "runtime_manifest.json", runtime_manifest)
 
     print(f"[TAILI_LAUNCH] run_id={run_id}", flush=True)
     print(f"[TAILI_LAUNCH] run_dir={run_dir}", flush=True)
     print(f"[TAILI_LAUNCH] agent_cfg={agent_cfg}", flush=True)
     print(f"[TAILI_LAUNCH] console_log={env['TAILI_CONSOLE_LOG']}", flush=True)
+    print(f"[TAILI_LAUNCH] runtime_manifest={run_dir / 'runtime_manifest.json'}", flush=True)
     print(f"[TAILI_LAUNCH] telemetry_interval={env['TAILI_TELEMETRY_INTERVAL']}", flush=True)
     print("[TAILI_LAUNCH] command=" + " ".join(cmd), flush=True)
     if args.dry_run:

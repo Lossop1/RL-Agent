@@ -2,7 +2,7 @@
 training run, and must reject a run id that could reach the remote shell."""
 import pytest
 
-from autotuner.training import acceptance_run as AR
+from autotuner.taili_ops import acceptance_run as AR
 
 
 class _FakeRemote:

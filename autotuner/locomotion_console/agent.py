@@ -150,7 +150,7 @@ def _tool_get_campaign_journal(src: RealDataSource, robot: str = "taili", limit:
     """The campaign's durable decision memory: best-so-far score, the (gate::lever) pairs already tried and
     ROLLED BACK (the NO-REPEAT guard must reject these), and recent iterations. Read this BEFORE proposing a
     lever (step 3 of run_tuning_loop) so you never repeat a failed experiment or claim a stale best."""
-    from .campaign_journal import read_journal
+    from autotuner.research.campaign_journal import read_journal
     return read_journal(robot=robot, limit=limit)
 
 
@@ -160,7 +160,7 @@ def _tool_record_campaign_iteration(src: RealDataSource, robot: str = "taili", t
                                     evidence: str = "", note: str = "") -> Dict[str, Any]:
     """Append this iteration's outcome to the campaign journal (decision in {kept, rolled_back, pending}).
     Do this at step 7 (decide) so the NO-REPEAT/DECIDE guards have the memory next iteration."""
-    from .campaign_journal import record_iteration
+    from autotuner.research.campaign_journal import record_iteration
     try:
         import datetime as _dt
         ts = _dt.datetime.now().timestamp()
@@ -244,7 +244,7 @@ def _tool_get_tuning_state(src: RealDataSource) -> Dict[str, Any]:
     is currently running. Check before proposing tune/train actions."""
     out: Dict[str, Any] = {}
     try:
-        from autotuner.training.strategy_edit import rollback_stack
+        from autotuner.taili_ops.strategy_edit import rollback_stack
         out["rollback_stack"] = rollback_stack()[-5:]
     except Exception as e:  # noqa: BLE001
         out["rollback_stack_error"] = str(e)
@@ -266,7 +266,7 @@ def _tool_analyze_acceptance(src: RealDataSource) -> Dict[str, Any]:
     Use this to DRIVE the loop yourself: run_acceptance → analyze_acceptance → propose apply_tuning
     → deploy_payload + resume_training → run_acceptance again."""
     from autotuner.blind_locomotion.taili_blind_config import get_config_value, load_taili_blind_config
-    from autotuner.training.tune_orchestrator import GATE_LEVERS, SKIP_FAMILIES, analyze_gaps, propose_change
+    from autotuner.taili_ops.tune_orchestrator import GATE_LEVERS, SKIP_FAMILIES, analyze_gaps, propose_change
 
     verdict = src.get_acceptance()
     if not verdict.get("available"):
@@ -377,6 +377,93 @@ def _tool_get_curriculum_model(src: RealDataSource, query: str = "") -> Dict[str
         except Exception:  # noqa: BLE001 — 拿不到现值就只给代码默认(带标注),不因此失败
             effective_config_text = ""
     return get_curriculum_model(effective_config_text=effective_config_text).model_dump()
+
+
+def _tool_get_research_audit(src: RealDataSource, manifest: str = "", checkpoint_root: str = "",
+                             strict: bool = False) -> Dict[str, Any]:
+    """Read-only RL Agent preflight for the local repository.
+
+    This deliberately does not use ``src`` for SSH: the report must not confuse
+    local source evidence with an unverified remote payload.  A manifest can
+    add runtime evidence, but its paths are constrained to the repository root.
+    """
+    from pathlib import Path
+
+    from .research_audit import PROJECT_ROOT, build_research_audit
+
+    root = PROJECT_ROOT.resolve()
+    manifest_path = Path(manifest).resolve() if manifest else None
+    checkpoint_path = Path(checkpoint_root).resolve() if checkpoint_root else None
+    report = build_research_audit(root, manifest_path=manifest_path, checkpoint_root=checkpoint_path)
+    result = report.model_dump(mode="json")
+    result["requested_strict"] = bool(strict)
+    result["strict_blocked"] = bool(strict and report.status != "ready")
+    return result
+
+
+def _tool_get_research_ledger(src: RealDataSource, root: str = "", record_type: str = "") -> Dict[str, Any]:
+    """Read-only local research lineage: append-only events, latest records, and hash-chain status."""
+    from autotuner.research.research_ledger import ResearchLedgerStore
+    from .research_service import resolve_research_root
+
+    try:
+        candidate = resolve_research_root(root) if root else resolve_research_root() / "ledger"
+    except ValueError as exc:
+        return {"error": str(exc)}
+    store = ResearchLedgerStore(candidate)
+    try:
+        summary = store.summary()
+        records = store.records(record_type=record_type)
+    except Exception as exc:
+        return {"root": str(candidate), "error": f"ledger verification failed: {type(exc).__name__}: {exc}"}
+    return {"summary": summary, "record_type": record_type, "records": records[-40:]}
+
+
+def _tool_get_research_state(src: RealDataSource) -> Dict[str, Any]:
+    """Read the durable research snapshot and verify its event hash chain."""
+    from .research_service import resolve_research_root
+    from autotuner.research.research_state import ResearchStateError, ResearchStateStore
+
+    store = ResearchStateStore(resolve_research_root() / "state")
+    try:
+        state = store.load()
+        return {
+            "available": True,
+            "summary": store.summary(),
+            "state": state.model_dump(mode="json"),
+        }
+    except ResearchStateError as exc:
+        return {"available": False, "error": str(exc)}
+
+
+def _tool_validate_research_mechanism(
+    src: RealDataSource,
+    bundle: Dict[str, Any] | None = None,
+    context: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Statically and numerically validate a generated mechanism without executing it."""
+    from autotuner.mechanisms.mechanism_specs import MechanismBundle
+    from autotuner.mechanisms.mechanism_validation import ValidationContext, validate_bundle
+
+    parsed_bundle = MechanismBundle.model_validate(bundle or {})
+    parsed_context = ValidationContext.model_validate(context or {})
+    return validate_bundle(parsed_bundle, parsed_context).model_dump(mode="json")
+
+
+def _tool_run_decision_replay(src: RealDataSource, split: str = "holdout") -> Dict[str, Any]:
+    """Run the deterministic blind historical decision benchmark."""
+    from .config import PROJECT_ROOT
+    from autotuner.research.decision_replay import DecisionReplayRunner, GlobalResearchDecisionPolicy, load_replay_cases
+
+    selected = str(split or "holdout").strip().lower()
+    if selected not in {"train", "holdout", "all"}:
+        return {"error": "split must be train, holdout, or all"}
+    cases = load_replay_cases(
+        PROJECT_ROOT / "config" / "decision_replay" / "taili_core_cases.jsonl",
+        split="" if selected == "all" else selected,
+    )
+    report = DecisionReplayRunner().run(cases, GlobalResearchDecisionPolicy())
+    return report.model_dump(mode="json")
 
 
 def _tool_get_code_facts(src: RealDataSource, query: str = "") -> Dict[str, Any]:
@@ -1851,6 +1938,11 @@ TOOLS = {
     "get_reward_model": _tool_get_reward_model,
     "get_robot_model": _tool_get_robot_model,
     "get_curriculum_model": _tool_get_curriculum_model,
+    "get_research_audit": _tool_get_research_audit,
+    "get_research_ledger": _tool_get_research_ledger,
+    "get_research_state": _tool_get_research_state,
+    "validate_research_mechanism": _tool_validate_research_mechanism,
+    "run_decision_replay": _tool_run_decision_replay,
     "get_code_facts": _tool_get_code_facts,
     "get_tuning_ledger": _tool_get_tuning_ledger,
     "get_train_log": _tool_get_train_log,
@@ -1922,6 +2014,24 @@ _TOOLS_DOC = """Available tools (read-only):
                                    taili_amp_env_cfg.py AST; the CURRENT run values read live from
                                    effective_config, paired with provenance (never a hand-copied number).
                                    Use for "what are the current phase-gate thresholds / penalty ramp".
+- get_research_audit(manifest="", checkpoint_root="", strict=false) -> LOCAL read-only RL Agent
+                                   preflight: source hashes/symbols, reward structure, train/eval metric
+                                   alignment, curriculum gate calibration, command coverage, PPO/resume
+                                   state, and checkpoint capability evidence. It never SSHes, edits,
+                                   launches training, or treats missing runtime evidence as complete.
+- get_research_ledger(root="", record_type="") -> LOCAL read-only append-only research lineage:
+                                   contract/run snapshot/baseline/resume/evidence/hypothesis/experiment/
+                                   decision/knowledge/handoff records plus hash-chain verification. It
+                                   never edits a record, reward, checkpoint, or remote process.
+- get_research_state()           -> durable current research cases, hypotheses, protected capabilities,
+                                   pending interventions, no-repeat fingerprints, and verified revision.
+- validate_research_mechanism(bundle, context={})
+                                -> read-only validation of a generated reward/metric/gate bundle: schema,
+                                   units, signal availability, privilege, numerical gradients, exploit
+                                   paths, protected evaluators, and runtime compatibility.
+- run_decision_replay(split="holdout")
+                                -> blind historical decision benchmark. The policy sees only facts that
+                                   were available at the decision point; outcomes are revealed afterwards.
 - get_code_facts(query="")      -> GENERAL code evidence for ANY question: an AST symbol index over all
                                    allowlisted source. Returns the class/function/constant DEFINITIONS
                                    (signature + docstring + file:line) matching the query, plus the words
@@ -2023,10 +2133,18 @@ the operator confirms before anything runs):
                                   train->re-measure until benchmark passes / levers exhausted, emit
                                   the deliverable report. Propose when asked to "deliver a policy".
 - run_campaign {run, checkpoint, max_iters}
-                                  AUTONOMOUS tuning campaign: the system runs the whole
-                                  measure->analyze->tune->train->re-measure loop unattended, keeping
-                                  improvements and rolling back regressions, with stall-recovery. This
-                                  is how the system completes a tuning task on its own. Long-running.
+                                   AUTONOMOUS tuning campaign: the system runs the whole
+                                   measure->analyze->tune->train->re-measure loop unattended, keeping
+                                   improvements and rolling back regressions, with stall-recovery. This
+                                   is how the system completes a tuning task on its own. Long-running.
+- propose_research_cycle {synthesis, expected_state_revision}
+                                   synthesize new reward/metric/gate mechanisms from measured gaps,
+                                   validate and compile them, then record the selected candidate. This
+                                   does not approve or execute an experiment.
+- execute_research_cycle {cycle_id, plan_id}
+                                   execute only an already-generated cycle and an independently approved,
+                                   registered ExperimentPlan. No command, environment, evaluator, or
+                                   mechanism body is accepted in this action.
 For edit_config, put the field name + new value in args, e.g.
 {"propose_action": {"name": "edit_config", "args": {"key": "rew_torque", "value": "-3.0e-4"}},
  "reply": "..."}. Always read the current value with get_config first."""
@@ -2034,7 +2152,8 @@ For edit_config, put the field name + new value in args, e.g.
 # action names the agent will surface as a confirmation, not auto-run
 ACTION_NAMES = {"deploy_payload", "start_training", "run_physeval", "resume_training", "kill_training",
                 "edit_config", "rollback_config", "run_diagnostic", "run_acceptance",
-                "apply_tuning", "rollback_tuning", "run_campaign", "produce_policy"}
+                "apply_tuning", "rollback_tuning", "run_campaign", "produce_policy",
+                "propose_research_cycle", "execute_research_cycle"}
 
 # Per-action RISK TIERS — the authorization surface for the active copilot. Higher tiers demand
 # stronger confirmation and a tighter blast radius. 'destructive' actions change the training/box
@@ -2044,8 +2163,10 @@ ACTION_RISK = {
     "edit_config": "low", "rollback_config": "low",
     "apply_tuning": "low", "rollback_tuning": "low",
     "run_diagnostic": "medium", "run_physeval": "medium", "run_acceptance": "medium",
+    "propose_research_cycle": "medium",
     "deploy_payload": "destructive", "start_training": "destructive",
     "resume_training": "destructive", "kill_training": "destructive",
+    "execute_research_cycle": "destructive",
     "run_campaign": "destructive",   # autonomously drives many training runs
     "produce_policy": "destructive",  # the PRODUCT action: hours of autonomous train/tune
 }
@@ -2083,6 +2204,9 @@ PROPOSE actions when they ask for one.
 Role boundary:
 - The LLM reads instruments, explains evidence, prioritizes next steps, and drafts proposals.
   It does NOT own final authority over facts, gates, or actions.
+- You may synthesize a research cycle, but you may not approve its ExperimentPlan. Executing a
+  research cycle requires an independently registered plan and accepts only cycle_id + plan_id;
+  never place a command, environment override, evaluator, or mechanism body in execution args.
 - A framework is a selectable, composable capability package made from AMP / curriculum / DR /
   reward / diagnostics / deployment mechanisms.
 - Use the concrete system terms: LLM, Framework, ConfigSet, Adapter, diagnostics, and gates.
@@ -2360,6 +2484,20 @@ def _intent_tool_hint(message: str) -> Dict[str, Any]:
     """Route high-confidence knowledge questions before the model chooses a tool."""
     question = _operator_question_from_message(message).strip()
     q = question.lower()
+    research_state = any(term in q for term in (
+        "research state", "research cycle", "研究状态", "研究周期", "当前假设", "待执行候选",
+    ))
+    decision_replay = any(term in q for term in (
+        "decision replay", "blind replay", "决策回放", "盲回放", "历史决策基准",
+    ))
+    ledger = any(term in q for term in (
+        "研究台账", "台账", "handoff", "lineage", "resume edge", "experiment plan", "实验计划",
+        "决策记录", "知识声明", "append-only", "研究记录",
+    ))
+    audit = any(term in q for term in (
+        "研究 agent", "research audit", "研究审计", "架构落地", "提案落地", "覆盖缺口",
+        "运行证明", "梯度审计", "课程可达", "命令覆盖", "优化器状态",
+    ))
     reward = any(term in q for term in (
         "奖励", "惩罚", "权重", "reward", "duty", "占空", "slip", "打滑",
         "impact", "tracking", "步态质量",
@@ -2372,6 +2510,14 @@ def _intent_tool_hint(message: str) -> Dict[str, Any]:
     ))
     definition = any(term in q for term in _STATIC_KNOWLEDGE_TERMS)
     asks_value = any(term in q for term in ("多少", "是什么", "当前", "现在", "值"))
+    if decision_replay:
+        return {"tool": "run_decision_replay", "args": {"split": "holdout"}, "reason": "历史决策盲回放"}
+    if research_state:
+        return {"tool": "get_research_state", "args": {}, "reason": "当前研究状态"}
+    if ledger:
+        return {"tool": "get_research_ledger", "args": {}, "reason": "RL Agent 研究台账问题"}
+    if audit:
+        return {"tool": "get_research_audit", "args": {}, "reason": "RL Agent 研究审计问题"}
     if reward and (definition or asks_value):
         return {"tool": "get_reward_model", "args": {"query": question}, "reason": "奖励定义或公式问题"}
     if curriculum and (definition or asks_value):
@@ -2808,6 +2954,68 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
 
     if name not in ACTION_NAMES:
         return {"ok": False, "detail": f"unknown action: {name}"}
+    if not isinstance(args, dict):
+        return {"ok": False, "detail": "action args must be an object"}
+
+    if name == "propose_research_cycle":
+        expected_keys = {"synthesis", "expected_state_revision"}
+        if set(args) != expected_keys:
+            return {
+                "ok": False,
+                "detail": "propose_research_cycle accepts exactly synthesis + expected_state_revision",
+            }
+        try:
+            from autotuner.mechanisms.mechanism_synthesis import SynthesisRequest
+            from .research_service import build_research_cycle_manager
+
+            request = SynthesisRequest.model_validate(args["synthesis"])
+            revision = int(args["expected_state_revision"])
+            proposal = build_research_cycle_manager(settings=settings).propose(
+                request,
+                expected_state_revision=revision,
+                actor="llm-agent",
+            )
+            result = proposal.model_dump(mode="json")
+            return {
+                "ok": proposal.status == "candidate_selected",
+                "detail": (
+                    f"research cycle {proposal.cycle_id}: {proposal.status}; "
+                    f"selected_patch={proposal.selected_patch_ref or 'none'}"
+                ),
+                "result": result,
+            }
+        except Exception as exc:  # noqa: BLE001 - action boundary returns an auditable failure
+            return {"ok": False, "detail": f"research proposal failed: {type(exc).__name__}: {exc}"}
+
+    if name == "execute_research_cycle":
+        expected_keys = {"cycle_id", "plan_id"}
+        if set(args) != expected_keys:
+            return {
+                "ok": False,
+                "detail": "execute_research_cycle accepts exactly cycle_id + plan_id",
+            }
+        cycle_id = str(args.get("cycle_id") or "").strip()
+        plan_id = str(args.get("plan_id") or "").strip()
+        if not cycle_id or not plan_id:
+            return {"ok": False, "detail": "cycle_id and plan_id are required"}
+        try:
+            from .research_service import build_research_cycle_manager
+
+            result_model = build_research_cycle_manager(settings=settings).execute_registered(
+                cycle_id=cycle_id,
+                plan_id=plan_id,
+                actor="operator-confirmed-agent",
+            )
+            result = result_model.model_dump(mode="json")
+            disposition = result_model.execution.disposition
+            return {
+                "ok": disposition == "promote",
+                "detail": f"research cycle {cycle_id} finished with disposition={disposition}",
+                "result": result,
+            }
+        except Exception as exc:  # noqa: BLE001 - action boundary returns an auditable failure
+            return {"ok": False, "detail": f"research execution failed: {type(exc).__name__}: {exc}"}
+
     # The configured source is a hard isolation boundary: fake/test execution
     # must never construct an SSH-backed data source.
     src = make_source(settings)
@@ -2855,7 +3063,7 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
             # edit the LOCAL strategy contract (reward weights / curriculum gates) with allowlist +
             # bounds + a rollback-stack push; deploy_payload then ships it to the box. This is the
             # copilot's own "tune" step of the measure->tune->retrain loop.
-            from autotuner.training.strategy_edit import apply_weight_changes
+            from autotuner.taili_ops.strategy_edit import apply_weight_changes
             changes = args.get("changes") if isinstance(args.get("changes"), dict) else {}
             res = await asyncio.to_thread(apply_weight_changes, changes, note=str(args.get("note", "")))
             if res["ok"]:
@@ -2874,7 +3082,7 @@ def execute_action(name: str, args: Dict[str, Any], settings: LocomotionConsoleS
             )
             return {"ok": r.ok, "detail": r.message}
         if name == "rollback_tuning":
-            from autotuner.training.strategy_edit import rollback_last
+            from autotuner.taili_ops.strategy_edit import rollback_last
             res = await asyncio.to_thread(rollback_last)
             if res["ok"]:
                 diffs = ", ".join(f"{a['key']}->{a['new']}" for a in res.get("restored", []))
@@ -2918,6 +3126,8 @@ def _tool_result_budget(tool: str) -> int:
         return 4200
     if tool == "get_code_facts":
         return 7600
+    if tool in {"get_research_state", "validate_research_mechanism", "run_decision_replay"}:
+        return 6500
     return 1800
 
 

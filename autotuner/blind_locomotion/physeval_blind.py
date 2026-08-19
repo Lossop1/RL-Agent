@@ -92,8 +92,7 @@ def main():
             "stairs": tg.MeshPyramidStairsTerrainCfg(proportion=1.0, step_height_range=(0.05, 0.18),
                                                      step_width=0.3, platform_width=3.0, border_width=1.0,
                                                      holes=False),
-            # ASCENDING stairs (0706): inverted pyramid = stepped pit, robot spawns at the BOTTOM and must
-            # CLIMB OUT. This makes 爬楼梯 a scored benchmark gate (D[stairs_up]); step up to 0.25 = the 25cm floor.
+            # 上楼场景使用倒置台阶形成坑底起步，验收按实际爬升高度判断，最高台阶约 25 cm。
             "stairs_up": tg.MeshInvertedPyramidStairsTerrainCfg(proportion=1.0, step_height_range=(0.10, 0.25),
                                                      step_width=0.32, platform_width=1.5, border_width=1.0,
                                                      holes=False),
@@ -124,10 +123,8 @@ def main():
     base = env.unwrapped
     base.use_external_commands = True
     robot = base.robot
-    # ── E3/E5 DR-force override (0708): apply the spec DR envelope DIRECTLY on the eval env, using the
-    # SAME physx-view writes the training env uses (taili_amp_env _reset_idx). This measures whether the
-    # hard gates hold under the low-friction / CoM-shifted condition — the E3/E5 battery that physeval_suite
-    # flagged NOT-BUILT. Absolute set on ALL envs; persists across resets (material props are not reset). ──
+    # E3/E5 评估直接写入与训练 reset 相同的 PhysX 属性，确保低摩擦和质心偏移的验收
+    # 与训练语义一致；属性写入所有环境，并在本次评估中保持不变。
     if args.friction > 0.0 or args.com_offset != 0.0:
         _N = base.num_envs
         _idx = torch.arange(_N, device=base.device)
@@ -194,13 +191,10 @@ def main():
                 obs, _, _, _, _ = env.step(out[-1].get("mean_actions", out[0]))
                 _ff = cs.data.net_forces_w[:, foot_c, :].norm(dim=-1)
                 contact = (_ff > 1.0)
-                # SETTLED stance = foot bearing real weight (> ~10% body weight, _SETTLE_N). Per
-                # taili_spec, slip is measured ONLY on settled frames — touchdown/liftoff TRANSITION
-                # frames (low force, foot still moving) are excluded. The 1N `contact` mask (used for
-                # duty) wrongly counted those transitions as stance and inflated B2. (0705 metric fix.)
+                # settled 支撑要求足端承受真实载荷；滑移只在 settled 帧统计，避免把触地/离地
+                # 过渡帧混入支撑滑移。duty 仍使用较宽的接触阈值。
                 settled = (_ff > _SETTLE_N)
-                # B1 touchdown vz measured at the FIRM-landing edge (first frame > 10N), not the 1N
-                # first-graze where the foot is still descending fast (which inflated the p95). (D3m)
+                # touchdown 速度在足端首次形成稳定载荷时采样，而不是在轻微擦碰时采样。
                 firm = (_ff > 10.0)
                 firm_rising = firm & (~prev_firm)
                 if firm_rising.any() and t >= warm and label != "stand":
@@ -225,9 +219,8 @@ def main():
                 settled_f = settled.float()                 # weight-bearing — for SLIP (spec: settled only)
                 swing = 1.0 - inc
                 # 接触点速度而不是足端球心速度；滚动时球心速度不等于滑移。
-                # velocity even with a non-sliding contact; the spec's slip is the bottom-of-sphere
-                # (contact-point) velocity = v_com + omega x r, r=(0,0,-radius). Removing the roll
-                # deletes the ~0.05 m/s phantom slip that was the whole B2 budget (D3m).
+                # 滑移使用接触点速度 v = v_com + omega × r，而不是足端球心速度；这样滚动
+                # 不会被误报为支撑面滑移。
                 _omega = robot.data.body_ang_vel_w[:, foot_b, :]                      # (N,4,3)
                 _normal = getattr(base, "_support_reference_normal", None)
                 if _normal is None:
@@ -288,13 +281,11 @@ def main():
             duty_tr.append(inc.mean(0).tolist())
             up_tr.append(float((-robot.data.projected_gravity_b[:, 2]).mean()))
     spd_tr, v_tr, wz_tr = np.array(spd_tr), np.array(v_tr), np.array(wz_tr)
-    # A3 settle per spec §3.1: first frame after which |v|<=0.05 AND |wz|<=0.05 BOTH hold for the rest
-    # (separate bands + dwell), NOT the old conflated (|v|+|wz|)<0.08 forward-max.
+    # A3 静止判定要求线速度和 yaw 角速度分别进入阈值，并从该帧起持续保持，不能用两者
+    # 相加的单一阈值掩盖其中一项未停稳。
     _settled = (v_tr <= 0.05) & (wz_tr <= 0.05)
     settle = next((i for i in range(len(_settled)) if _settled[i:].all()), HALT)
-    # A3-settle ARTIFACT CHECK (0706): the strict "holds for ALL remaining frames" makes settle hypersensitive
-    # to a single late micro-blip. Report the FIRST settled frame + how many later blips push the strict settle
-    # out, so we can tell a genuine slow-settle from a 1-frame artifact.
+    # 同时报告首次进入静止和之后的反复离开次数，用来区分真正的慢制动与单帧抖动。
     _first = next((i for i in range(len(_settled)) if _settled[i]), HALT)
     _dt = float(getattr(base, "step_dt", 0.02))
     _blips = int((~_settled[_first:]).sum()) if _first < HALT else 0

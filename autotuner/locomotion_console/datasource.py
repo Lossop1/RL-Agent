@@ -490,7 +490,7 @@ class RealDataSource(RunDataSource):
             )
         if self._remote is None:
             # Lazy: only import/connect when the real source is actually used.
-            from autotuner.training.remote import RemoteSSH
+            from autotuner.infrastructure.remote import RemoteSSH
             from .config_manager import effective_remote_config
 
             # The console's own config (config/ssh.json + saved remote profile) is the source of
@@ -878,9 +878,8 @@ class RealDataSource(RunDataSource):
             return 0
         sub = self.profile.checkpoints_subdir
         checkpoint_dir = f"{run.rstrip('/')}/{sub.strip('/')}"
-        # Do not grep digits from the full path: run ids contain dates such as
-        # 20260703, which previously won over agent_5000.pt and broke status /
-        # resume selection.  Only basename agent_<step>.pt is authoritative.
+        # 不能从完整路径提取数字，因为运行目录名可能包含日期；
+        # 只有 agent_<step>.pt 文件名中的数字才是检查点步数。
         out = remote.exec_out(
             "bash -lc "
             + shlex.quote(
@@ -2024,7 +2023,7 @@ class RealDataSource(RunDataSource):
                 return ActionResult(action="run_acceptance", ok=False, message=f"invalid checkpoint name: {checkpoint!r}")
             run_id = run if (run and re.fullmatch(r"[A-Za-z0-9._\-]+", run)) else "newest"
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.training.acceptance_run", run_id,
+            args = [sys.executable, "-m", "autotuner.taili_ops.acceptance_run", run_id,
                     "--terrains", *terr, "--checkpoint", checkpoint or "best_agent.pt", "--num-envs", "64"]
             # detached: the measurement outlives the request; result is read later via get_acceptance
             subprocess.Popen(args, cwd=repo_root, stdout=subprocess.DEVNULL,
@@ -2061,7 +2060,7 @@ class RealDataSource(RunDataSource):
                 return ActionResult(action="run_campaign", ok=False, message="a valid run id is required")
             iters = max(1, min(int(max_iters), 12))
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.training.tune_orchestrator", run, checkpoint,
+            args = [sys.executable, "-m", "autotuner.taili_ops.tune_orchestrator", run, checkpoint,
                     "--max-iters", str(iters), "--out", f"/tmp/campaign_{run}.json"]
             subprocess.Popen(args, cwd=repo_root, stdout=open(f"/tmp/campaign_{run}.log", "w"),
                              stderr=subprocess.STDOUT, start_new_session=True,
@@ -2090,7 +2089,7 @@ class RealDataSource(RunDataSource):
         try:
             iters = max(1, min(int(max_iters), 16))
             repo_root = str(Path(__file__).resolve().parents[2])
-            args = [sys.executable, "-m", "autotuner.training.tune_orchestrator", "auto", "auto",
+            args = [sys.executable, "-m", "autotuner.taili_ops.tune_orchestrator", "auto", "auto",
                     "--produce", "--max-iters", str(iters), "--steps-per-iter", "18000",
                     "--num-envs", "1024", "--out", "/tmp/policy_report.json"]
             subprocess.Popen(args, cwd=repo_root, stdout=open("/tmp/produce_policy.log", "w"),

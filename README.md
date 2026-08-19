@@ -5,9 +5,10 @@ frontend that drives training, diagnostics, and acceptance evaluation on a **rem
 over SSH/tmux, keeping the deterministic control path outside the LLM loop.
 
 - **Backend:** `autotuner/locomotion_console/` — `python -m autotuner.locomotion_console` (uvicorn on :8000)
-- **Frontend:** `locomotion-console-ui/` — Vite/React, built to `frontend/dist/` and served on :5173
+- **Frontend source:** `locomotion-console-ui/`; generated output is `frontend/dist/`
 - **Training strategy contract:** `autotuner/blind_locomotion/taili_blind_config.yaml` (single editable source)
-- **Acceptance spec / design docs:** [`docs/`](./docs) — `taili_spec.md`, `taili_strategy_decisions.md`, `taili_tuning_followups.md`
+- **Architecture and maintenance:** [`docs/README.md`](docs/README.md)、[`docs/repository_architecture.md`](docs/repository_architecture.md)
+- **Structure gate:** `python tools/check_repository_structure.py`
 
 ## Run
 

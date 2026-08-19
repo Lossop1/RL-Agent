@@ -1,0 +1,49 @@
+{
+  "coverage_window": "run_id:step_start-step_end",
+  "command_coverage_source": "training telemetry export",
+  "metric_alignment": [
+    {
+      "id": "A1",
+      "status": "proven",
+      "evidence": ["raw_trace:...", "metric_alignment:...", "scorer:..."]
+    }
+  ],
+  "gate_calibration": [
+    {
+      "gate_id": "phase_gate_prog_0",
+      "status": "proven",
+      "reference_policy_ref": "checkpoint:...",
+      "observed_range": {"p05": 0.0, "p50": 0.0, "p95": 0.0},
+      "reachable_interval": {"min": 0.0, "max": 1.0},
+      "evidence": ["telemetry:...", "diagnostic:..."]
+    }
+  ],
+  "command_coverage": [
+    {"bucket": "forward", "target_count": 0, "applied_count": 0, "eligible_count": 0},
+    {"bucket": "backward", "target_count": 0, "applied_count": 0, "eligible_count": 0},
+    {"bucket": "lateral", "target_count": 0, "applied_count": 0, "eligible_count": 0},
+    {"bucket": "yaw", "target_count": 0, "applied_count": 0, "eligible_count": 0},
+    {"bucket": "stand", "target_count": 0, "applied_count": 0, "eligible_count": 0},
+    {"bucket": "mixed", "target_count": 0, "applied_count": 0, "eligible_count": 0}
+  ],
+  "optimization_state": {
+    "source": "resume manifest",
+    "parity_check": false,
+    "policy": "checkpoint hash",
+    "value": "value hash",
+    "optimizer": "optimizer state hash",
+    "scheduler": "scheduler state hash",
+    "normalizer": "normalizer hash",
+    "log_std": "policy noise hash",
+    "amp": "discriminator and optimizer hash",
+    "curriculum": "phase/DR/gate state hash",
+    "rng": "RNG state hash"
+  },
+  "checkpoint_capabilities": [
+    {
+      "checkpoint": "agent_00000.pt",
+      "capabilities": {"flat": "unknown", "stairs": "unknown", "stand": "unknown", "dr": "unknown"},
+      "evidence": ["diagnostic_job:..."]
+    }
+  ]
+}

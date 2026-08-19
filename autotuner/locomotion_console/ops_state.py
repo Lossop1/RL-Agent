@@ -13,9 +13,9 @@ from typing import Any
 
 # local automation entrypoints worth reporting (the "who is driving the box" inventory)
 _AUTOMATION_MARKERS = {
-    "-m autotuner.training.tune_orchestrator": "campaign/produce（自主调参·产出管线）",
+    "-m autotuner.taili_ops.tune_orchestrator": "campaign/produce（Taili 旧式调参管线）",
     "auto_drive.py": "auto_drive（自愈驾驶：停滞检测+自动重启）",
-    "-m autotuner.training.acceptance_run": "acceptance_run（验收测评）",
+    "-m autotuner.taili_ops.acceptance_run": "acceptance_run（Taili 验收测评）",
 }
 
 
@@ -37,10 +37,8 @@ def build_operations_state(src: Any) -> dict[str, Any]:
     out: dict[str, Any] = {"automations_running": _local_automations()}
     try:
         remote = src._get_remote()
-        # BATCHED READ (0707 audit#6): the "卡住了/what state" hot path used to fan out ~8 SERIAL SSH
-        # round-trips (run dir, step, log age, pid, gpu, environ, cmdline, TPCURR) — pure latency tax on the
-        # exact moment an operator needs a fast answer. Collapse them into ONE labeled remote shell read and
-        # parse the blob. A missing section just yields empty → the same graceful degradation as before.
+        # 监控热路径一次读取运行目录、步数、日志年龄、进程、GPU 和环境变量，再按标签解析；
+        # 缺少某一段时保留为空，监控仍可降级工作。
         _script = (
             "run=$(ls -1td /root/gpufree-data/taili_runs/*/ 2>/dev/null | head -1 | sed 's:/*$::'); "
             "printf '__RUN__%s\\n' \"$run\"; "
@@ -75,20 +73,14 @@ def build_operations_state(src: Any) -> dict[str, Any]:
         out["training_process_alive"] = bool(pid)
         gpu = (_sec.get("__GPU__", "") or "").strip()
         out["gpu"] = gpu
-        # ── TRAINING-PROGRESS FACTS (0706): the LLM was guessing phase/target from raw step numbers and
-        # calling a resume "barely started, run tens of thousands more steps" (which would overtrain). Give
-        # it the actual regime so it reasons from facts, not the 1.5M launch ceiling. ────────────────────
+        # 给研究系统提供实际 phase、resume 和 payload 信息，避免仅凭总步数推断训练状态。
         tp: dict[str, Any] = {}
         if pid:
             cmdline = _sec.get("__CMD__", "") or ""
             ck = re.search(r"--checkpoint\s+(\S+)", cmdline)
             tp["resumed_from_checkpoint"] = ck.group(1).split("/")[-3] + "/" + ck.group(1).split("/")[-1] if ck else None
             tp["is_resume"] = bool(ck)
-            # capture the ARCHITECTURE flags the run is actually using (0707): the arch stack (multi-critic,
-            # dynamics latent, amp-stride, hard-equiv, yaw-fullrange...) is toggled by TAILI_* env vars, and a
-            # flag being UNSET silently disables that upgrade (e.g. an unset TAILI_MULTI_CRITIC makes the K-group
-            # reward split byte-inert). Surface them so the operator/LLM SEES what architecture is live, not just
-            # the payload name.
+            # 训练架构由 TAILI_* 环境变量覆盖；把实际生效的变量一并呈现，避免只看 payload 名称。
             arch_flags = {}
             for line in (_sec.get("__ENV__", "") or "").split(";"):
                 if line.startswith("PYTHONPATH="):

@@ -33,7 +33,7 @@ class ParamikoSSH:
             if tr is not None and tr.is_active():
                 return self._client
         import paramiko
-        from autotuner.training.remote import _AcceptNewHostKeyPolicy, _DEFAULT_KNOWN_HOSTS
+        from autotuner.infrastructure.remote import _AcceptNewHostKeyPolicy, _DEFAULT_KNOWN_HOSTS
         c = paramiko.SSHClient()
         # Host-key verification: accept-new (TOFU) by default — usable on first connect, detects a
         # later key swap (MITM). Pinned known_hosts → RejectPolicy; blind AutoAdd is opt-in.

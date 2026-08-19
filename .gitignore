@@ -23,8 +23,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pytest-tmp/
 .pytest_tmp*/
 .pytest-tmp-*/
+.pt/
 .mypy_cache/
 .venv/
 venv/

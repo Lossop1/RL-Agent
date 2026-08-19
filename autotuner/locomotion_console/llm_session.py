@@ -89,10 +89,20 @@ class LLMSessionStore:
             ))
         return recorded
 
-    def update_latest_pending(self, *, name: str, ok: bool, detail: str) -> dict[str, Any] | None:
+    def update_latest_pending(
+        self,
+        *,
+        name: str,
+        ok: bool,
+        detail: str,
+        args: dict[str, Any] | None = None,
+        proposal_id: str = "",
+    ) -> dict[str, Any] | None:
         proposals = self._read_proposals()
         for item in reversed(proposals):
-            if item.get("status") == "pending" and item.get("name") == name:
+            matches_args = args is None or item.get("args", {}) == args
+            matches_id = not proposal_id or item.get("id") == proposal_id
+            if item.get("status") == "pending" and item.get("name") == name and matches_args and matches_id:
                 item["status"] = "executed" if ok else "failed"
                 item["updated_at"] = _utc_now()
                 item["result"] = detail
@@ -100,11 +110,14 @@ class LLMSessionStore:
                 return item
         return None
 
-    def find_pending(self, *, name: str) -> dict[str, Any] | None:
-        """Read-only: the latest still-pending proposal for this action name, or None. Used to BIND
-        /chat/execute to an action the copilot actually proposed (defeats out-of-band execution)."""
+    def find_pending(self, *, name: str, args: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """Return a pending proposal bound to both action name and exact arguments."""
         for item in reversed(self._read_proposals()):
-            if item.get("status") == "pending" and item.get("name") == name:
+            if (
+                item.get("status") == "pending"
+                and item.get("name") == name
+                and (args is None or item.get("args", {}) == args)
+            ):
                 return item
         return None
 

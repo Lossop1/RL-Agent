@@ -53,12 +53,8 @@ def score_B2(p90, terrain):
 
 def score_B3(peak_m, terrain, obstacle_h=None, margin=0.04):
     if terrain == "flat":
-        # RECALIBRATED (0705, structural investigation + SOTA): a BLIND policy cannot see the ground,
-        # so the energy-optimal and SAFE behavior is to over-lift on flat to clear unseen terrain — the
-        # legged-RL literature (ANYmal/RMA) confirms this and gates clearance LOWER-BOUND-only, never a
-        # two-sided flat band (which even a sighted gait only meets by luck). The upper bound also
-        # depended on a max-of-max statistic. Flat B3 now = "the swing foot clears the ground" (>=0.05),
-        # with the over-lift reported. Terrain B3 keeps the obstacle-relative lower bound.
+        # 盲策略无法直接看到地面，平地净空只要求足端确实离地；过度抬脚作为质量读数
+        # 单独报告，不把它伪装成通过条件。障碍地形仍使用相对障碍高度的下限。
         ok = peak_m >= 0.05
         return {"B3": _r(ok, f"swing-peak clearance p90={peak_m:.3f}m >= 0.05 (blind: over-lift ok, reported)")}
     if obstacle_h is None:
@@ -107,8 +103,7 @@ def score_D(forward_speed, fall_rate, base_h_drop, terrain):
 
 # ── E. robustness / disturbance (spec E1-E5) ────────────────────────────────
 def score_D_ascend(climb_m, fall_rate, threshold=0.15):
-    """D[stairs_up] ASCENDING (0706): the blind dog must CLIMB OUT of a stepped pit. Judged on height
-    actually GAINED (not horizontal speed — ascent is slow), no fall. Makes 爬楼梯 a scored benchmark gate."""
+    """上楼验收按实际增加的高度判断，允许上楼速度低于平地，但不能以水平速度代替换层。"""
     ok = climb_m >= threshold and fall_rate == 0.0
     return {"D[stairs_up]": _r(ok, f"climbed={climb_m:.3f}m>={threshold} fall_rate={fall_rate:.3f}=0")}
 

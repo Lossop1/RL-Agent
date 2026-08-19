@@ -18,7 +18,9 @@ _TAILI_YAML = _ROOT / "autotuner" / "blind_locomotion" / "taili_blind_config.yam
 
 _ALLOWLIST_DOCS = {
     "taili_ops_runbook.md": "运营手册：已知故障签名(GPU挂起/OOM/SSH)、训练体制事实、系统自动化、当前基线。",
-    "taili_tuning_followups.md": "调参实战全记录(D3a-D3p)：每个修复的证据链、度量伪影、结构性结论。",
+    "archive/taili/taili_tuning_followups.md": "历史调参记录(D3a-D3p)：每个修复的证据链、度量伪影、结构性结论；仅作背景。",
+    "archive/taili/taili_session_lessons.md": "历史会话经验：用于检索假设，不覆盖当前契约。",
+    "archive/taili/taili_mujoco_investigation_20260803.md": "历史 MuJoCo 迁移调查：用于交叉验证，不覆盖当前运行事实。",
     "taili_spec.md": "验收 spec：速度、姿态、地形、鲁棒和部署要求。",
     "taili_strategy_decisions.md": "策略决策书：AMP+地形感知器+课程门控+奖励结构的设计理由。",
     "SYSTEM_ARCHITECTURE.md": "系统架构：控制台、LLM 权限、数据来源、部署/诊断边界。",
@@ -55,8 +57,9 @@ def _sections() -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     if not _DOCS.is_dir():
         return out
-    for f in sorted(_DOCS.glob("*.md")):
-        if f.name not in _ALLOWLIST_DOCS:
+    for f in sorted(_DOCS.rglob("*.md")):
+        key = f.relative_to(_DOCS).as_posix()
+        if key not in _ALLOWLIST_DOCS:
             continue
         text = f.read_text(encoding="utf-8")
         cur = {"source": f.stem, "title": f"{f.stem} (intro)", "body": ""}
@@ -229,7 +232,7 @@ def build_taili_context_pack(query: str = "", include_docs: bool = True) -> dict
     return {
         "kind": "taili_controlled_context_pack",
         "permission_boundary": (
-            "Local read-only allowlist: docs/*.md selected by name and "
+                "Local read-only allowlist: selected Markdown paths under docs/ and "
             "autotuner/blind_locomotion/taili_blind_config.yaml. No arbitrary local scan, "
             "no remote path scan, no action execution."
         ),

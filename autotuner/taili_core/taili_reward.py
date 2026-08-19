@@ -1634,9 +1634,8 @@ def compute_reward_components(inp, cfg):
     swing = (clearance_contact <= 0.5).to(f)
     apex_weight = getattr(inp, "swing_apex_weight", swing)
     apex_weight = apex_weight.to(dtype=f, device=gate.device) * swing
-    # 普通平地只在摆动中点检查 clearance。上楼碰障是被动感知事件，若仍要求
-    # 事件恰好与预设摆动中点重合，碰撞足会得到零梯度。当前响应足因此按连续
-    # 碰撞强度临时扩大评价权重；响应消失后立即恢复，不引入锁存或阶段状态。
+    # 平地在摆动中段评价净空；楼梯碰障是被动事件，不能要求它恰好落在预设中段。
+    # 响应足的权重随连续碰撞强度变化，事件消失后自动恢复，不引入锁存或阶段状态。
     event_foot = getattr(
         inp,
         "terrain_clearance_foot_mask",
@@ -2546,11 +2545,37 @@ def compute_reward_components(inp, cfg):
     is_terminal = 1.0 if (inp.terminal_reason is not None and inp.terminal_reason != "timeout") else 0.0
     comp["terminal_penalty"] = -cfg.w_terminal * torch.full_like(gate, is_terminal)
 
+    # Optional live-research mechanisms are compiled and validated before launch.
+    # They enter the same component sum as built-in rewards; metrics and gate
+    # decisions remain diagnostic data and cannot silently alter the total.
+    dynamic_result = None
+    try:
+        try:
+            from .mechanism_runtime import runtime_from_environment
+        except ImportError:
+            from autotuner.mechanisms.mechanism_runtime import runtime_from_environment
+        dynamic_runtime = runtime_from_environment()
+        if dynamic_runtime is not None:
+            dynamic_result = dynamic_runtime.evaluate_step(inputs=inp, components=comp)
+            for name, value in dynamic_result.reward_components.items():
+                if name in comp:
+                    raise RuntimeError(f"dynamic mechanism reward collides with built-in component: {name}")
+                comp[name] = value
+    except ImportError:
+        # Minimal deployment payloads predating mechanism support remain usable
+        # when no mechanism bundle was requested.
+        if __import__("os").environ.get("TAILI_MECHANISM_BUNDLE"):
+            raise
+
     total = torch.zeros_like(gate)
     for k, v in comp.items():
         if k not in REWARD_DIAGNOSTIC_COMPONENTS:
             total = total + v
     comp["total"] = total
+    if dynamic_result is not None:
+        comp["_dynamic_metrics"] = dynamic_result.metric_values
+        comp["_dynamic_gates"] = dynamic_result.gate_results
+        comp["_dynamic_reward_groups"] = dynamic_result.reward_groups
     return comp
 
 
@@ -2628,10 +2653,11 @@ def group_reward_vector(comp, extra_by_group=None):
                 break
     n = ref.shape[0]
     vec = torch.zeros(n, len(names), dtype=ref.dtype, device=ref.device)
+    dynamic_groups = comp.get("_dynamic_reward_groups", {})
     for k, v in comp.items():
         if k in REWARD_GROUP_GATES or not torch.is_tensor(v):
             continue
-        g = _REWARD_GROUP_OF.get(k, REWARD_GROUP_FALLBACK)
+        g = dynamic_groups.get(k, _REWARD_GROUP_OF.get(k, REWARD_GROUP_FALLBACK))
         vec[:, col[g]] = vec[:, col[g]] + v.to(dtype=ref.dtype)
     if extra_by_group:
         for g, v in extra_by_group.items():

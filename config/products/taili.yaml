@@ -1,0 +1,64 @@
+schema_version: 1
+
+product:
+  id: taili
+  version: "1"
+  label: Taili 四足盲行走产品
+  status: draft
+
+robot:
+  id: robot.taili
+  label: Taili quadruped
+  status: draft
+  dof: 12
+  base_link: base
+  joint_order:
+    - FL_hip_joint
+    - FR_hip_joint
+    - RL_hip_joint
+    - RR_hip_joint
+    - FL_thigh_joint
+    - FR_thigh_joint
+    - RL_thigh_joint
+    - RR_thigh_joint
+    - FL_calf_joint
+    - FR_calf_joint
+    - RL_calf_joint
+    - RR_calf_joint
+  leg_order: [FL, FR, RL, RR]
+  foot_links: [FL_foot, FR_foot, RL_foot, RR_foot]
+  diagnostic_spec: taili.yaml
+  capabilities: [quadruped_12dof, blind_actor, amp_reference]
+  note: 资产映射仍需在目标硬件上完成最终验收
+
+task:
+  id: taili_blind_locomotion
+  family: blind_locomotion
+  framework_id: taili_amp_blind
+  train_entrypoint: autotuner.blind_locomotion.launch_taili_train:main
+  diagnose_entrypoint: autotuner.blind_locomotion.diagnose_taili:main
+
+sources:
+  config: autotuner/blind_locomotion/taili_blind_config.yaml
+  roots:
+    - autotuner/blind_locomotion
+    - autotuner/taili_core
+  task_env: autotuner/blind_locomotion/blind_tp_env.py
+  task_config: autotuner/blind_locomotion/taili_blind_env_cfg.py
+  reward: autotuner/taili_core/taili_reward.py
+  asset_config: autotuner/blind_locomotion/assets/taili.py
+
+assets:
+  - id: robot_urdf
+    kind: urdf
+    path: locomotion-console-ui/public/robot/taili_dog_description/urdf/robot.urdf
+  - id: robot_meshes
+    kind: mesh_directory
+    path: locomotion-console-ui/public/robot/taili_dog_description/meshes
+  - id: diagnostic_spec
+    kind: diagnostic_spec
+    path: tools/isaaclab_quad_diag_observation/specs/taili.yaml
+
+build:
+  payload_builder: autotuner.training_payloads.taili_blind_runtime.build_payload:build_payload
+  payload_package: taili_blind_runtime

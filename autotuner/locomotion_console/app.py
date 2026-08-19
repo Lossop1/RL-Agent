@@ -22,6 +22,13 @@ from typing import Callable, Literal, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+
+from autotuner.mechanisms.mechanism_specs import MechanismBundle
+from autotuner.mechanisms.mechanism_synthesis import SynthesisRequest
+from autotuner.mechanisms.mechanism_validation import ValidationContext
+from autotuner.research.research_ledger import ExperimentPlan
+from autotuner.research.research_state import ResearchState
 
 from .config import get_settings
 from .config_manager import (
@@ -105,6 +112,46 @@ from .schemas import (
 
 settings = get_settings()
 
+
+class ResearchStateInitializeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    state: ResearchState
+    actor: str = "operator"
+
+
+class ResearchStateUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=0)
+    changes: dict
+    actor: str = "operator"
+    reason: str
+
+
+class ResearchMechanismValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bundle: MechanismBundle
+    context: ValidationContext = Field(default_factory=ValidationContext)
+
+
+class ResearchCycleProposeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    synthesis: SynthesisRequest
+    expected_state_revision: int = Field(ge=0)
+    actor: str = "operator"
+    validation_context: ValidationContext | None = None
+
+
+class ResearchPlanRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plan: ExperimentPlan
+    actor: str = "operator"
+
+
+class ResearchCycleExecuteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cycle_id: str
+    plan_id: str
+
 # ── auth for state-changing endpoints ────────────────────────────────────────────────────
 # Every mutating route (POST/PATCH/DELETE) drives real remote actions — kill/start training,
 # deploy payloads, rewrite the SSH target, execute LLM-proposed actions. Two independent guards:
@@ -124,9 +171,9 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 def _console_auth_error(token_header: Optional[str], client_host: str) -> Optional[tuple[int, str]]:
     """Return (status, detail) if the request must be rejected, else None.
 
-    令牌机制已按操作者要求去掉 (0708): the console-token gate is disabled — all state-changing requests
-    pass. Set LOCOMOTION_CONSOLE_TOKEN + LOCOMOTION_CONSOLE_REQUIRE_TOKEN=1 to re-enable it if the port
-    is ever exposed to a network."""
+    默认本地开发不强制令牌；当服务暴露到非本机网络时，设置
+    ``LOCOMOTION_CONSOLE_REQUIRE_TOKEN=1`` 并配置 ``LOCOMOTION_CONSOLE_TOKEN``。
+    """
     if os.environ.get("LOCOMOTION_CONSOLE_REQUIRE_TOKEN", "").strip() not in ("1", "true", "True"):
         return None
     if token_header is None:
@@ -766,6 +813,135 @@ async def _fast_training_status_response(req: ChatRequest, started: float) -> Ch
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "source": settings.source, "framework_id": settings.framework_id}
+
+
+def _research_root():
+    try:
+        from .research_service import resolve_research_root
+
+        return resolve_research_root()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _research_cycle_manager():
+    from .research_service import build_research_cycle_manager
+
+    return build_research_cycle_manager(settings=settings, root=_research_root())
+
+
+@app.get("/research/state")
+async def research_state() -> dict:
+    from autotuner.research.research_state import ResearchStateError, ResearchStateStore
+
+    store = ResearchStateStore(_research_root() / "state")
+    try:
+        state = store.load()
+        return {"summary": store.summary(), "state": state.model_dump(mode="json")}
+    except ResearchStateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/research/state/initialize")
+async def research_state_initialize(req: ResearchStateInitializeRequest) -> dict:
+    from autotuner.research.research_state import ResearchStateError, ResearchStateStore
+
+    try:
+        state = ResearchStateStore(_research_root() / "state").initialize(req.state, actor=req.actor)
+        return {"ok": True, "state": state.model_dump(mode="json")}
+    except ResearchStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/research/state/update")
+async def research_state_update(req: ResearchStateUpdateRequest) -> dict:
+    from autotuner.research.research_state import ResearchStateError, ResearchStateStore
+
+    immutable = {"schema_version", "state_id", "program_ref", "contract_ref", "goals"}
+    forbidden = sorted(immutable & set(req.changes))
+    if forbidden:
+        raise HTTPException(status_code=400, detail=f"fixed research contract fields cannot be patched: {', '.join(forbidden)}")
+    try:
+        state = ResearchStateStore(_research_root() / "state").compare_and_set(
+            req.expected_revision, req.changes, actor=req.actor, reason=req.reason,
+        )
+        return {"ok": True, "state": state.model_dump(mode="json")}
+    except ResearchStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/research/mechanisms/validate")
+async def research_mechanism_validate(req: ResearchMechanismValidationRequest) -> dict:
+    from autotuner.mechanisms.mechanism_validation import validate_bundle
+
+    report = await asyncio.to_thread(validate_bundle, req.bundle, req.context)
+    return report.model_dump(mode="json")
+
+
+@app.post("/research/cycles/propose")
+async def research_cycle_propose(req: ResearchCycleProposeRequest) -> dict:
+    try:
+        proposal = await asyncio.to_thread(
+            _research_cycle_manager().propose,
+            req.synthesis,
+            expected_state_revision=req.expected_state_revision,
+            actor=req.actor,
+            validation_context=req.validation_context,
+        )
+        return proposal.model_dump(mode="json")
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"research proposal failed: {type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/research/plans/register")
+async def research_plan_register(req: ResearchPlanRegistrationRequest) -> dict:
+    try:
+        plan = await asyncio.to_thread(_research_cycle_manager().register_plan, req.plan, actor=req.actor)
+        return {"ok": True, "plan": plan.model_dump(mode="json")}
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"plan registration failed: {type(exc).__name__}: {exc}") from exc
+
+
+@app.post("/research/cycles/execute")
+async def research_cycle_execute(req: ResearchCycleExecuteRequest) -> dict:
+    try:
+        result = await asyncio.to_thread(
+            _research_cycle_manager().execute_registered,
+            cycle_id=req.cycle_id,
+            plan_id=req.plan_id,
+            actor="operator-confirmed-api",
+        )
+        return result.model_dump(mode="json")
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"research execution failed: {type(exc).__name__}: {exc}") from exc
+
+
+@app.get("/research/replay")
+async def research_replay(split: str = "holdout") -> dict:
+    from autotuner.research.decision_replay import DecisionReplayRunner, GlobalResearchDecisionPolicy, load_replay_cases
+    from .code_knowledge import _ROOT as project_root
+
+    path = project_root / "config" / "decision_replay" / "taili_core_cases.jsonl"
+    cases = load_replay_cases(path, split=split)
+    report = await asyncio.to_thread(DecisionReplayRunner().run, cases, GlobalResearchDecisionPolicy())
+    return report.model_dump(mode="json")
+
+
+@app.get("/research/ledger")
+async def research_ledger(root: str = "", record_type: str = "") -> dict:
+    """Read-only local research lineage endpoint; it never probes SSH or mutates records."""
+    from autotuner.research.research_ledger import ResearchLedgerStore
+    from .research_service import resolve_research_root
+
+    try:
+        candidate = resolve_research_root(root) if root else resolve_research_root() / "ledger"
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        store = ResearchLedgerStore(candidate)
+        return {"summary": store.summary(), "record_type": record_type, "records": store.records(record_type=record_type)[-40:]}
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"research ledger verification failed: {type(exc).__name__}: {exc}")
 
 
 @app.get("/config/frameworks", response_model=list[FrameworkProfileInfo])
@@ -1712,7 +1888,8 @@ async def _chat_impl(
         )
         llm_session.update_latest_pending(
             name=str(done.get("action") or ""), ok=bool(res.get("ok")),
-            detail=str(res.get("detail", ""))[:400])
+            detail=str(res.get("detail", ""))[:400], args=done.get("args") or {},
+            proposal_id=str(rec.get("id") or ""))
     if out.get("proposed_action"):
         proposal = llm_session.record_proposal(
             reply=out.get("reply", ""),
@@ -1859,7 +2036,7 @@ async def chat_execute(req: ExecuteRequest) -> ExecuteResponse:
 
     if req.name not in ACTION_NAMES:
         raise HTTPException(status_code=400, detail=f"unknown action: {req.name}")
-    pending = llm_session.find_pending(name=req.name)
+    pending = llm_session.find_pending(name=req.name, args=req.args)
     if pending is None:
         raise HTTPException(
             status_code=409,
@@ -1873,7 +2050,13 @@ async def chat_execute(req: ExecuteRequest) -> ExecuteResponse:
         out = await _asyncio.to_thread(execute_action, req.name, req.args, settings)
     ok, detail = bool(out.get("ok")), str(out.get("detail", ""))
     # record the action + result so the soul remembers it did this
-    llm_session.update_latest_pending(name=req.name, ok=ok, detail=detail)
+    llm_session.update_latest_pending(
+        name=req.name,
+        args=req.args,
+        proposal_id=str(pending.get("id") or ""),
+        ok=ok,
+        detail=detail,
+    )
     llm_session.append_turn(
         role="assistant",
         content=(f"[executed {req.name} risk={tier} proposal={pending.get('id')}] "

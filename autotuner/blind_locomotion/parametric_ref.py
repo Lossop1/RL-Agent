@@ -46,7 +46,7 @@ def _fk2(th_t, th_c):
 
 def _ik2(tx, tz, iters=40):
     """2-link sagittal IK (vectorized Newton) for target foot (tx,tz) rel hip -> (th_t, th_c)."""
-    th_t = torch.full_like(tx, 0.7)   # OCCAM/ROOT-1 (0707): q_default seed (was stale 0.6/-1.2)
+    th_t = torch.full_like(tx, 0.7)   # 从默认站立姿态开始，保证 IK 分支连续。
     th_c = torch.full_like(tx, -1.4)
     ox, oz = FOOT_OFF[0], FOOT_OFF[2]
     for _ in range(iters):
@@ -68,9 +68,9 @@ def _ik2(tx, tz, iters=40):
     return th_t, th_c
 
 
-# nominal foot (x,z) rel hip at the standing joints — q_default (0, 0.7, -1.4), matching the TASK reward's
-# default pose so AMP style + imitation + the phi-gate style_err no longer fight the task at every stance/stand
-# frame (ROOT-1, 0707). H0 是默认姿态下 base 到足端球心的距离；BASE_Z 还需
+# nominal foot (x,z) rel hip at the standing joints — q_default (0, 0.7, -1.4), matching the task reward's
+# default pose so AMP style, imitation and the style gate share one standing reference. H0 是默认姿态下
+# base 到足端球心的距离；BASE_Z 还需
 # 加上真实足球半径，才能让碰撞球足底落在地面而不是让球心落在地面。
 with torch.no_grad():
     _nx, _nz = _fk2(torch.tensor(0.7), torch.tensor(-1.4))

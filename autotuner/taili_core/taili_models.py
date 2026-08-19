@@ -106,11 +106,8 @@ class EquivariantActor(nn.Module):
     def mean(self, body, z):
         """Structurally L/R-equivariant mean for any weights: 1/2[net(x)+M_a net(M_in x)].
 
-        A/B DIAGNOSTIC (0704): hard equivariance averages 1/2[net(x)+M net(Mx)], which for the
-        ANTI-symmetric (turning) action component averages two initially-uncorrelated halves →
-        suppresses turning output at init and slows yaw learning while symmetric (forward) is
-        preserved. Set TAILI_NO_EQUIV=1 to bypass and use the raw net(x): if yaw then learns,
-        the hard equivariance is the yaw blocker → replace with SOFT equivariance (mirror loss).
+        结构化镜像平均保证左右关系；调试时可用 ``TAILI_NO_EQUIV=1`` 暂时观察原始网络，
+        但正式训练仍使用结构化输出，避免把诊断开关误当成策略配置。
         """
         x = torch.cat([body, z], dim=-1)         # [B, 85]
         if os.environ.get("TAILI_NO_EQUIV") == "1":

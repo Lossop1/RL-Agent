@@ -14,9 +14,7 @@ import uvicorn
 def main() -> None:
     host = os.environ.get("LOCOMOTION_CONSOLE_HOST", "127.0.0.1")
     port = int(os.environ.get("LOCOMOTION_CONSOLE_PORT", "8000"))
-    # AUTO-RELOAD default OFF (0708): reload=True (uvicorn's file-watching reloader) destabilised the running
-    # backend when source files were edited live (reload mid-edit → crash / "进不去系统"). Default OFF = the
-    # known-good stable behavior; a restart loads new code. Opt in with LOCOMOTION_CONSOLE_RELOAD=1 for dev.
+    # 默认关闭热重载，避免编辑过程中加载半成品模块；开发者可显式开启。
     reload = os.environ.get("LOCOMOTION_CONSOLE_RELOAD", "0") in ("1", "true", "True")
     uvicorn.run("autotuner.locomotion_console.app:app", host=host, port=port, reload=reload)
 

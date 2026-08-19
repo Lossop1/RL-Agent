@@ -49,8 +49,22 @@ def _f(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _clean_float_map(data: Mapping[str, Any]) -> dict[str, float]:
-    return {str(k): _f(v) for k, v in data.items() if v is not None}
+def _clean_float_map(data: Mapping[str, Any]) -> dict[str, Any]:
+    def clean(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): clean(child) for key, child in value.items() if child is not None}
+        return _f(value)
+
+    return {str(key): clean(value) for key, value in data.items() if value is not None}
+
+
+def _scalar_items(data: Mapping[str, Any], prefix: str = ""):
+    for key, value in data.items():
+        name = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, Mapping):
+            yield from _scalar_items(value, name)
+        elif isinstance(value, (int, float)):
+            yield name, float(value)
 
 
 def _kv(items: list[tuple[str, Any]], *, digits: int = 3) -> str:
@@ -327,16 +341,15 @@ class TrainingTelemetryEmitter:
         if self.writer is None:
             return
         step = payload["step"]
-        for key, value in payload["reward"].items():
+        for key, value in _scalar_items(payload["reward"]):
             self.writer.add_scalar(f"Telemetry/reward/{key}", value, step)
-        for key, value in payload.get("command", {}).items():
+        for key, value in _scalar_items(payload.get("command", {})):
             self.writer.add_scalar(f"Telemetry/command/{key}", value, step)
-        for key, value in payload["health"].items():
+        for key, value in _scalar_items(payload["health"]):
             self.writer.add_scalar(f"Telemetry/health/{key}", value, step)
-        for key, value in payload["curriculum"].items():
-            if isinstance(value, (int, float)):
-                self.writer.add_scalar(f"Telemetry/curriculum/{key}", float(value), step)
-        for key, value in payload.get("counters", {}).items():
+        for key, value in _scalar_items(payload["curriculum"]):
+            self.writer.add_scalar(f"Telemetry/curriculum/{key}", value, step)
+        for key, value in _scalar_items(payload.get("counters", {})):
             self.writer.add_scalar(f"Telemetry/counters/{key}", value, step)
 
     def _emit_line(self, line: str) -> None:

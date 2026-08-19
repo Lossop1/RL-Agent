@@ -1,4 +1,4 @@
-﻿"""Pydantic API models for the locomotion console.
+"""Pydantic API models for the locomotion console.
 
 These are the wire contract between the FastAPI backend and the React frontend. The live
 metric point intentionally mirrors the fields of `autotuner.tuning.events.SmokeProgressEvent`

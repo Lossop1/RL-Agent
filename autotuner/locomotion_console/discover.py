@@ -170,7 +170,7 @@ def _connect_default():
     import json as _json
     from pathlib import Path
     import runtime_state
-    from autotuner.training.remote import RemoteSSH
+    from autotuner.infrastructure.remote import RemoteSSH
 
     if not runtime_state.get_config_path():
         cfg_path = Path("config/ssh.json")

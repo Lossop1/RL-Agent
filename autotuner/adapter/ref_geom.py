@@ -25,7 +25,7 @@ from typing import List
 #   v = PROVEN * total_leg / _LEG_PROVEN   (Taili total_leg==_LEG_PROVEN → 精确复现 0.52/0.09)
 _LEG_PROVEN = 0.36385 + 0.3179635      # Taili total_leg = L1 + |foot_off_z|
 _BASE_Z_PROVEN = 0.52
-# 参考抬腿高度:用户领域修正(2026-06-23)——平地 3-5cm(高效低抬),不是早先的 9cm(过高/prancing)。
+# 参考抬腿高度遵循当前任务规范：平地低抬脚约 3-5cm，避免过高抬腿造成跳跃步态。
 # 坡/台阶上 = 离面 3-5cm。取 4cm 为框架默认。注:Taili 已部署 clip 用的是旧 9cm。
 _CLEAR_PROVEN = 0.04
 

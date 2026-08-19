@@ -2167,6 +2167,8 @@ class TailiBlindTPEnv(TailiAmpEnv):
         )
         # 5. 统一奖励计算：通用 tracking、步态、滑移、落脚和稳定项都在 taili_reward 中计算。
         comp = taili_reward.compute_reward_components(inp, cfg)
+        self._dynamic_mechanism_metrics = dict(comp.get("_dynamic_metrics", {}))
+        self._dynamic_mechanism_gates = dict(comp.get("_dynamic_gates", {}))
         self._terrain_pattern_scale_for_amp = comp["terrain_pattern_scale"].detach()
         self._amp_style_scale_for_agent = (
             comp["terrain_pattern_scale"] * _policy_steady_f
@@ -3194,6 +3196,10 @@ class TailiBlindTPEnv(TailiAmpEnv):
                     reward_cfg=cfg,
                     include_reward_cfg=include_reward_cfg,
                 )
+                if self._dynamic_mechanism_metrics:
+                    reward_payload["dynamic_metrics"] = dict(self._dynamic_mechanism_metrics)
+                if self._dynamic_mechanism_gates:
+                    curriculum_payload_dynamic = dict(self._dynamic_mechanism_gates)
                 if include_reward_cfg:
                     self._reward_cfg_printed = True
                 command_payload = build_command_payload(
@@ -3229,6 +3235,8 @@ class TailiBlindTPEnv(TailiAmpEnv):
                     gait_gate=gait_gate,
                     fall_rate=fall_rate,
                 )
+                if self._dynamic_mechanism_gates:
+                    curriculum_payload["dynamic_gates"] = curriculum_payload_dynamic
                 health_payload = build_health_payload(
                     gate=gate,
                     moving=moving,

@@ -127,6 +127,11 @@ def test_chat_execute_is_proposal_bound(client, monkeypatch):
     assert client.post("/chat/execute", json={"name": "kill_training", "args": {}}, headers=h).status_code == 409
     assert client.post("/chat/execute", json={"name": "nope", "args": {}}, headers=h).status_code == 400
     llm_session.record_proposal(reply="stop", proposed_action={"name": "kill_training", "args": {}})
+    assert client.post(
+        "/chat/execute",
+        json={"name": "kill_training", "args": {"different": True}},
+        headers=h,
+    ).status_code == 409
     assert client.post("/chat/execute", json={"name": "kill_training", "args": {}}, headers=h).status_code != 409
 
 
@@ -136,6 +141,8 @@ def test_action_risk_tiers():
     assert agent.action_risk("edit_config") == "low"
     assert agent.action_risk("run_acceptance") == "medium"
     assert agent.action_risk("run_campaign") == "destructive"
+    assert agent.action_risk("propose_research_cycle") == "medium"
+    assert agent.action_risk("execute_research_cycle") == "destructive"
     assert agent.action_risk("get_status") == "auto"  # read-only default
 
 

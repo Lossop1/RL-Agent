@@ -15,6 +15,26 @@ def _float_attr(obj: Any, name: str, default: float = 0.0) -> float:
     return float(getattr(obj, name, default))
 
 
+def _command_bucket_masks(commands: torch.Tensor, *, deadband: float = 0.05) -> dict[str, torch.Tensor]:
+    """Return disjoint command buckets for the realized batch.
+
+    Direction audit fields are axis-oriented and intentionally overlap for a
+    mixed command. Coverage accounting needs a second, disjoint view so a
+    batch cannot be mistaken for six command regimes from one mean vector.
+    """
+    active = commands.abs() > deadband
+    active_count = active.sum(dim=-1)
+    single = active_count == 1
+    return {
+        "stand": active_count == 0,
+        "mixed": active_count > 1,
+        "forward": single & active[:, 0] & (commands[:, 0] >= 0.0),
+        "backward": single & active[:, 0] & (commands[:, 0] < 0.0),
+        "lateral": single & active[:, 1],
+        "yaw": single & active[:, 2],
+    }
+
+
 def _reward_cfg_payload(cfg: Any) -> dict[str, float]:
     try:
         payload = (
@@ -278,6 +298,17 @@ def build_command_payload(
                 if isinstance(value, (int, float)):
                     command_payload[f"direction_{direction}_{name}"] = float(value)
     command_payload["quality_capability_gate"] = _float_attr(env, "_quality_capability_gate")
+    # Keep a disjoint per-batch command view alongside the existing
+    # direction-oriented audit. The latter is useful for progress attribution
+    # but overlaps mixed commands; this view is the source for coverage proof.
+    steady_eval = transition_state == 0
+    for prefix, batch_commands in (("target", target_commands), ("applied", commands)):
+        for bucket, mask in _command_bucket_masks(batch_commands).items():
+            command_payload[f"bucket_{bucket}_{prefix}_samples"] = float(mask.float().sum())
+            if prefix == "applied":
+                command_payload[f"bucket_{bucket}_eligible_samples"] = float(
+                    (mask & steady_eval).float().sum()
+                )
     return command_payload
 
 
@@ -377,6 +408,7 @@ def build_curriculum_payload(
     curriculum_payload["dr_transition_handoff_ok"] = float(bool(getattr(env, "_dr_transition_handoff_ok", False)))
     curriculum_payload["flat_core_gate_ok"] = float(bool(getattr(env, "_flat_core_gate_ok", False)))
     curriculum_payload["flat_gait_gate_ok"] = float(bool(getattr(env, "_flat_gait_gate_ok", False)))
+    curriculum_payload["terrain_health_slip_high_value"] = _float_attr(env, "_slip_high_fraction")
     curriculum_payload["phase_gate_ok"] = float(bool(getattr(env, "_phase_gate_ok", False)))
     curriculum_payload["phase_gate_eval_step"] = float(getattr(env, "_phase_gate_eval_step", 0))
     for group_name, attr_name in (

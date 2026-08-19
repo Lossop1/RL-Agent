@@ -48,7 +48,7 @@ class DeployItem:
 @dataclass
 class DeployPlan:
     items: List[DeployItem]
-    backup_suffix: str          # appended to each remote original, e.g. ".autobak-20260629-231500"
+    backup_suffix: str          # 追加到远端原文件名，例如 ".autobak-<timestamp>"
     work_dir: str
     launch_cmd: Optional[str] = None
     launch_session: str = "tpdeploy"

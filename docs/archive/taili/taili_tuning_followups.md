@@ -6,8 +6,8 @@ confirmed on the GPU box before adoption), and the **positive validations** that
 strategy is physically and methodologically sound. Findings come from a 14-subsystem adversarial audit
 (each finding independently verified against the code); severities are the verifier's, not the finder's.
 
-Ground truth for acceptance is [`taili_spec.md`](./taili_spec.md); reward/curriculum design is
-[`taili_strategy_decisions.md`](./taili_strategy_decisions.md).
+Ground truth for acceptance is [`taili_spec.md`](../../taili_spec.md); reward/curriculum design is
+[`taili_strategy_decisions.md`](../../taili_strategy_decisions.md).
 
 ---
 

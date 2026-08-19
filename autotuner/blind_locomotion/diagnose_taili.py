@@ -492,12 +492,8 @@ def _configure_terrain(env_cfg, terrain: dict[str, Any]) -> str:
         # 优先保留训练配置中的真实地形类型。若把 stairs_up 几何挂到 stairs 键下，
         # 环境会把物理上行误标为下行，进而锁定错误的事件方向和奖励链路。
         sub_key = canonical
-        # DEEP-COPY isolation (0706): terrain_generator and its sub_terrains dict are CLASS-LEVEL
-        # shared defaults — parse_env_cfg hands back the SAME objects on every call.  Mutating them
-        # per case (proportion, direction swap) leaked into the next case; on the 2nd gym.make the
-        # accumulated/half-swapped config made configclass._validate recurse to a RecursionError,
-        # crashing any diagnostic with >1 terrain (e.g. 上/下楼梯对照).  Copy the generator onto THIS
-        # env_cfg so every case mutates an isolated graph and the shared default stays pristine.
+        # IsaacLab 配置中的 terrain_generator 可能由多个环境共享。每个诊断 case 都复制一份，
+        # 后续的比例和方向调整不会污染其他 case，也不会改变默认配置对象。
         import copy as _copy
         generator = _copy.deepcopy(env_cfg.terrain.terrain_generator)
         env_cfg.terrain.terrain_generator = generator
@@ -508,8 +504,7 @@ def _configure_terrain(env_cfg, terrain: dict[str, Any]) -> str:
         if sub_key not in sub_terrains:
             env_cfg.terrain.terrain_type = "plane"
             return "flat"
-        # On the isolated copy it is now safe to select one terrain by proportion (and to swap in an
-        # inverted-stairs cfg below) without corrupting later gym.make calls.
+        # 现在可以在隔离副本上选择单一地形或替换倒置楼梯，而不会影响后续 gym.make。
         for name, cfg in sub_terrains.items():
             cfg.proportion = 1.0 if name == sub_key else 0.0
         sub = sub_terrains[sub_key]

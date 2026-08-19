@@ -29,8 +29,7 @@ from autotuner.adapter.pipeline import (
 
 _REMOTE_TAILI = "/root/gpufree-data/robot_lab/source/robot_lab/robot_lab/tasks/direct/taili_amp"
 
-# Current tree is Taili-only. Unitree/B2 proof fixtures were archived under
-# archive/2026-07-cleanup/b2-removed/.
+# 当前树仅保留 Taili；其他机器人验证夹具已归档。
 PRESETS = {
     "taili": dict(
         urdf="assets/robots/taili-dog/robot.urdf",

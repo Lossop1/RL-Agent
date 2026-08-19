@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from autotuner.training import strategy_edit as SE
+from autotuner.taili_ops import strategy_edit as SE
 
 
 @pytest.fixture()

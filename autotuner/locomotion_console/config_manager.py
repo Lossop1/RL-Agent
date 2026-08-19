@@ -235,7 +235,7 @@ def update_remote_profile(settings: LocomotionConsoleSettings, updates: dict[str
 def test_remote_connection(settings: LocomotionConsoleSettings) -> RemoteConnectionTestResult:
     import time as _time
 
-    from autotuner.training.remote import RemoteSSH
+    from autotuner.infrastructure.remote import RemoteSSH
 
     cfg = effective_remote_config(settings)
     profile = remote_profile(settings)

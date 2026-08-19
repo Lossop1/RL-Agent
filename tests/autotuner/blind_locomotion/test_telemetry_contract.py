@@ -9,7 +9,9 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
-from autotuner.blind_locomotion.telemetry_payloads import _lagging_progress
+import torch
+
+from autotuner.blind_locomotion.telemetry_payloads import _command_bucket_masks, _lagging_progress
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -47,6 +49,24 @@ def _payload_keys(payload_name: str) -> set[str]:
             if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
                 keys.add(node.slice.value)
     return keys
+
+
+def test_command_bucket_masks_are_disjoint_and_complete():
+    commands = torch.tensor(
+        [
+            [0.5, 0.0, 0.0],
+            [-0.5, 0.0, 0.0],
+            [0.0, 0.3, 0.0],
+            [0.0, 0.0, 0.4],
+            [0.0, 0.0, 0.0],
+            [0.4, 0.2, 0.0],
+        ]
+    )
+    masks = _command_bucket_masks(commands)
+    assert set(masks) == {"forward", "backward", "lateral", "yaw", "stand", "mixed"}
+    stacked = torch.stack(list(masks.values()), dim=0)
+    assert torch.all(stacked.sum(dim=0) == 1)
+    assert all(int(mask.sum()) == 1 for mask in masks.values())
 
 
 def test_command_payload_keeps_core_fields():

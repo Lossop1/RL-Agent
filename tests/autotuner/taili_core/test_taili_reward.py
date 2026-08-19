@@ -761,6 +761,63 @@ def _reward_cfg_only(**overrides):
     return cfg
 
 
+def test_compiled_dynamic_mechanism_enters_production_reward_and_diagnostics(tmp_path, monkeypatch):
+    from autotuner.mechanisms.mechanism_runtime import clear_runtime_cache
+    from autotuner.mechanisms.mechanism_specs import (
+        Expression,
+        GateSpec,
+        MechanismBundle,
+        MetricSpec,
+        RewardTermSpec,
+        SignalSpec,
+    )
+
+    cfg = _reward_cfg_only(w_tracking_lin=1.0)
+    monkeypatch.delenv("TAILI_MECHANISM_BUNDLE", raising=False)
+    clear_runtime_cache()
+    baseline = compute_reward_components(make_inp(2), cfg)
+
+    bundle = MechanismBundle(
+        id="bundle:production-hook",
+        status="approved",
+        contract_ref="contract:test",
+        signals=(SignalSpec(
+            name="existing.tracking", description="built-in tracking component",
+            source_ref="component.tracking_lin",
+        ),),
+        rewards=(RewardTermSpec(
+            id="reward:tracking-bonus", name="tracking bonus", role="positive_drive",
+            expression=Expression.signal("existing.tracking"), weight=0.25,
+            reward_group="track", intended_effect="strengthen tracking",
+            failure_region="tracking is weak", success_region="tracking is strong",
+        ),),
+        metrics=(MetricSpec(
+            id="metric:tracking-live", name="tracking live",
+            expression=Expression.signal("existing.tracking"), intended_reading="higher is better",
+        ),),
+        gates=(GateSpec(
+            id="gate:tracking-live", name="tracking live gate", metric_ref="metric:tracking-live",
+            comparator="ge", threshold=0.5, action="advance", scope="curriculum",
+            rationale="require live tracking",
+        ),),
+        evaluator_refs=("evaluator:test",),
+    )
+    path = tmp_path / "mechanisms.json"
+    path.write_text(bundle.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv("TAILI_MECHANISM_BUNDLE", str(path))
+    clear_runtime_cache()
+
+    result = compute_reward_components(make_inp(2), cfg)
+    dynamic = result["dynamic/reward:tracking-bonus"]
+    assert torch.allclose(dynamic, 0.25 * baseline["tracking_lin"])
+    assert torch.allclose(result["total"], baseline["total"] + dynamic)
+    assert result["_dynamic_metrics"]["metric:tracking-live"] == pytest.approx(1.0)
+    assert result["_dynamic_gates"]["gate:tracking-live"]["passed"] is True
+    grouped = group_reward_vector(result)
+    track_index = REWARD_GROUP_NAMES.index("track")
+    assert grouped[:, track_index].sum() >= dynamic.sum()
+
+
 def test_base_linear_drive_is_independent_of_posture_and_command_age():
     cfg = _reward_cfg_only(
         w_tracking_lin=2.0,

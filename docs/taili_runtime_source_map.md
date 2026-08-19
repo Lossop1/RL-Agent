@@ -213,7 +213,7 @@ manifest 同时做静态检查：
 - `strategy_backups/`
 - 历史 payload 解压目录。
 - 历史 run 目录中的配置副本。
-- 过期的 `CURRENT_FINAL_STRATEGY.md`。
+- 归档的 `docs/archive/taili/current_final_strategy_legacy.md`。
 - 旧的远端 task-source 覆盖目录。
 - 只用于前端、LLM、控制台展示的文件。
 

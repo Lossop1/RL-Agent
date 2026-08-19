@@ -2089,6 +2089,13 @@ class TailiAmpEnv(DirectRLEnv):
             and terrain_capability_gate_ok
             and fall_rate < C.phase_gate_fall_2
         )
+        dynamic_gates = getattr(self, "_dynamic_mechanism_gates", {})
+        dynamic_advance = {
+            name: result for name, result in dynamic_gates.items()
+            if result.get("scope") == "curriculum" and result.get("action") in {"advance", "hold"}
+        }
+        dynamic_curriculum_ok = all(bool(result.get("passed")) for result in dynamic_advance.values())
+        gate = bool(gate) and dynamic_curriculum_ok
         self._phase_gate_ok = bool(gate)
         self._phase_gate_status = {
             "progress": min_prog >= prog_thr,
@@ -2104,6 +2111,7 @@ class TailiAmpEnv(DirectRLEnv):
             "terrain_capability": terrain_capability_gate_ok,
             "terrain_fall": fall_rate < C.phase_gate_fall_2,
             "terrain_mixed": terrain_mixed_ok,
+            "dynamic_mechanisms": dynamic_curriculum_ok,
         }
         self._phase_gate_values = {
             "progress": min_prog,
@@ -2147,6 +2155,10 @@ class TailiAmpEnv(DirectRLEnv):
             "flat_duty_valid": float(flat_metrics.get("duty_valid", 0.0)),
             "flat_period": float(flat_metrics.get("period", 0.0)),
             "flat_yaw_gait": yaw_gait_score,
+            **{
+                f"dynamic/{name}": float(result.get("value", float("nan")))
+                for name, result in dynamic_gates.items()
+            },
         }
         self._phase_gate_eval_step = int(self._log_step)
         # 死锁保护仅在显式开启时使用；关闭预算控制的策略从首个日志窗口开始计时。

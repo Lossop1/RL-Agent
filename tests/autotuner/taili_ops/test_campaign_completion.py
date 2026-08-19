@@ -1,7 +1,7 @@
 """Proof that the autonomous campaign COMPLETES a tuning task correctly (not just runs one):
 it keeps a change that improves the score, ROLLS BACK one that regresses, and stops at convergence.
 Driven entirely by a mock — no box, no GPU — so the decision logic is proven deterministically."""
-from autotuner.training import tune_orchestrator as TO
+from autotuner.taili_ops import tune_orchestrator as TO
 
 
 class _MockDriver:
@@ -45,7 +45,7 @@ def _run(monkeypatch, scores, max_iters=1):
     # avoid touching the real config/rollback file
     monkeypatch.setattr("autotuner.blind_locomotion.taili_blind_config.load_taili_blind_config", lambda: {})
     monkeypatch.setattr("autotuner.blind_locomotion.taili_blind_config.get_config_value", lambda c, k: 0.45)
-    monkeypatch.setattr("autotuner.training.strategy_edit.rollback_last", lambda: rolled.append(1) or {"ok": True})
+    monkeypatch.setattr("autotuner.taili_ops.strategy_edit.rollback_last", lambda: rolled.append(1) or {"ok": True})
     camp = TO.Campaign(max_iters=max_iters)
     summary = TO.run_campaign(camp, "run0", "agent_0.pt", log=lambda *a: None,
                               stamp_fn=lambda: str(len(rolled)))
@@ -77,7 +77,7 @@ def test_campaign_resolves_bare_checkpoint_to_absolute_path(monkeypatch):
     monkeypatch.setattr(TO, "propose_change", lambda gaps, cur, hist: {"w_diagonal_contact": 0.55})
     monkeypatch.setattr("autotuner.blind_locomotion.taili_blind_config.load_taili_blind_config", lambda: {})
     monkeypatch.setattr("autotuner.blind_locomotion.taili_blind_config.get_config_value", lambda c, k: 0.45)
-    monkeypatch.setattr("autotuner.training.strategy_edit.rollback_last", lambda: {"ok": True})
+    monkeypatch.setattr("autotuner.taili_ops.strategy_edit.rollback_last", lambda: {"ok": True})
     TO.run_campaign(TO.Campaign(max_iters=1), "run0", "agent_15000.pt", log=lambda *a: None,
                     stamp_fn=lambda: "s1")
     assert drivers[0].launched_ckpts == ["/root/gpufree-data/taili_runs/run0/checkpoints/agent_15000.pt"]

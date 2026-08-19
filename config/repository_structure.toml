@@ -1,0 +1,94 @@
+# 仓库结构契约。修改目录或入口时必须同步更新并运行
+# python tools/check_repository_structure.py。
+schema_version = 1
+
+[source]
+roots = [
+  "autotuner",
+  "tools/isaaclab_quad_diag_observation/isaaclab_quad_diag",
+  "locomotion-console-ui/src",
+  "locomotion-console-ui/public",
+  "tests",
+]
+
+[artifacts]
+roots = [
+  "output",
+  "frontend/dist",
+  "autotuner/training_payloads/taili_blind_runtime/.build",
+  "autotuner/training_payloads/taili_blind_runtime/dist",
+  "autotuner/training_payloads/taili_blind_runtime/archive",
+]
+
+[history]
+roots = [
+  "strategy_backups",
+  "output",
+  "docs/archive",
+]
+
+[entrypoints]
+backend = "python -m autotuner.locomotion_console"
+frontend = "locomotion-console-ui"
+training_config = "autotuner/blind_locomotion/taili_blind_config.yaml"
+payload_manifest = "python -m autotuner.training_payloads.taili_blind_runtime.payload_manifest"
+payload_builder = "python -m autotuner.training_payloads.taili_blind_runtime.build_payload"
+structure_check = "python tools/check_repository_structure.py"
+
+[dependency_rules]
+# 每行表示“左侧包禁止直接依赖右侧包”。兼容转发文件不作为业务依赖。
+"autotuner.mechanisms" = [
+  "autotuner.locomotion_console",
+  "autotuner.blind_locomotion",
+  "autotuner.taili_core",
+  "autotuner.taili_ops",
+  "autotuner.training",
+  "autotuner.adapter",
+]
+"autotuner.research" = [
+  "autotuner.locomotion_console",
+  "autotuner.blind_locomotion",
+  "autotuner.taili_core",
+  "autotuner.taili_ops",
+  "autotuner.training",
+  "autotuner.adapter",
+]
+"autotuner.taili_core" = [
+  "autotuner.locomotion_console",
+  "autotuner.blind_locomotion",
+  "autotuner.taili_ops",
+  "autotuner.training",
+  "autotuner.adapter",
+]
+"autotuner.blind_locomotion" = [
+  "autotuner.locomotion_console",
+  "autotuner.taili_ops",
+  "autotuner.training",
+]
+"autotuner.training" = [
+  "autotuner.locomotion_console",
+]
+
+[compatibility]
+modules = [
+  "autotuner.training.remote",
+  "autotuner.training.acceptance_run",
+  "autotuner.training.early_stop",
+  "autotuner.training.strategy_edit",
+  "autotuner.training.tune_orchestrator",
+  "autotuner.locomotion_console.mechanism_specs",
+  "autotuner.locomotion_console.mechanism_runtime",
+  "autotuner.locomotion_console.mechanism_validation",
+  "autotuner.locomotion_console.mechanism_synthesis",
+  "autotuner.locomotion_console.mechanism_artifacts",
+  "autotuner.locomotion_console.research_state",
+  "autotuner.locomotion_console.research_ledger",
+  "autotuner.locomotion_console.research_supervisor",
+  "autotuner.locomotion_console.research_cycle",
+  "autotuner.locomotion_console.outcome_learning",
+  "autotuner.locomotion_console.decision_replay",
+  "autotuner.locomotion_console.policy_contract",
+  "autotuner.locomotion_console.gate_calibration",
+  "autotuner.locomotion_console.campaign_journal",
+]
+

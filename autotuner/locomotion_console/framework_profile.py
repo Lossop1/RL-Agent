@@ -68,8 +68,7 @@ _FRAMEWORKS: dict[str, FrameworkProfile] = {
             "| grep -v pgrep"
         ),
         kill_cmd="pkill -f 'taili_blind_runtime\\.train_taili|launch_taili_train|RobotLab-Isaac-Taili.*Blind'",
-        # §3 D 运维: warm-start resume from a checkpoint (the box auto-shut-down killed v1; resume
-        # instead of restarting from 0). tp_resume.py = agent.load(ckpt) then continue.
+        # 运维支持从检查点暖启动；具体恢复命令由运行器提供。
         resume_cmd="",
     ),
     "taili_amp_teacher_reference": FrameworkProfile(
