@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 import numpy as np
@@ -13,7 +12,6 @@ from .util import (
     command_segment_key_columns,
     group_key_columns,
     numeric_col,
-    stats,
 )
 
 

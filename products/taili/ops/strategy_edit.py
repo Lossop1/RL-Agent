@@ -111,7 +111,11 @@ def apply_weight_changes(changes: dict[str, Any], *, yaml_path: Path | None = No
 def rollback_stack() -> list[dict[str, Any]]:
     if not _ROLLBACK_STACK.exists():
         return []
-    return [json.loads(l) for l in _ROLLBACK_STACK.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [
+        json.loads(line)
+        for line in _ROLLBACK_STACK.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def rollback_last(*, yaml_path: Path | None = None) -> dict[str, Any]:

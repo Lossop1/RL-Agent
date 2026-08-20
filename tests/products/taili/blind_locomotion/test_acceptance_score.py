@@ -7,9 +7,7 @@ drift. Pure Python — no torch, no sim — so they run in any CI.
 Convention: for each gate we test one value that must PASS (at or inside the bound, since the
 spec uses non-strict <=/>=) and one that must FAIL (just outside).
 """
-import math
 
-import pytest
 
 from products.taili.blind_locomotion import acceptance_score as A
 

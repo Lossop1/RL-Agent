@@ -9,10 +9,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from autotuner.mechanisms.mechanism_artifacts import MechanismArtifactCompiler
-from autotuner.mechanisms.mechanism_specs import MechanismBundle
 from autotuner.mechanisms.mechanism_synthesis import MechanismSynthesizer, SynthesisCandidate, SynthesisRequest
 from autotuner.mechanisms.mechanism_validation import ValidationContext, ValidationReport, validate_patch
 from .outcome_learning import OutcomeLearner, OutcomeLearningResult

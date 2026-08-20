@@ -1920,7 +1920,6 @@ class RealDataSource(RunDataSource):
 
     def _deploy_payload(self, remote) -> tuple[str, str, int]:
         """通过产品合同和版本化执行层部署 payload。"""
-        import shlex
 
         from autotuner.adapter.remote_executors import RemoteSSHTransportAdapter
         from autotuner.execution import RemoteLayout, VersionedRemoteDeployer

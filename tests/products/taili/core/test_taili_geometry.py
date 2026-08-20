@@ -1,3 +1,5 @@
+# Torch is optional in the test environment; importorskip must run first.
+# ruff: noqa: E402
 from pathlib import Path
 import xml.etree.ElementTree as ET
 

@@ -107,8 +107,6 @@ def test_gate_preserves_zero_terrain_start_and_exposes_hidden_quality_conditions
     ])
     gate = _actual_phase_gate_from_config(text, phase=0)
     cond = gate["conditions"]
-    src = gate["conditions_source"]
-
     assert cond["terrain_start_phase"] == 0
     assert cond["execution_min"] == 0.81
     assert cond["duty_target_min"] == 0.56

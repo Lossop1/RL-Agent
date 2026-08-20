@@ -1525,7 +1525,6 @@ class DiagnosticsController:
         return plan
 
     def _write_remote_plan_artifacts(self, remote: Any, job: _Job) -> None:
-        import os
         import yaml
 
         plan = job.plan or _default_plan_for_preset(job.preset)

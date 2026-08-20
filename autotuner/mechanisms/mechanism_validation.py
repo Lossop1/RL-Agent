@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .mechanism_runtime import MechanismRuntimeError, TensorExpressionEvaluator
+from .mechanism_runtime import TensorExpressionEvaluator
 from .mechanism_specs import (
     Expression,
     MechanismBundle,

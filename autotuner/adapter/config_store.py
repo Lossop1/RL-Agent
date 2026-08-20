@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from autotuner.adapter.pipeline import ConfigSet
 

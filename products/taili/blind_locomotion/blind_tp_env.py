@@ -18,20 +18,22 @@ import torch
 from isaaclab.utils.math import quat_apply_inverse
 
 try:                                            # payload 包内导入。
-    from .taili_core import (taili_obs, taili_symmetry, taili_amp_reference,
+    from .taili_core import (taili_obs, taili_symmetry as _taili_symmetry, taili_amp_reference,
                              taili_reward, taili_terrain_labels, taili_curriculum,
                              terrain_curriculum, taili_geometry)
 except ImportError:
     if __package__ == "taili_blind_runtime":
         raise
     try:                                        # 本地源码树导入。
-        from products.taili.core import (taili_obs, taili_symmetry, taili_amp_reference,
+        from products.taili.core import (taili_obs, taili_symmetry as _taili_symmetry, taili_amp_reference,
                                           taili_reward, taili_terrain_labels, taili_curriculum,
                                           terrain_curriculum, taili_geometry)
     except ImportError:
-        from taili_core import (taili_obs, taili_symmetry, taili_amp_reference,
+        from taili_core import (taili_obs, taili_symmetry as _taili_symmetry, taili_amp_reference,
                                 taili_reward, taili_terrain_labels, taili_curriculum,
                                 terrain_curriculum, taili_geometry)
+
+# 核心对称模块随环境载入，保留其兼容性与模块初始化行为。
 
 try:
     from .telemetry_emit import TrainingTelemetryEmitter
@@ -97,6 +99,8 @@ from .taili_amp_env import (
     _sample_core_full_mixture,
 )
 from .parametric_ref import flat_reference, foot_reference   # live imitation 与统一足端参考。
+
+_ = _taili_symmetry
 
 HIST_LEN = 25
 TICK_DIM = 54
@@ -879,7 +883,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
         stance = (in_contact > 0.5).to(f)
         settled = (settled_contact > 0.5).to(f)
         moving_mask = moving > 0.5
-        moving_col = moving_mask[:, None]
 
         if stance.shape[-1] >= 4:
             fl, fr, rl, rr = stance[:, 0], stance[:, 1], stance[:, 2], stance[:, 3]
@@ -892,7 +895,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
         else:
             diag_pair = torch.zeros_like(base_h)
 
-        duty_target = min(max(float(getattr(self._rcfg, "duty_target", getattr(self.cfg, "gait_duty", 0.5))), 0.05), 0.95)
         transition_active = getattr(self, "_cmd_transition_timer", torch.zeros_like(base_h)) > 0
         # 对角小跑指标只在适用场景更新：前进、后退或横移命令明显强于 yaw。
         # yaw 主导转向时低 diag_pair 是合理的；不应把它混进直线小跑质量 EMA。
@@ -1286,8 +1288,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
         base_h = rd.root_pos_w[:, 2] - terrain_h                                       # 平地使用的世界竖直高度。
         grav = rd.projected_gravity_b
         tilt_rel = torch.arccos(torch.clamp(-grav[:, 2], -1.0, 1.0))                   # 平地使用世界水平参考。
-        roll = torch.arcsin(torch.clamp(grav[:, 1], -1.0, 1.0))
-        pitch = torch.arcsin(torch.clamp(-grav[:, 0], -1.0, 1.0))
         in_contact = self._in_contact                                                 # (N,4)，由 _get_observations 缓存。
         cc = in_contact.sum(dim=1)
         spd_xy = torch.norm(self.commands[:, :2], dim=1)
@@ -1303,7 +1303,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
         td_mask = None
         # 稳定支撑 = 当前帧接触且上一帧也接触。触地帧由落脚冲击负责，
         # 不计入支撑滑移，避免把同一个事件重复算进 B1 和 B2。
-        settled_contact = in_contact * (prev_contact > 0.5).float()
         foot_pos = rd.body_pos_w[:, self.foot_indexes, :]                             # (N,4,3)
         foot_vel = rd.body_lin_vel_w[:, self.foot_indexes, :]                         # (N,4,3)
         _foot_force_w = self._contact_sensor.data.net_forces_w[:, self._feet_contact_ids, :]
@@ -2925,7 +2924,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
                 else:
                     best_lag_gait_mean = 0.0
                 fl, fr, rl, rr = in_contact[:, 0], in_contact[:, 1], in_contact[:, 2], in_contact[:, 3]
-                diag = 1.0 - 0.5 * ((fl - rr).abs() + (fr - rl).abs())
                 diag_pair_inst_mean = float(quality["diag_pair_inst"][moving_any].mean()) if bool(moving_any.any()) else 0.0
                 front = 0.5 * (fl + fr)
                 rear = 0.5 * (rl + rr)
@@ -2949,7 +2947,6 @@ class TailiBlindTPEnv(TailiAmpEnv):
                 best_lag_gait_mean = 0.0
                 duty_balance_inst_mean = 0.0
                 duty_eval = torch.zeros(N, dtype=torch.bool, device=dev)
-            foot_slip_xy = foot_vel_xy
             self._slip_now = float(quality["slip_speed"][moving_any].mean()) if bool(moving_any.any()) else 0.0
             self._slip_inst = float(quality["slip_speed_inst"][moving_any].mean()) if bool(moving_any.any()) else 0.0
             self._slip_high_fraction = float(quality["slip_high_fraction"][moving_any].mean()) if bool(moving_any.any()) else 0.0

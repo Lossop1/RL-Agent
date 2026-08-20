@@ -28,7 +28,6 @@ from .code_knowledge import _ROOT as PROJECT_ROOT
 from autotuner.product import ResolvedProductContract, resolve_product_contract
 from autotuner.research.gate_calibration import extract_gate_definitions, gate_passes, quantiles
 from .knowledge_model.reward_deriver import derive_reward_terms
-from .knowledge_model.robot_sources import get_robot_sources
 
 
 AuditStatus = Literal["ready", "incomplete", "blocked"]

@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")

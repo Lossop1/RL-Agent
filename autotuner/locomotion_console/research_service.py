@@ -1,4 +1,5 @@
 """Shared construction and path policy for the research loop."""
+
 from __future__ import annotations
 
 import os
@@ -8,24 +9,51 @@ from .config import LocomotionConsoleSettings, PROJECT_ROOT, get_settings
 from autotuner.research.research_cycle import ResearchCycleManager
 from autotuner.research.research_ledger import ResearchLedgerStore
 from autotuner.research.research_state import ResearchStateStore
-from autotuner.research.research_supervisor import CommandExperimentBackend, ExperimentBackend, ResearchSupervisor
+from autotuner.research.research_supervisor import (
+    CommandExperimentBackend,
+    ExperimentBackend,
+    ResearchSupervisor,
+)
 
 
 DEFAULT_RESEARCH_ROOT = "output/research"
 
 
 def resolve_research_root(configured: str | os.PathLike[str] | None = None) -> Path:
-    """Resolve the research root while keeping all mutable state in the repository."""
+    """Resolve the research root.
+
+    Relative paths stay inside the repository.  An absolute path outside the
+    repository is allowed only through ``LOCOMOTION_RESEARCH_ROOT`` so API and
+    agent arguments cannot turn this read/write store into an arbitrary local
+    path reader.  The filesystem root itself is always rejected.
+    """
     base = PROJECT_ROOT.resolve()
-    raw = str(configured) if configured is not None else os.environ.get(
-        "LOCOMOTION_RESEARCH_ROOT", DEFAULT_RESEARCH_ROOT
+    raw = (
+        str(configured)
+        if configured is not None
+        else os.environ.get("LOCOMOTION_RESEARCH_ROOT", DEFAULT_RESEARCH_ROOT)
     )
     raw = raw.strip() or DEFAULT_RESEARCH_ROOT
-    candidate = (base / raw).resolve()
-    try:
-        candidate.relative_to(base)
-    except ValueError as exc:
-        raise ValueError("research root must remain inside the local repository") from exc
+    raw_path = Path(raw).expanduser()
+    if raw_path.is_absolute():
+        candidate = raw_path.resolve()
+        if configured is not None:
+            try:
+                candidate.relative_to(base)
+            except ValueError as exc:
+                raise ValueError(
+                    "explicit research root must remain inside the local repository"
+                ) from exc
+    else:
+        candidate = (base / raw_path).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(
+                "relative research root must remain inside the local repository"
+            ) from exc
+    if candidate == Path(candidate.anchor):
+        raise ValueError("research root cannot be the filesystem root")
     return candidate
 
 
@@ -40,7 +68,9 @@ def build_experiment_backend(
         return CommandExperimentBackend()
     if mode == "ssh":
         if active_settings.source != "real":
-            raise RuntimeError("SSH research backend requires LOCOMOTION_CONSOLE_SOURCE=real")
+            raise RuntimeError(
+                "SSH research backend requires LOCOMOTION_CONSOLE_SOURCE=real"
+            )
         from .config_manager import effective_remote_config
         from .research_remote import SSHExperimentBackend
 

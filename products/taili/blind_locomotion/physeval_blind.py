@@ -17,6 +17,9 @@ rough/boxes (scored D-style: controlled progress, tracking-band relaxed per spec
 (E1-E5) needs the push+DR battery — reported NOT-EVALUATED, never silently passed. Soft items
 (A5 B5 F1 F3) reported, never gating.
 """
+
+# IsaacLab's AppLauncher must be constructed before importing the runtime stack.
+# ruff: noqa: E402
 import argparse
 from isaaclab.app import AppLauncher
 
@@ -25,16 +28,37 @@ parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--steps", type=int, default=220)
 parser.add_argument("--task", type=str, default="RobotLab-Isaac-Taili-Blind-Direct-v0")
-parser.add_argument("--config", type=str, default="", help="Taili single-source config YAML")
-parser.add_argument("--agent-yaml", type=str, default="", help="Optional generated skrl runtime YAML")
-parser.add_argument("--terrain", type=str, default="flat",
-                    choices=["mix", "flat", "rough", "stairs", "stairs_up", "boxes", "slope"])
+parser.add_argument(
+    "--config", type=str, default="", help="Taili single-source config YAML"
+)
+parser.add_argument(
+    "--agent-yaml", type=str, default="", help="Optional generated skrl runtime YAML"
+)
+parser.add_argument(
+    "--terrain",
+    type=str,
+    default="flat",
+    choices=["mix", "flat", "rough", "stairs", "stairs_up", "boxes", "slope"],
+)
 parser.add_argument("--terrain-level", type=int, default=4)
-parser.add_argument("--report", type=str, default="", help="Write the scorecard as JSON to this path (for physeval_suite).")
-parser.add_argument("--friction", type=float, default=0.0,
-                    help="E3/E5: force foot/ground friction (spec E3 low-friction μ>=0.4). 0 = no override (default clean eval).")
-parser.add_argument("--com-offset", type=float, default=0.0,
-                    help="E5: force base CoM planar offset (m) on all envs. 0 = none.")
+parser.add_argument(
+    "--report",
+    type=str,
+    default="",
+    help="Write the scorecard as JSON to this path (for physeval_suite).",
+)
+parser.add_argument(
+    "--friction",
+    type=float,
+    default=0.0,
+    help="E3/E5: force foot/ground friction (spec E3 low-friction μ>=0.4). 0 = no override (default clean eval).",
+)
+parser.add_argument(
+    "--com-offset",
+    type=float,
+    default=0.0,
+    help="E5: force base CoM planar offset (m) on all envs. 0 = none.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.enable_cameras = False
@@ -48,31 +72,49 @@ import gymnasium as gym
 import yaml
 from skrl.utils.runner.torch import Runner
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
+
 try:
     import taili_blind_runtime as taili_runtime  # noqa: F401
     from taili_blind_runtime.taili_blind_env_cfg import TailiBlindEnvCfg
-    from taili_blind_runtime.taili_blind_config import build_skrl_config, load_taili_blind_config
+    from taili_blind_runtime.taili_blind_config import (
+        build_skrl_config,
+        load_taili_blind_config,
+    )
     from taili_blind_runtime.taili_core import taili_geometry
 except Exception:
     import products.taili.blind_locomotion as taili_runtime  # noqa: F401
     from products.taili.blind_locomotion.taili_blind_env_cfg import TailiBlindEnvCfg
-    from products.taili.blind_locomotion.taili_blind_config import build_skrl_config, load_taili_blind_config
+    from products.taili.blind_locomotion.taili_blind_config import (
+        build_skrl_config,
+        load_taili_blind_config,
+    )
     from products.taili.core import taili_geometry
-import acceptance_score as ACC                          # pure spec-threshold judge (off-sim unit-tested)
+import acceptance_score as ACC  # pure spec-threshold judge (off-sim unit-tested)
 
 LEGS = ["FL", "FR", "RL", "RR"]
 # Settled-stance vertical-force threshold for the B2 slip metric: a foot bearing more than ~10% of
 # the 38.98 kg Taili's weight (0.10 * 38.98 * 9.81 ≈ 38 N) is weight-bearing/settled; below it the
 # foot is in a touchdown or liftoff TRANSITION (still moving), which taili_spec excludes from slip.
 _SETTLE_N = 38.0
-COMMANDS = [("stand",  (0.0, 0.0, 0.0)),
-            ("fwd03",  (0.3, 0.0, 0.0)), ("fwd05",  (0.5, 0.0, 0.0)), ("fwd07", (0.7, 0.0, 0.0)),
-            ("back04", (-0.4, 0.0, 0.0)), ("lat03",  (0.0, 0.3, 0.0)),
-            ("yaw04",  (0.0, 0.0, 0.4)), ("yaw08",  (0.0, 0.0, 0.8)),
-            ("mixed",  (0.4, 0.2, 0.3))]
+COMMANDS = [
+    ("stand", (0.0, 0.0, 0.0)),
+    ("fwd03", (0.3, 0.0, 0.0)),
+    ("fwd05", (0.5, 0.0, 0.0)),
+    ("fwd07", (0.7, 0.0, 0.0)),
+    ("back04", (-0.4, 0.0, 0.0)),
+    ("lat03", (0.0, 0.3, 0.0)),
+    ("yaw04", (0.0, 0.0, 0.4)),
+    ("yaw08", (0.0, 0.0, 0.8)),
+    ("mixed", (0.4, 0.2, 0.3)),
+]
 SYMMETRIC = {"stand", "fwd03", "fwd05", "fwd07", "back04"}
-LINEAR = {"fwd03": (0, 0.3), "fwd05": (0, 0.5), "fwd07": (0, 0.7),
-          "back04": (0, -0.4), "lat03": (1, 0.3)}
+LINEAR = {
+    "fwd03": (0, 0.3),
+    "fwd05": (0, 0.5),
+    "fwd07": (0, 0.7),
+    "back04": (0, -0.4),
+    "lat03": (1, 0.3),
+}
 YAW = {"yaw04": 0.4, "yaw08": 0.8}
 
 
@@ -85,21 +127,44 @@ def main():
     cfg.scene.num_envs = args.num_envs
     if args.terrain != "mix":
         import isaaclab.terrains as tg
+
         single = {
-            "flat":   tg.MeshPlaneTerrainCfg(proportion=1.0),
-            "rough":  tg.HfRandomUniformTerrainCfg(proportion=1.0, noise_range=(0.02, 0.12),
-                                                   noise_step=0.02, border_width=0.25),
-            "stairs": tg.MeshPyramidStairsTerrainCfg(proportion=1.0, step_height_range=(0.05, 0.18),
-                                                     step_width=0.3, platform_width=3.0, border_width=1.0,
-                                                     holes=False),
+            "flat": tg.MeshPlaneTerrainCfg(proportion=1.0),
+            "rough": tg.HfRandomUniformTerrainCfg(
+                proportion=1.0,
+                noise_range=(0.02, 0.12),
+                noise_step=0.02,
+                border_width=0.25,
+            ),
+            "stairs": tg.MeshPyramidStairsTerrainCfg(
+                proportion=1.0,
+                step_height_range=(0.05, 0.18),
+                step_width=0.3,
+                platform_width=3.0,
+                border_width=1.0,
+                holes=False,
+            ),
             # 上楼场景使用倒置台阶形成坑底起步，验收按实际爬升高度判断，最高台阶约 25 cm。
-            "stairs_up": tg.MeshInvertedPyramidStairsTerrainCfg(proportion=1.0, step_height_range=(0.10, 0.25),
-                                                     step_width=0.32, platform_width=1.5, border_width=1.0,
-                                                     holes=False),
-            "boxes":  tg.MeshRandomGridTerrainCfg(proportion=1.0, grid_width=0.45,
-                                                  grid_height_range=(0.05, 0.2), platform_width=2.0),
-            "slope":  tg.HfPyramidSlopedTerrainCfg(proportion=1.0, slope_range=(0.0, 0.4),
-                                                   platform_width=2.0, border_width=0.25),
+            "stairs_up": tg.MeshInvertedPyramidStairsTerrainCfg(
+                proportion=1.0,
+                step_height_range=(0.10, 0.25),
+                step_width=0.32,
+                platform_width=1.5,
+                border_width=1.0,
+                holes=False,
+            ),
+            "boxes": tg.MeshRandomGridTerrainCfg(
+                proportion=1.0,
+                grid_width=0.45,
+                grid_height_range=(0.05, 0.2),
+                platform_width=2.0,
+            ),
+            "slope": tg.HfPyramidSlopedTerrainCfg(
+                proportion=1.0,
+                slope_range=(0.0, 0.4),
+                platform_width=2.0,
+                border_width=0.25,
+            ),
         }[args.terrain]
         cfg.terrain.terrain_generator.sub_terrains = {args.terrain: single}
     if cfg.terrain.terrain_generator is not None:
@@ -131,32 +196,49 @@ def main():
         if args.friction > 0.0:
             try:
                 _mats = robot.root_physx_view.get_material_properties().clone()
-                _mats[:, :, 0:2] = float(args.friction)           # static + dynamic friction, absolute
+                _mats[:, :, 0:2] = float(
+                    args.friction
+                )  # static + dynamic friction, absolute
                 robot.root_physx_view.set_material_properties(_mats, _idx.cpu())
-                print(f"[E3/E5] forced friction μ={args.friction} on all {_N} envs", flush=True)
+                print(
+                    f"[E3/E5] forced friction μ={args.friction} on all {_N} envs",
+                    flush=True,
+                )
             except Exception as _e:
-                print(f"[E3/E5] friction override FAILED: {type(_e).__name__}: {_e}", flush=True)
+                print(
+                    f"[E3/E5] friction override FAILED: {type(_e).__name__}: {_e}",
+                    flush=True,
+                )
         if args.com_offset != 0.0:
             try:
                 _coms = robot.root_physx_view.get_coms().clone()
                 _coms[:, 0, 0:2] += float(args.com_offset)
                 robot.root_physx_view.set_coms(_coms, _idx.cpu())
-                print(f"[E3/E5] forced CoM +{args.com_offset}m on all {_N} envs", flush=True)
+                print(
+                    f"[E3/E5] forced CoM +{args.com_offset}m on all {_N} envs",
+                    flush=True,
+                )
             except Exception as _e:
-                print(f"[E3/E5] CoM override FAILED: {type(_e).__name__}: {_e}", flush=True)
+                print(
+                    f"[E3/E5] CoM override FAILED: {type(_e).__name__}: {_e}",
+                    flush=True,
+                )
     foot_b = [robot.data.body_names.index(f"{lg}_foot") for lg in LEGS]
     cs = base._contact_sensor
     foot_c = base._feet_contact_ids
     hs = base._height_scanner
-    elim = robot.actuators["legs"].effort_limit                       # SAME source as env reward
+    elim = robot.actuators["legs"].effort_limit  # SAME source as env reward
     elim = torch.as_tensor(elim, device=base.device, dtype=torch.float32)
     if elim.ndim == 2:
         elim = elim[0]
     elim = elim.reshape(-1)
 
-    print(f"\n{'='*108}\nBLIND ACCEPTANCE  ckpt={os.path.basename(args.checkpoint)}  "
-          f"terrain={args.terrain}@{args.terrain_level}  num_envs={args.num_envs}  steps/cmd={args.steps}\n"
-          f"effort_limit(12)={elim.tolist()}\n{'='*108}", flush=True)
+    print(
+        f"\n{'=' * 108}\nBLIND ACCEPTANCE  ckpt={os.path.basename(args.checkpoint)}  "
+        f"terrain={args.terrain}@{args.terrain_level}  num_envs={args.num_envs}  steps/cmd={args.steps}\n"
+        f"effort_limit(12)={elim.tolist()}\n{'=' * 108}",
+        flush=True,
+    )
 
     def foot_clear(fp):
         hits = hs.data.ray_hits_w
@@ -171,39 +253,62 @@ def main():
     SC = {}
     tq_abs_max = torch.zeros(12, device=base.device)
     tq_samples = []
-    clamp_hits = 0; clamp_tot = 0
+    clamp_hits = 0
+    clamp_tot = 0
     td_vz_all = []
-    fall_any = torch.zeros(base.num_envs, dtype=torch.bool, device=base.device)   # D fall proxy
+    fall_any = torch.zeros(
+        base.num_envs, dtype=torch.bool, device=base.device
+    )  # D fall proxy
     bh_drop_max = 0.0
 
-    print(f"{'cmd':6s}| base_h | vx/vy/wz actual (cmd)        | swing FL/FR/RL/RR cm (peak) | "
-          f"duty FL/FR/RL/RR | slip FL/FR/RL/RR cm/s | sym dduty/dclr | up | th/ca", flush=True)
+    print(
+        f"{'cmd':6s}| base_h | vx/vy/wz actual (cmd)        | swing FL/FR/RL/RR cm (peak) | "
+        f"duty FL/FR/RL/RR | slip FL/FR/RL/RR cm/s | sym dduty/dclr | up | th/ca",
+        flush=True,
+    )
     for label, (vx, vy, wz) in COMMANDS:
         c = torch.tensor([vx, vy, wz], dtype=torch.float32, device=base.device)
-        A = {k: [] for k in ("bh", "vx", "vy", "wz", "swz", "swzpk", "duty", "slip", "up", "th", "ca")}
-        prev_contact = (cs.data.net_forces_w[:, foot_c, :].norm(dim=-1) > 1.0)
-        prev_firm = (cs.data.net_forces_w[:, foot_c, :].norm(dim=-1) > 10.0)   # B1: firm-landing edge, not 1N graze
+        A = {
+            k: []
+            for k in (
+                "bh",
+                "vx",
+                "vy",
+                "wz",
+                "swz",
+                "swzpk",
+                "duty",
+                "slip",
+                "up",
+                "th",
+                "ca",
+            )
+        }
+        prev_firm = (
+            cs.data.net_forces_w[:, foot_c, :].norm(dim=-1) > 10.0
+        )  # B1: firm-landing edge, not 1N graze
         td_vz = []
         for t in range(args.steps):
             with torch.inference_mode():
-                getattr(base, "_cmd_target", base.commands)[:] = c.unsqueeze(0).expand(base.num_envs, -1)
+                getattr(base, "_cmd_target", base.commands)[:] = c.unsqueeze(0).expand(
+                    base.num_envs, -1
+                )
                 out = runner.agent.act(obs, timestep=0, timesteps=0)
                 obs, _, _, _, _ = env.step(out[-1].get("mean_actions", out[0]))
                 _ff = cs.data.net_forces_w[:, foot_c, :].norm(dim=-1)
-                contact = (_ff > 1.0)
+                contact = _ff > 1.0
                 # settled 支撑要求足端承受真实载荷；滑移只在 settled 帧统计，避免把触地/离地
                 # 过渡帧混入支撑滑移。duty 仍使用较宽的接触阈值。
-                settled = (_ff > _SETTLE_N)
+                settled = _ff > _SETTLE_N
                 # touchdown 速度在足端首次形成稳定载荷时采样，而不是在轻微擦碰时采样。
-                firm = (_ff > 10.0)
+                firm = _ff > 10.0
                 firm_rising = firm & (~prev_firm)
                 if firm_rising.any() and t >= warm and label != "stand":
                     fvz = robot.data.body_lin_vel_w[:, foot_b, 2].abs()
                     td_vz.append(fvz[firm_rising].detach())
-                prev_contact = contact
                 prev_firm = firm
                 up_now = -robot.data.projected_gravity_b[:, 2]
-                fall_any |= (up_now < 0.5)                                       # >60deg tilt = fall
+                fall_any |= up_now < 0.5  # >60deg tilt = fall
                 if t >= warm:
                     tq = robot.data.applied_torque.abs()
                     tq_abs_max = torch.maximum(tq_abs_max, tq.max(0).values)
@@ -215,69 +320,135 @@ def main():
                     continue
                 fp = robot.data.body_pos_w[:, foot_b, :]
                 clr = foot_clear(fp)
-                inc = contact.float()                       # 1N contact — for DUTY (contact timing)
-                settled_f = settled.float()                 # weight-bearing — for SLIP (spec: settled only)
+                inc = contact.float()  # 1N contact — for DUTY (contact timing)
+                settled_f = (
+                    settled.float()
+                )  # weight-bearing — for SLIP (spec: settled only)
                 swing = 1.0 - inc
                 # 接触点速度而不是足端球心速度；滚动时球心速度不等于滑移。
                 # 滑移使用接触点速度 v = v_com + omega × r，而不是足端球心速度；这样滚动
                 # 不会被误报为支撑面滑移。
-                _omega = robot.data.body_ang_vel_w[:, foot_b, :]                      # (N,4,3)
+                _omega = robot.data.body_ang_vel_w[:, foot_b, :]  # (N,4,3)
                 _normal = getattr(base, "_support_reference_normal", None)
                 if _normal is None:
-                    _normal = torch.zeros((base.num_envs, 3), device=robot.data.body_lin_vel_w.device)
+                    _normal = torch.zeros(
+                        (base.num_envs, 3), device=robot.data.body_lin_vel_w.device
+                    )
                     _normal[:, 2] = 1.0
                 _r = -taili_geometry.FOOT_RADIUS * _normal[:, None, :]
-                _vc = robot.data.body_lin_vel_w[:, foot_b, :] + torch.cross(_omega, _r.expand_as(_omega), dim=-1)
+                _vc = robot.data.body_lin_vel_w[:, foot_b, :] + torch.cross(
+                    _omega, _r.expand_as(_omega), dim=-1
+                )
                 fvel = _vc[:, :, :2].norm(dim=-1)
-                A["bh"].append(float((robot.data.root_pos_w[:, 2] - base._terrain.env_origins[:, 2]).mean()))
+                A["bh"].append(
+                    float(
+                        (
+                            robot.data.root_pos_w[:, 2]
+                            - base._terrain.env_origins[:, 2]
+                        ).mean()
+                    )
+                )
                 A["vx"].append(robot.data.root_lin_vel_b[:, 0].detach())
                 A["vy"].append(robot.data.root_lin_vel_b[:, 1].detach())
                 A["wz"].append(robot.data.root_ang_vel_b[:, 2].detach())
-                A["swz"].append(((clr * swing).sum(0) / swing.sum(0).clamp(min=1.0) * 100).tolist())
+                A["swz"].append(
+                    ((clr * swing).sum(0) / swing.sum(0).clamp(min=1.0) * 100).tolist()
+                )
                 A["swzpk"].append((clr * swing).max(0).values.mul(100).tolist())
                 A["duty"].append(inc.mean(0).tolist())
-                A["slip"].append(((fvel * settled_f).sum(0) / settled_f.sum(0).clamp(min=1.0) * 100).tolist())
+                A["slip"].append(
+                    (
+                        (fvel * settled_f).sum(0)
+                        / settled_f.sum(0).clamp(min=1.0)
+                        * 100
+                    ).tolist()
+                )
                 A["up"].append(float(up_now.mean()))
                 jp = robot.data.joint_pos
-                A["th"].append(float(jp[:, 4:8].mean())); A["ca"].append(float(jp[:, 8:12].mean()))
-        bh = np.mean(A["bh"]); up = np.mean(A["up"])
-        vx_a = torch.stack(A["vx"]); vy_a = torch.stack(A["vy"]); wz_a = torch.stack(A["wz"])
-        swz = np.mean(A["swz"], 0); swpk = np.max(A["swzpk"], 0)
-        duty = np.mean(A["duty"], 0); slip = np.mean(A["slip"], 0)
-        th = np.degrees(np.mean(A["th"])); ca = np.degrees(np.mean(A["ca"]))
-        dd = abs(duty[0] - duty[1]) + abs(duty[2] - duty[3]); dc = abs(swz[0] - swz[1]) + abs(swz[2] - swz[3])
-        bh_drop_max = max(bh_drop_max, float(cfg.stand_height - bh) if hasattr(cfg, "stand_height") else 0.0)
+                A["th"].append(float(jp[:, 4:8].mean()))
+                A["ca"].append(float(jp[:, 8:12].mean()))
+        bh = np.mean(A["bh"])
+        up = np.mean(A["up"])
+        vx_a = torch.stack(A["vx"])
+        vy_a = torch.stack(A["vy"])
+        wz_a = torch.stack(A["wz"])
+        swz = np.mean(A["swz"], 0)
+        swpk = np.max(A["swzpk"], 0)
+        duty = np.mean(A["duty"], 0)
+        slip = np.mean(A["slip"], 0)
+        th = np.degrees(np.mean(A["th"]))
+        ca = np.degrees(np.mean(A["ca"]))
+        dd = abs(duty[0] - duty[1]) + abs(duty[2] - duty[3])
+        dc = abs(swz[0] - swz[1]) + abs(swz[2] - swz[3])
+        bh_drop_max = max(
+            bh_drop_max,
+            float(cfg.stand_height - bh) if hasattr(cfg, "stand_height") else 0.0,
+        )
         if td_vz:
             td_vz_all.append(torch.cat(td_vz))
-        climb = float(A["bh"][-1] - A["bh"][0]) if len(A["bh"]) > 1 else 0.0   # height GAINED = ascent
-        SC[label] = dict(bh=bh, up=up, vx=vx_a.mean().item(), vy=vy_a.mean().item(), wz=wz_a.mean().item(),
-                         swz=swz, swpk=swpk, duty=duty, slip=slip, dd=dd, dc=dc, climb=climb,
-                         vx_a=vx_a, vy_a=vy_a, wz_a=wz_a)
-        print(f"{label:6s}| {bh:.3f}m | {SC[label]['vx']:+.2f}/{SC[label]['vy']:+.2f}/{SC[label]['wz']:+.2f} "
-              f"({vx:+.1f}/{vy:+.1f}/{wz:+.1f}) | {swz[0]:.1f}/{swz[1]:.1f}/{swz[2]:.1f}/{swz[3]:.1f} "
-              f"({swpk.max():.0f}) | {duty[0]:.2f}/{duty[1]:.2f}/{duty[2]:.2f}/{duty[3]:.2f} | "
-              f"{slip[0]:.0f}/{slip[1]:.0f}/{slip[2]:.0f}/{slip[3]:.0f} | {dd:.2f}/{dc:.1f} | "
-              f"{up:.3f} | {th:.0f}/{ca:.0f}", flush=True)
+        climb = (
+            float(A["bh"][-1] - A["bh"][0]) if len(A["bh"]) > 1 else 0.0
+        )  # height GAINED = ascent
+        SC[label] = dict(
+            bh=bh,
+            up=up,
+            vx=vx_a.mean().item(),
+            vy=vy_a.mean().item(),
+            wz=wz_a.mean().item(),
+            swz=swz,
+            swpk=swpk,
+            duty=duty,
+            slip=slip,
+            dd=dd,
+            dc=dc,
+            climb=climb,
+            vx_a=vx_a,
+            vy_a=vy_a,
+            wz_a=wz_a,
+        )
+        print(
+            f"{label:6s}| {bh:.3f}m | {SC[label]['vx']:+.2f}/{SC[label]['vy']:+.2f}/{SC[label]['wz']:+.2f} "
+            f"({vx:+.1f}/{vy:+.1f}/{wz:+.1f}) | {swz[0]:.1f}/{swz[1]:.1f}/{swz[2]:.1f}/{swz[3]:.1f} "
+            f"({swpk.max():.0f}) | {duty[0]:.2f}/{duty[1]:.2f}/{duty[2]:.2f}/{duty[3]:.2f} | "
+            f"{slip[0]:.0f}/{slip[1]:.0f}/{slip[2]:.0f}/{slip[3]:.0f} | {dd:.2f}/{dc:.1f} | "
+            f"{up:.3f} | {th:.0f}/{ca:.0f}",
+            flush=True,
+        )
 
     # =========================== STOP-RECOVERY (A3 settle) ===========================
-    cw = torch.tensor([0.5, 0.0, 0.0], device=base.device); cz = torch.zeros(3, device=base.device)
+    cw = torch.tensor([0.5, 0.0, 0.0], device=base.device)
+    cz = torch.zeros(3, device=base.device)
     for t in range(120):
         with torch.inference_mode():
-            getattr(base, "_cmd_target", base.commands)[:] = cw.unsqueeze(0).expand(base.num_envs, -1)
+            getattr(base, "_cmd_target", base.commands)[:] = cw.unsqueeze(0).expand(
+                base.num_envs, -1
+            )
             out = runner.agent.act(obs, timestep=0, timesteps=0)
             obs, _, _, _, _ = env.step(out[-1].get("mean_actions", out[0]))
     spd_tr, h_tr, duty_tr, up_tr, v_tr, wz_tr = [], [], [], [], [], []
     HALT = 160
     for t in range(HALT):
         with torch.inference_mode():
-            getattr(base, "_cmd_target", base.commands)[:] = cz.unsqueeze(0).expand(base.num_envs, -1)
+            getattr(base, "_cmd_target", base.commands)[:] = cz.unsqueeze(0).expand(
+                base.num_envs, -1
+            )
             out = runner.agent.act(obs, timestep=0, timesteps=0)
             obs, _, _, _, _ = env.step(out[-1].get("mean_actions", out[0]))
             spd = float(robot.data.root_lin_vel_b[:, :2].norm(dim=-1).mean())
             wzr = float(robot.data.root_ang_vel_b[:, 2].abs().mean())
-            v_tr.append(spd); wz_tr.append(wzr); spd_tr.append(spd + wzr)   # spd_tr kept for resid/peak report
-            h_tr.append(float((robot.data.root_pos_w[:, 2] - base._terrain.env_origins[:, 2]).mean()))
-            inc = (cs.data.net_forces_w[:, foot_c, :].norm(dim=-1) > 10.0).float()  # DUTY = foot down (10N, matches train), not the 38N settled-slip mask
+            v_tr.append(spd)
+            wz_tr.append(wzr)
+            spd_tr.append(spd + wzr)  # spd_tr kept for resid/peak report
+            h_tr.append(
+                float(
+                    (
+                        robot.data.root_pos_w[:, 2] - base._terrain.env_origins[:, 2]
+                    ).mean()
+                )
+            )
+            inc = (
+                cs.data.net_forces_w[:, foot_c, :].norm(dim=-1) > 10.0
+            ).float()  # DUTY = foot down (10N, matches train), not the 38N settled-slip mask
             duty_tr.append(inc.mean(0).tolist())
             up_tr.append(float((-robot.data.projected_gravity_b[:, 2]).mean()))
     spd_tr, v_tr, wz_tr = np.array(spd_tr), np.array(v_tr), np.array(wz_tr)
@@ -289,22 +460,35 @@ def main():
     _first = next((i for i in range(len(_settled)) if _settled[i]), HALT)
     _dt = float(getattr(base, "step_dt", 0.02))
     _blips = int((~_settled[_first:]).sum()) if _first < HALT else 0
-    print(f"[A3_SETTLE_DIAG] first_settled={_first*_dt:.2f}s strict_settle={settle*_dt:.2f}s "
-          f"blips_after_first={_blips} maxv_after_first={float(v_tr[_first:].max()) if _first<HALT else 0:.3f} "
-          f"maxwz_after_first={float(wz_tr[_first:].max()) if _first<HALT else 0:.3f}", flush=True)
-    resid = float(spd_tr[-30:].mean()); peak = float(spd_tr[:20].max())
-    fduty = np.mean(duty_tr[-30:], 0); fh = float(np.mean(h_tr[-30:])); fup = float(np.mean(up_tr[-30:]))
+    print(
+        f"[A3_SETTLE_DIAG] first_settled={_first * _dt:.2f}s strict_settle={settle * _dt:.2f}s "
+        f"blips_after_first={_blips} maxv_after_first={float(v_tr[_first:].max()) if _first < HALT else 0:.3f} "
+        f"maxwz_after_first={float(wz_tr[_first:].max()) if _first < HALT else 0:.3f}",
+        flush=True,
+    )
+    resid = float(spd_tr[-30:].mean())
+    peak = float(spd_tr[:20].max())
+    fduty = np.mean(duty_tr[-30:], 0)
+    fh = float(np.mean(h_tr[-30:]))
+    fup = float(np.mean(up_tr[-30:]))
     fsym = abs(fduty[0] - fduty[1]) + abs(fduty[2] - fduty[3])
-    print(f"\n{'-'*108}\nSTOP-RECOVERY (walk0.5 -> halt {HALT}): settle={settle} ({settle*0.02:.1f}s)  "
-          f"resid={resid:.3f}m/s  peak={peak:.2f}  duty={fduty[0]:.2f}/{fduty[1]:.2f}/{fduty[2]:.2f}/{fduty[3]:.2f}  "
-          f"sym={fsym:.2f}  h={fh:.3f}m  up={fup:.3f}", flush=True)
+    print(
+        f"\n{'-' * 108}\nSTOP-RECOVERY (walk0.5 -> halt {HALT}): settle={settle} ({settle * 0.02:.1f}s)  "
+        f"resid={resid:.3f}m/s  peak={peak:.2f}  duty={fduty[0]:.2f}/{fduty[1]:.2f}/{fduty[2]:.2f}/{fduty[3]:.2f}  "
+        f"sym={fsym:.2f}  h={fh:.3f}m  up={fup:.3f}",
+        flush=True,
+    )
 
     # =========================== SCORECARD via acceptance_score (vs taili_spec) ===========================
     def p(a, q):
         return float(torch.quantile(a.reshape(-1).float(), q))
-    print(f"\n{'='*108}\nSCORECARD vs taili_spec ({args.terrain}@{args.terrain_level}, mean-action)\n{'='*108}", flush=True)
+
+    print(
+        f"\n{'=' * 108}\nSCORECARD vs taili_spec ({args.terrain}@{args.terrain_level}, mean-action)\n{'=' * 108}",
+        flush=True,
+    )
     results = {}
-    flat = (args.terrain == "flat")
+    flat = args.terrain == "flat"
 
     if flat:
         a1b = {}
@@ -324,20 +508,37 @@ def main():
         if "stand" in SC:
             s = SC["stand"]
             speed = (s["vx"] ** 2 + s["vy"] ** 2) ** 0.5
-            results.update(ACC.score_A3(speed, s["wz"], settle * 0.02, float(min(s["duty"])), s["up"]))
+            results.update(
+                ACC.score_A3(
+                    speed, s["wz"], settle * 0.02, float(min(s["duty"])), s["up"]
+                )
+            )
         if td_vz_all:
             results.update(ACC.score_B1(p(torch.cat(td_vz_all), 0.95), args.terrain))
-        slip_pool = np.concatenate([SC[l]["slip"] for l in SC if l != "stand"]) / 100.0
+        slip_pool = np.concatenate([SC[label]["slip"] for label in SC if label != "stand"]) / 100.0
         results.update(ACC.score_B2(float(np.percentile(slip_pool, 90)), args.terrain))
         # per-swing-peak p90 distribution (not a global max-of-max outlier over ~300k samples)
-        _swpk = np.concatenate([np.asarray(SC[l]["swpk"], dtype=float).reshape(-1)
-                                for l in SC if l != "stand"])
+        _swpk = np.concatenate(
+            [
+                np.asarray(SC[label]["swpk"], dtype=float).reshape(-1)
+                for label in SC
+                if label != "stand"
+            ]
+        )
         peakcm = float(np.percentile(_swpk, 90)) / 100.0
         results.update(ACC.score_B3(peakcm, args.terrain))
-        symb = {l: (SC[l]["dd"], SC[l]["dc"] / 100.0) for l in SYMMETRIC if l in SC}
+        symb = {
+            label: (SC[label]["dd"], SC[label]["dc"] / 100.0)
+            for label in SYMMETRIC
+            if label in SC
+        }
         results.update(ACC.score_B4(symb))
         a3ok = results.get("A3", {"ok": False})["ok"]
-        results.update(ACC.score_C(a3ok, SC.get("stand", {}).get("dd", 9.0), fup, float(min(fduty))))
+        results.update(
+            ACC.score_C(
+                a3ok, SC.get("stand", {}).get("dd", 9.0), fup, float(min(fduty))
+            )
+        )
     else:
         if args.terrain == "stairs_up":
             # ASCENDING: judge by HEIGHT CLIMBED (ascent is slow, so a 0.30 m/s horizontal bar would
@@ -349,27 +550,45 @@ def main():
             # D terrain: controlled progress at fwd05, no fall, bounded base-height drop
             fwd = SC.get("fwd05", SC.get("fwd03", {}))
             fwd_speed = fwd.get("vx", 0.0)
-            results.update(ACC.score_D(fwd_speed, float(fall_any.float().mean()), bh_drop_max, args.terrain))
+            results.update(
+                ACC.score_D(
+                    fwd_speed, float(fall_any.float().mean()), bh_drop_max, args.terrain
+                )
+            )
 
     # F2 always (torque is terrain-independent hardware gate)
-    tqs = torch.cat(tq_samples) if tq_samples else torch.zeros(1, 12, device=base.device)
+    tqs = (
+        torch.cat(tq_samples) if tq_samples else torch.zeros(1, 12, device=base.device)
+    )
     q995 = torch.quantile(tqs.float(), 0.995, dim=0)
     ratio995 = (q995 / elim).max().item()
     peak_ratio = (tq_abs_max / elim).max().item()
     clamp_rate = clamp_hits / max(1, clamp_tot)
-    results.update(ACC.score_F2(ratio995, peak_ratio, clamp_rate, int((q995 / elim).argmax().item())))
+    results.update(
+        ACC.score_F2(
+            ratio995, peak_ratio, clamp_rate, int((q995 / elim).argmax().item())
+        )
+    )
 
     for k, v in results.items():
         print(f"{k:10s} {pf(v['ok'])}  {v['detail']}", flush=True)
     s = ACC.summarize(results)
-    print(f"\n{'-'*108}\nHARD GATES on {args.terrain}: {s['n_pass']}/{s['n_total']} pass  "
-          f"PASS[{', '.join(s['passed'])}]  FAIL[{', '.join(s['failed'])}]", flush=True)
-    print("NOT-EVALUATED here: " + ("D1-D4 (run --terrain stairs/slope/rough/boxes); " if flat else "")
-          + "E1-E5 (push + full DR battery); B4 pi(M obs)=M pi(obs) [structural; unit-tested in taili_core]. "
-            "Soft report-only: A5 envelope, B5 jerk, F1 CoT, F3 jitter.", flush=True)
+    print(
+        f"\n{'-' * 108}\nHARD GATES on {args.terrain}: {s['n_pass']}/{s['n_total']} pass  "
+        f"PASS[{', '.join(s['passed'])}]  FAIL[{', '.join(s['failed'])}]",
+        flush=True,
+    )
+    print(
+        "NOT-EVALUATED here: "
+        + ("D1-D4 (run --terrain stairs/slope/rough/boxes); " if flat else "")
+        + "E1-E5 (push + full DR battery); B4 pi(M obs)=M pi(obs) [structural; unit-tested in taili_core]. "
+        "Soft report-only: A5 envelope, B5 jerk, F1 CoT, F3 jitter.",
+        flush=True,
+    )
     if args.report:
         import json as _json
         from pathlib import Path as _Path
+
         payload = {
             "terrain": args.terrain,
             "terrain_level": args.terrain_level,

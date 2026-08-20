@@ -21,9 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping
 
-from autotuner.llm_gateway.client import LLMResponse, call_llm_with_schema
+from autotuner.llm_gateway.client import call_llm_with_schema
 from autotuner.llm_gateway.schemas import (
     TaskSpecVocabulary,
     TaskSpec,
@@ -32,7 +32,6 @@ from autotuner.llm_gateway.schemas import (
 from autotuner.product import (
     ProductRegistry,
     ResolvedProductContract,
-    TaskBundleMaterializer,
     TaskContractStore,
     TaskContractBundle,
     TaskContractCompiler,

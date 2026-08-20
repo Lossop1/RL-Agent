@@ -13,9 +13,8 @@ Returned style features match the clip convention used by collect_reference_moti
   jv (M,12) joint vel (finite diff), bh (M,1) base height, tn (M,6) base tangent+normal,
   foot_rel (M,4,3) foot position relative to base in base frame, legs [FL,FR,RL,RR].
 """
+
 from __future__ import annotations
-import math
-import numpy as np
 import torch
 
 try:
@@ -24,14 +23,14 @@ except ImportError:
     from products.taili.core import taili_geometry as geometry
 
 # --- URDF kinematic constants (identical to gen_taili_gaits.py) ---
-L1 = 0.36385                                          # thigh length
-FOOT_OFF = (0.0252765, 0.0, -0.3179635)              # calf->foot offset (sagittal x,z used)
-HIPX, HIPY = 0.30414, 0.065                          # hip joint offset from base (x, y)
-THIGHY = 0.1432                                       # hip-abduction-axis -> thigh sagittal-plane y offset
-BASE_Z = geometry.NOMINAL_BASE_HEIGHT                # 足端球心高度加 URDF 碰撞球半径。
+L1 = 0.36385  # thigh length
+FOOT_OFF = (0.0252765, 0.0, -0.3179635)  # calf->foot offset (sagittal x,z used)
+HIPX, HIPY = 0.30414, 0.065  # hip joint offset from base (x, y)
+THIGHY = 0.1432  # hip-abduction-axis -> thigh sagittal-plane y offset
+BASE_Z = geometry.NOMINAL_BASE_HEIGHT  # 足端球心高度加 URDF 碰撞球半径。
 LEGS = ["FL", "FR", "RL", "RR"]
-SGN = {"FL": (1, 1), "FR": (1, -1), "RL": (-1, 1), "RR": (-1, -1)}   # (x,y) sign per leg
-TROT = {"FL": 0.0, "FR": 0.5, "RL": 0.5, "RR": 0.0}                  # diagonal trot phase offsets
+SGN = {"FL": (1, 1), "FR": (1, -1), "RL": (-1, 1), "RR": (-1, -1)}  # (x,y) sign per leg
+TROT = {"FL": 0.0, "FR": 0.5, "RL": 0.5, "RR": 0.0}  # diagonal trot phase offsets
 
 
 def _fk2(th_t, th_c):
@@ -46,7 +45,7 @@ def _fk2(th_t, th_c):
 
 def _ik2(tx, tz, iters=40):
     """2-link sagittal IK (vectorized Newton) for target foot (tx,tz) rel hip -> (th_t, th_c)."""
-    th_t = torch.full_like(tx, 0.7)   # 从默认站立姿态开始，保证 IK 分支连续。
+    th_t = torch.full_like(tx, 0.7)  # 从默认站立姿态开始，保证 IK 分支连续。
     th_c = torch.full_like(tx, -1.4)
     ox, oz = FOOT_OFF[0], FOOT_OFF[2]
     for _ in range(iters):
@@ -91,11 +90,11 @@ def _foot_traj(p, sdx, sdy, clearance):
     stance = p < 0.5
     s_st = p / 0.5
     s_sw = (p - 0.5) / 0.5
-    smooth5 = s_sw ** 3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
+    smooth5 = s_sw**3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
     hsw = 2.0 * smooth5 - s_sw
     fx = torch.where(stance, X0 + sdx / 2 - sdx * s_st, X0 - sdx / 2 + sdx * hsw)
     fy = torch.where(stance, sdy / 2 - sdy * s_st, -sdy / 2 + sdy * hsw)
-    swing_bump = 64.0 * s_sw ** 3 * (1.0 - s_sw) ** 3
+    swing_bump = 64.0 * s_sw**3 * (1.0 - s_sw) ** 3
     fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * swing_bump)
     return fx, fy, fz
 
@@ -109,17 +108,30 @@ def clearance_for_speed(speed, clearance_base, clearance_gain):
     """低速缩短步幅时同步降低平地抬脚高度，避免小步高抬后重落脚。"""
     speed_ratio = torch.clamp(speed / 0.50, 0.0, 1.0)
     base_scale = 0.55 + 0.45 * speed_ratio
-    return clearance_base * base_scale + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)
+    return clearance_base * base_scale + clearance_gain * torch.clamp(
+        speed / 2.0, 0.0, 1.0
+    )
 
 
-def foot_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075,
-                   gait_period_min=0.40, yaw_speed_equiv=0.15,
-                   clearance_base=0.09, clearance_gain=0.03, stance_dx=0.0):
+def foot_reference(
+    commands,
+    times,
+    *,
+    gait_period=0.55,
+    gait_period_slope=0.075,
+    gait_period_min=0.40,
+    yaw_speed_equiv=0.15,
+    clearance_base=0.09,
+    clearance_gain=0.03,
+    stance_dx=0.0,
+):
     """生成命令条件化的四足相对机身轨迹，不执行 IK。"""
     vx, vy, wz = commands[:, 0], commands[:, 1], commands[:, 2]
     speed = torch.norm(commands[:, :2], dim=1)
     period_speed = speed + float(yaw_speed_equiv) * wz.abs()
-    period = period_for_speed(period_speed, gait_period, gait_period_slope, gait_period_min)
+    period = period_for_speed(
+        period_speed, gait_period, gait_period_slope, gait_period_min
+    )
     clearance = clearance_for_speed(period_speed, clearance_base, clearance_gain)
     clearance = clearance * torch.clamp(torch.norm(commands, dim=1) / 0.1, 0.0, 1.0)
 
@@ -142,10 +154,22 @@ def foot_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
     return torch.stack(feet, dim=1)
 
 
-def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075, gait_period_min=0.40,
-                   yaw_speed_equiv=0.15, clearance_base=0.09, clearance_gain=0.03,
-                   roughness=None, clearance_rough_gain=0.30,
-                   stance_dx=0.0, iters=40, jp_only=False):
+def flat_reference(
+    commands,
+    times,
+    *,
+    gait_period=0.55,
+    gait_period_slope=0.075,
+    gait_period_min=0.40,
+    yaw_speed_equiv=0.15,
+    clearance_base=0.09,
+    clearance_gain=0.03,
+    roughness=None,
+    clearance_rough_gain=0.30,
+    stance_dx=0.0,
+    iters=40,
+    jp_only=False,
+):
     """Analytic trot reference. commands (M,3) [vx,vy,wz], times (M,) local time (s).
     roughness (M,) optional terrain roughness in [0,~0.3]: raises swing clearance so the AMP discriminator
     rewards a HIGH-LIFT climbing style on rough/stair terrain (flat terrain keeps the low-energy ~9cm lift).
@@ -155,19 +179,30 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
     speed = torch.norm(commands[:, :2], dim=1)
     # yaw 按足端旋转半径折算成等效线速度，只影响步态周期；步幅仍由刚体足端速度公式决定。
     period_speed = speed + float(yaw_speed_equiv) * wz.abs()
-    T = period_for_speed(period_speed, gait_period, gait_period_slope, gait_period_min)    # (M,)
-    clearance = clearance_for_speed(period_speed, clearance_base, clearance_gain)             # (M,)
+    T = period_for_speed(
+        period_speed, gait_period, gait_period_slope, gait_period_min
+    )  # (M,)
+    clearance = clearance_for_speed(
+        period_speed, clearance_base, clearance_gain
+    )  # (M,)
     if roughness is not None:
-        clearance = clearance + clearance_rough_gain * torch.clamp(roughness, 0.0, 0.3)     # higher lift on rough
+        clearance = clearance + clearance_rough_gain * torch.clamp(
+            roughness, 0.0, 0.3
+        )  # higher lift on rough
     # STAND reference: at ~zero command the stride is already 0, but the swing still lifts -> the reference is
     # "marching in place", so the discriminator rewards the standing policy for lifting feet -> FIDGET. Gate the
     # swing clearance by command magnitude so a stand command yields a STATIC planted stance (feet at nominal,
     # zero joint velocity) -> the discriminator instead rewards STILLNESS when commanded to stand.
-    cmd_mag = torch.norm(commands, dim=1)                                                   # (M,) incl. yaw
-    clearance = clearance * torch.clamp(cmd_mag / 0.1, 0.0, 1.0)                            # 0 at stand -> planted
+    cmd_mag = torch.norm(commands, dim=1)  # (M,) incl. yaw
+    clearance = clearance * torch.clamp(
+        cmd_mag / 0.1, 0.0, 1.0
+    )  # 0 at stand -> planted
 
     def joints_at(tt):
-        hip = []; thigh = []; calf = []; foot = []
+        hip = []
+        thigh = []
+        calf = []
+        foot = []
         for lg in LEGS:
             sx, sy = SGN[lg]
             hx, hy = sx * HIPX, sy * HIPY
@@ -188,7 +223,9 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
             th_h = torch.atan2(fy, -fz)
             r = torch.hypot(fy, fz)
             th_t, th_c = _ik2(fx, -r, iters)
-            hip.append(th_h); thigh.append(th_t); calf.append(th_c)
+            hip.append(th_h)
+            thigh.append(th_t)
+            calf.append(th_c)
             if jp_only:
                 continue
             # foot rel BASE = hip offset + Rx(th_h)@([0, sy*THIGHY, 0] + 2-link foot). The decoupled IK target
@@ -196,8 +233,8 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
             fy_b = hy + fy + sy * THIGHY * torch.cos(th_h)
             fz_b = fz + sy * THIGHY * torch.sin(th_h)
             foot.append(torch.stack([hx + fx, fy_b, fz_b], dim=-1))
-        jp = torch.stack(hip + thigh + calf, dim=-1)                   # (M,12) clip dof order
-        foot_rel = None if jp_only else torch.stack(foot, dim=1)       # (M,4,3)
+        jp = torch.stack(hip + thigh + calf, dim=-1)  # (M,12) clip dof order
+        foot_rel = None if jp_only else torch.stack(foot, dim=1)  # (M,4,3)
         return jp, foot_rel
 
     # JP-ONLY FAST PATH (imitation reward): one IK pass, fewer iters, skip jv/bh/tn/foot_rel. ~6x cheaper than the
@@ -212,7 +249,16 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
 
     M = commands.shape[0]
     bh = torch.full((M, 1), BASE_Z, device=dev)
-    yaw = wz * times                                                  # base yaw accumulates for turning
-    tn = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw),
-                      torch.zeros_like(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)], dim=-1)
+    yaw = wz * times  # base yaw accumulates for turning
+    tn = torch.stack(
+        [
+            torch.cos(yaw),
+            torch.sin(yaw),
+            torch.zeros_like(yaw),
+            torch.zeros_like(yaw),
+            torch.zeros_like(yaw),
+            torch.ones_like(yaw),
+        ],
+        dim=-1,
+    )
     return jp, jv, bh, tn, foot_rel

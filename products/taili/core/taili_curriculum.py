@@ -7,7 +7,7 @@ sourced from taili_spec.md. CPU-testable for internal consistency.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # ── #2 command sampling (φ0–φ1) ──────────────────────────────────────────────
 COMMAND_PROPORTIONS_PHI0 = {        # single-axis + stand; Σ = 1.0

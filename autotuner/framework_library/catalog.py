@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Tuple
 
 AdaptKind = Literal["invariant", "derive", "regenerate", "scale"]
 

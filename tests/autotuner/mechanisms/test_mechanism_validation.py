@@ -1,7 +1,6 @@
 """Anti-cheat, parity, and numerical validation tests."""
 from __future__ import annotations
 
-import pytest
 
 from autotuner.mechanisms.mechanism_specs import (
     Expression,

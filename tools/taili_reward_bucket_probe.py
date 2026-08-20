@@ -816,7 +816,10 @@ class _CollisionRecoveryAudit:
         self.target_delay = torch.zeros(self.shape, device=self.device)
         self.last_contact = torch.ones(self.shape, dtype=torch.bool, device=self.device)
 
-        zeros = lambda: torch.zeros(self.bucket_count, dtype=torch.float64, device=self.device)
+        def zeros():
+            return torch.zeros(
+                self.bucket_count, dtype=torch.float64, device=self.device
+            )
         self.started = zeros()
         self.closed = zeros()
         self.censored = zeros()
@@ -1556,7 +1559,6 @@ def _force_stair_level(base: Any, requested_level: int) -> dict[str, int] | None
     if requested_level < 0:
         return None
 
-    import torch
 
     terrain = base._terrain
     max_level = int(terrain.terrain_origins.shape[0]) - 1

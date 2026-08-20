@@ -4,6 +4,8 @@ The trainer PLUMBING (optimizer groups, z_prev pairing through the rollout shuff
 integration; the MATH here is CPU-unit-testable and is what the TerrainPerceiver aux head trains
 against, so a regression here silently corrupts the learned terrain latent.
 """
+# Torch is optional in the test environment; importorskip must run first.
+# ruff: noqa: E402
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -98,7 +100,6 @@ def test_smoothness_zero_when_not_steady():
 
 def test_aux_loss_weights_geom_and_risk():
     # geom Huber 0.5 (weight 1.0) + risk Huber 0.5 (weight 0.5) = 0.5 + 0.25 = 0.75
-    z = torch.zeros(1, 2)
     geom_pred, geom_label, geom_mask = torch.zeros(2), torch.ones(2), torch.ones(2)
     risk_pred, risk_label, risk_mask = torch.zeros(2), torch.ones(2), torch.ones(2)
     loss = L.aux_loss(geom_pred, geom_label, geom_mask, risk_pred, risk_label, risk_mask)

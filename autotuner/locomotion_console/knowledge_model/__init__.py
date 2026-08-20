@@ -47,6 +47,7 @@ __all__ = [
     "CurriculumModelResult",
     # store / public API
     "KnowledgeStore",
+    "get_code_facts",
     "get_reward_model",
     "assemble_reward_term",
     "reward_model_audit",

@@ -5,7 +5,6 @@ import pytest
 
 from autotuner.mechanisms.mechanism_specs import (
     Expression,
-    GateSpec,
     MechanismBundle,
     MechanismOperation,
     MechanismPatch,

@@ -19,7 +19,7 @@ import os
 import time
 from typing import Callable, Literal, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -846,7 +846,7 @@ def _research_root():
 def _research_cycle_manager():
     from .research_service import build_research_cycle_manager
 
-    return build_research_cycle_manager(settings=settings, root=_research_root())
+    return build_research_cycle_manager(settings=settings)
 
 
 @app.get("/research/state")

@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
-import sys
 from pathlib import Path
 
 from autotuner.infrastructure.remote import RemoteSSH

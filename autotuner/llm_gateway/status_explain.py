@@ -15,7 +15,7 @@ gateway is offline, build a deterministic readable line from the abstract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 from autotuner.llm_gateway.client import call_llm_with_schema
 

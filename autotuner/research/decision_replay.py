@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 from .research_supervisor import evidence_policy
 

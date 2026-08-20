@@ -12,7 +12,6 @@ import math
 import os
 from pathlib import Path
 import statistics
-import sys
 import traceback
 from typing import Any
 

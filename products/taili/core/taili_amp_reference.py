@@ -11,23 +11,22 @@ parametric_ref (which is reference-only):
 
 Kinematic constants are URDF-derived (same as gen_taili_gaits / parametric_ref). Pure torch.
 """
+
 from __future__ import annotations
 
-import math
 
 import torch
 
 from . import taili_geometry as geometry
-from . import taili_symmetry as sym
 
 # ── URDF kinematic constants ─────────────────────────────────────────────────
-L1 = 0.36385                               # thigh length
-FOOT_OFF = (0.0252765, 0.0, -0.3179635)    # calf->foot offset (sagittal x,z used)
-HIPX, HIPY = 0.30414, 0.065                # hip joint offset from base (x, y)
-THIGHY = 0.1432                            # hip-abduction-axis -> thigh sagittal y offset
+L1 = 0.36385  # thigh length
+FOOT_OFF = (0.0252765, 0.0, -0.3179635)  # calf->foot offset (sagittal x,z used)
+HIPX, HIPY = 0.30414, 0.065  # hip joint offset from base (x, y)
+THIGHY = 0.1432  # hip-abduction-axis -> thigh sagittal y offset
 LEGS = ["FL", "FR", "RL", "RR"]
-SGN = {"FL": (1, 1), "FR": (1, -1), "RL": (-1, 1), "RR": (-1, -1)}   # (x,y) sign per leg
-TROT = {"FL": 0.0, "FR": 0.5, "RL": 0.5, "RR": 0.0}                  # diagonal trot offsets
+SGN = {"FL": (1, 1), "FR": (1, -1), "RL": (-1, 1), "RR": (-1, -1)}  # (x,y) sign per leg
+TROT = {"FL": 0.0, "FR": 0.5, "RL": 0.5, "RR": 0.0}  # diagonal trot offsets
 
 # ── nominal pose = q_default (Runtime IO / asset; NOT the old 0.6/-1.2) ───────
 Q_DEFAULT_THIGH = 0.7
@@ -133,11 +132,11 @@ def _foot_traj(p, sdx, sdy, clearance):
     stance = p < 0.5
     s_st = p / 0.5
     s_sw = (p - 0.5) / 0.5
-    smooth5 = s_sw ** 3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
+    smooth5 = s_sw**3 * (10.0 + s_sw * (-15.0 + 6.0 * s_sw))
     hsw = 2.0 * smooth5 - s_sw
     fx = torch.where(stance, X0 + sdx / 2 - sdx * s_st, X0 - sdx / 2 + sdx * hsw)
     fy = torch.where(stance, sdy / 2 - sdy * s_st, -sdy / 2 + sdy * hsw)
-    swing_bump = 64.0 * s_sw ** 3 * (1.0 - s_sw) ** 3
+    swing_bump = 64.0 * s_sw**3 * (1.0 - s_sw) ** 3
     fz = torch.where(stance, torch.full_like(p, -H0), -H0 + clearance * swing_bump)
     return fx, fy, fz
 
@@ -150,13 +149,24 @@ def clearance_for_speed(speed, clearance_base, clearance_gain):
     """低速缩短步幅时同步降低平地抬脚高度，避免小步高抬后重落脚。"""
     speed_ratio = torch.clamp(speed / 0.50, 0.0, 1.0)
     base_scale = 0.55 + 0.45 * speed_ratio
-    return clearance_base * base_scale + clearance_gain * torch.clamp(speed / 2.0, 0.0, 1.0)
+    return clearance_base * base_scale + clearance_gain * torch.clamp(
+        speed / 2.0, 0.0, 1.0
+    )
 
 
-def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075,
-                   gait_period_min=0.40, yaw_speed_equiv=0.15,
-                   clearance_base=0.07, clearance_gain=0.03,
-                   stance_dx=0.0, iters=40):
+def flat_reference(
+    commands,
+    times,
+    *,
+    gait_period=0.55,
+    gait_period_slope=0.075,
+    gait_period_min=0.40,
+    yaw_speed_equiv=0.15,
+    clearance_base=0.07,
+    clearance_gain=0.03,
+    stance_dx=0.0,
+    iters=40,
+):
     """Analytic trot reference, command-conditioned, terrain-AGNOSTIC.
     commands (M,3) [vx,vy,wz], times (M,). Returns jp,jv,bh,tn,foot_rel."""
     dev = commands.device
@@ -187,12 +197,14 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
             th_h = torch.atan2(fy, -fz)
             r = torch.hypot(fy, fz)
             th_t, th_c = _ik2(fx, -r, iters)
-            hip.append(th_h); thigh.append(th_t); calf.append(th_c)
+            hip.append(th_h)
+            thigh.append(th_t)
+            calf.append(th_c)
             fy_b = hy + fy + sy * THIGHY * torch.cos(th_h)
             fz_b = fz + sy * THIGHY * torch.sin(th_h)
             foot.append(torch.stack([hx + fx, fy_b, fz_b], dim=-1))
-        jp = torch.stack(hip + thigh + calf, dim=-1)       # (M,12) canonical dof order
-        foot_rel = torch.stack(foot, dim=1)                # (M,4,3)
+        jp = torch.stack(hip + thigh + calf, dim=-1)  # (M,12) canonical dof order
+        foot_rel = torch.stack(foot, dim=1)  # (M,4,3)
         return jp, foot_rel
 
     jp, foot_rel = joints_at(times)
@@ -202,8 +214,17 @@ def flat_reference(commands, times, *, gait_period=0.55, gait_period_slope=0.075
     M = commands.shape[0]
     bh = torch.full((M, 1), BASE_HEIGHT_REF, device=dev, dtype=commands.dtype)
     yaw = wz * times
-    tn = torch.stack([torch.cos(yaw), torch.sin(yaw), torch.zeros_like(yaw),
-                      torch.zeros_like(yaw), torch.zeros_like(yaw), torch.ones_like(yaw)], dim=-1)
+    tn = torch.stack(
+        [
+            torch.cos(yaw),
+            torch.sin(yaw),
+            torch.zeros_like(yaw),
+            torch.zeros_like(yaw),
+            torch.zeros_like(yaw),
+            torch.ones_like(yaw),
+        ],
+        dim=-1,
+    )
     return jp, jv, bh, tn, foot_rel
 
 

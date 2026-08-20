@@ -27,7 +27,7 @@
 
 ## 2. 持久目录
 
-默认根目录是 `output/research`，可用 `LOCOMOTION_RESEARCH_ROOT` 修改，但解析后必须仍位于本仓库内。
+默认根目录是 `output/research`。相对路径必须仍位于本仓库内；部署或测试隔离可通过 `LOCOMOTION_RESEARCH_ROOT` 指定绝对路径，但不能指定文件系统根目录。
 
 | 路径 | 内容 |
 |---|---|

@@ -813,7 +813,7 @@ def handle_slash_command(message: str, settings: LocomotionConsoleSettings, sour
         from . import knowledge
 
         query = " ".join(args)
-        product_id = getattr(getattr(src, "settings", None), "product_id", "") or None
+        product_id = getattr(getattr(source, "settings", None), "product_id", "") or None
         pack = knowledge.build_context_pack(query=query, include_docs=True, product_id=product_id)
         return {
             "reply": _context_pack_reply(pack),

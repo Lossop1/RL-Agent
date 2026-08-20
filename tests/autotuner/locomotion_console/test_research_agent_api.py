@@ -1,8 +1,12 @@
 """Agent and API integration tests for the live research loop."""
+
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("LOCOMOTION_CONSOLE_SOURCE", "fake")
 
@@ -10,8 +14,30 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from autotuner.locomotion_console import agent  # noqa: E402
 from autotuner.locomotion_console import app as app_module  # noqa: E402
-from autotuner.locomotion_console.config import LocomotionConsoleSettings  # noqa: E402
+from autotuner.locomotion_console.config import LocomotionConsoleSettings, PROJECT_ROOT  # noqa: E402
+from autotuner.locomotion_console.research_service import resolve_research_root  # noqa: E402
 from autotuner.research.research_state import ResearchState, ResearchStateStore  # noqa: E402
+
+
+def test_research_root_keeps_request_paths_local_and_allows_env_isolation(
+    tmp_path, monkeypatch
+):
+    relative = resolve_research_root("output/research-test")
+    relative.relative_to(PROJECT_ROOT.resolve())
+    assert resolve_research_root(PROJECT_ROOT / "output" / "research-test") == relative
+
+    with pytest.raises(ValueError, match="relative research root"):
+        resolve_research_root("../outside-repository")
+
+    with pytest.raises(ValueError, match="explicit research root"):
+        resolve_research_root(Path(tmp_path))
+
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path))
+    assert resolve_research_root() == tmp_path.resolve()
+
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path.anchor))
+    with pytest.raises(ValueError, match="filesystem root"):
+        resolve_research_root()
 
 
 def test_research_read_tools_are_registered_and_state_is_durable(tmp_path, monkeypatch):
@@ -33,7 +59,23 @@ def test_research_read_tools_are_registered_and_state_is_durable(tmp_path, monke
     assert replay["case_count"] >= 1
     assert replay["pass_count"] == replay["case_count"]
     assert agent._intent_tool_hint("查看当前研究状态")["tool"] == "get_research_state"
-    assert agent._intent_tool_hint("运行历史决策盲回放")["tool"] == "run_decision_replay"
+    assert (
+        agent._intent_tool_hint("运行历史决策盲回放")["tool"] == "run_decision_replay"
+    )
+
+
+def test_research_ledger_rejects_external_request_roots(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path / "configured"))
+
+    with TestClient(app_module.app) as client:
+        response = client.get(
+            "/research/ledger", params={"root": str(tmp_path / "requested")}
+        )
+
+    assert response.status_code == 400
+    assert "explicit research root" in response.json()["detail"]
+    result = agent._tool_get_research_ledger(None, root=str(tmp_path / "requested"))
+    assert "explicit research root" in result["error"]
 
 
 def test_execute_research_action_accepts_only_registered_ids(monkeypatch):
@@ -68,11 +110,13 @@ def test_execute_research_action_accepts_only_registered_ids(monkeypatch):
         settings,
     )
     assert accepted["ok"] is True
-    assert called == [{
-        "cycle_id": "cycle:1",
-        "plan_id": "plan:1",
-        "actor": "operator-confirmed-agent",
-    }]
+    assert called == [
+        {
+            "cycle_id": "cycle:1",
+            "plan_id": "plan:1",
+            "actor": "operator-confirmed-agent",
+        }
+    ]
     assert agent.action_risk("execute_research_cycle") == "destructive"
 
 
@@ -90,48 +134,70 @@ def test_research_api_state_cas_validation_and_execution_schema(tmp_path, monkey
             return ApiResult()
 
     with TestClient(app_module.app) as client:
-        initialized = client.post("/research/state/initialize", json={
-            "state": {"state_id": "taili", "baseline_ref": "bundle:base"},
-            "actor": "test",
-        })
+        initialized = client.post(
+            "/research/state/initialize",
+            json={
+                "state": {"state_id": "taili", "baseline_ref": "bundle:base"},
+                "actor": "test",
+            },
+        )
         assert initialized.status_code == 200
         state = client.get("/research/state")
         assert state.status_code == 200
         assert state.json()["summary"]["revision"] == 0
-        updated = client.post("/research/state/update", json={
-            "expected_revision": 0,
-            "changes": {"active_run_ref": "run:1"},
-            "actor": "test",
-            "reason": "bind run",
-        })
+        updated = client.post(
+            "/research/state/update",
+            json={
+                "expected_revision": 0,
+                "changes": {"active_run_ref": "run:1"},
+                "actor": "test",
+                "reason": "bind run",
+            },
+        )
         assert updated.status_code == 200
-        stale = client.post("/research/state/update", json={
-            "expected_revision": 0,
-            "changes": {"active_run_ref": "run:stale"},
-            "actor": "test",
-            "reason": "stale update",
-        })
+        stale = client.post(
+            "/research/state/update",
+            json={
+                "expected_revision": 0,
+                "changes": {"active_run_ref": "run:stale"},
+                "actor": "test",
+                "reason": "stale update",
+            },
+        )
         assert stale.status_code == 409
-        validation = client.post("/research/mechanisms/validate", json={
-            "bundle": {"id": "bundle:test", "contract_ref": "contract:test"},
-        })
+        validation = client.post(
+            "/research/mechanisms/validate",
+            json={
+                "bundle": {"id": "bundle:test", "contract_ref": "contract:test"},
+            },
+        )
         assert validation.status_code == 200
         assert "checks" in validation.json()
 
-        monkeypatch.setattr(app_module, "_research_cycle_manager", lambda: DummyManager())
-        injected = client.post("/research/cycles/execute", json={
-            "cycle_id": "cycle:1",
-            "plan_id": "plan:1",
-            "command": ["python", "train.py"],
-        })
+        monkeypatch.setattr(
+            app_module, "_research_cycle_manager", lambda: DummyManager()
+        )
+        injected = client.post(
+            "/research/cycles/execute",
+            json={
+                "cycle_id": "cycle:1",
+                "plan_id": "plan:1",
+                "command": ["python", "train.py"],
+            },
+        )
         assert injected.status_code == 422
-        executed = client.post("/research/cycles/execute", json={
+        executed = client.post(
+            "/research/cycles/execute",
+            json={
+                "cycle_id": "cycle:1",
+                "plan_id": "plan:1",
+            },
+        )
+        assert executed.status_code == 200
+    assert calls == [
+        {
             "cycle_id": "cycle:1",
             "plan_id": "plan:1",
-        })
-        assert executed.status_code == 200
-    assert calls == [{
-        "cycle_id": "cycle:1",
-        "plan_id": "plan:1",
-        "actor": "operator-confirmed-api",
-    }]
+            "actor": "operator-confirmed-api",
+        }
+    ]

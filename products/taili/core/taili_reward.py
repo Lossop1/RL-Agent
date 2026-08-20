@@ -886,7 +886,7 @@ def compute_reward_components(inp, cfg):
         trajectory_scope = trajectory_scope.to(dtype=f, device=gate.device)
         trajectory_scale = max(float(getattr(cfg, "foot_trajectory_error_scale", 0.35)), 1e-6)
         trajectory_shape = trajectory_error / (trajectory_error + trajectory_scale)
-        trajectory_quality = trajectory_quality_score(
+        _trajectory_quality = trajectory_quality_score(
             trajectory_error,
             trajectory_scope,
             trajectory_scale,
@@ -895,7 +895,7 @@ def compute_reward_components(inp, cfg):
     else:
         trajectory_shape = torch.zeros_like(gate)
         trajectory_scope = torch.zeros_like(gate)
-        trajectory_quality = torch.ones_like(gate)
+        _trajectory_quality = torch.ones_like(gate)
 
     cmd = inp.cmd
     vel = inp.base_lin_vel
@@ -1122,7 +1122,7 @@ def compute_reward_components(inp, cfg):
         0.0,
         1.0,
     )
-    terrain_progress_clearance_gate = torch.clamp(
+    _terrain_progress_clearance_gate = torch.clamp(
         1.0
         - terrain_clearance_response
         + terrain_clearance_response * clearance_success,
@@ -1461,7 +1461,7 @@ def compute_reward_components(inp, cfg):
     direction_support_floor = min(max(
         float(getattr(cfg, "direction_progress_support_floor", 0.0)), 0.0
     ), 1.0)
-    direction_support_quality = torch.clamp(
+    _direction_support_quality = torch.clamp(
         direction_support_floor + (1.0 - direction_support_floor) * support_quality,
         0.0,
         1.0,

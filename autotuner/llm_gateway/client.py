@@ -25,7 +25,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 DEFAULT_LLM_CONFIG_PATH = Path("config/llm.json")
 
@@ -79,8 +79,8 @@ def _resolve_api_key(raw: str) -> str:
 def _load_config(path: Path = DEFAULT_LLM_CONFIG_PATH) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
-            f"config/llm.json not found; LLM gateway requires it. "
-            f"See autotuner/tuning/llm_openai_advisor.py for format."
+            "config/llm.json not found; LLM gateway requires it. "
+            "See autotuner/tuning/llm_openai_advisor.py for format."
         )
     cfg = json.loads(path.read_text(encoding="utf-8"))
     override_path = _state_root() / "llm_profile.json"

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .mechanism_specs import MechanismBundle, MechanismPatch, apply_mechanism_patch, content_fingerprint
+from .mechanism_specs import MechanismBundle, MechanismPatch, apply_mechanism_patch
 
 
 ARTIFACT_SCHEMA_VERSION = "rl-agent.mechanism-artifact/v1"

@@ -10,6 +10,11 @@ from typing import Any
 from autotuner.product import load_product_plugin, resolve_product_contract
 
 
+# 仅声明兼容接口的类型，不在导入时绑定具体产品；实际值仍由 __getattr__ 动态解析。
+FAMILY_ORDER: list[str]
+TENSIONS: list[tuple[str, str, str]]
+
+
 def _metadata(product_id: str | None = None) -> dict[str, Any]:
     contract = resolve_product_contract(product_id, check_files=False)
     plugin = load_product_plugin(contract, "acceptance", "metadata")

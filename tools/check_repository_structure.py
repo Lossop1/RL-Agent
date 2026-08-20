@@ -10,8 +10,6 @@ import ast
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
-import re
-import subprocess
 import sys
 from typing import Iterable
 
@@ -114,7 +112,6 @@ def check_encoding(root: Path, report: CheckReport) -> None:
 
 
 def check_source_boundaries(root: Path, layout: dict, report: CheckReport) -> None:
-    source_roots = layout.get("source", {}).get("roots", [])
     for path in _python_files(root):
         rel = path.resolve().relative_to(root.resolve()).as_posix()
         if any(part in TEMP_DIR_NAMES for part in path.relative_to(root).parts):

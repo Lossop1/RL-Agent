@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,12 +20,7 @@ from autotuner.product import resolve_product_runtime
 
 import yaml
 
-from autotuner.research.gate_calibration import (
-    GateDefinition,
-    extract_gate_definitions,
-    gate_trace_rows,
-    quantiles,
-)
+from autotuner.research.gate_calibration import extract_gate_definitions, gate_trace_rows, quantiles
 from .research_audit import _DEFAULT_ALIGNMENT_SPECS
 
 

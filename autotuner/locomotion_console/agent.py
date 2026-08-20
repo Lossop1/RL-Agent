@@ -19,6 +19,13 @@ import re
 import shlex
 from typing import Any, Callable, Dict, List
 
+from .config import LocomotionConsoleSettings
+from .config_manager import desired_framework_id, llm_profile
+from .config_set import get_active_config_set
+from .datasource import RealDataSource, make_source
+from .diagnostic_history import DiagnosticHistoryStore
+from .framework_profile import list_framework_profiles
+
 # The ReAct loop is mostly cheap decisions ("which tool next?") that do NOT need the
 # expensive reasoning model. Measured: fast model + the curriculum facts card holds 100%
 # factual accuracy at ~2-4s/call vs 25-100s on the pro model. Route the loop to the fast
@@ -33,13 +40,6 @@ _LOOP_THINK: bool = os.environ.get("LOCOMOTION_CONSOLE_LOOP_THINK", "").strip() 
 # string in which $()/backticks still expand → remote RCE). Everything shell-bound is shlex.quote'd
 # AND allowlisted.
 _RUN_TOKEN_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
-
-from .config import LocomotionConsoleSettings
-from .config_manager import desired_framework_id, llm_profile
-from .config_set import get_active_config_set
-from .datasource import RealDataSource, make_source
-from .diagnostic_history import DiagnosticHistoryStore
-from .framework_profile import list_framework_profiles
 
 
 def _profile_summary(profile) -> Dict[str, Any]:
@@ -686,7 +686,6 @@ def _tool_get_evidence_context(
     evidence and gaps, but no rigid report template.
     """
     import asyncio
-    import re
 
     from . import knowledge
     from .definitions import definitions_for_telemetry, list_definitions

@@ -7,7 +7,7 @@ validated before any write occurs.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path

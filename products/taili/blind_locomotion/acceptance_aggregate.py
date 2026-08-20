@@ -10,10 +10,11 @@ results (a gate must pass in EVERY run that produced it), and applies acceptance
 This is the missing link between the raw physeval runs and the single "does this policy pass the
 benchmark?" answer.
 """
+
 from __future__ import annotations
 
 import re
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable
 
 try:
     from . import acceptance_score as ACC
@@ -32,7 +33,8 @@ _PROV = re.compile(r"ckpt=(\S+)\s+terrain=(\S+)\s+num_envs=(\d+)")
 # physeval_blind battery row: "fwd05 | 0.393m | +0.00/+0.00/+0.00 (+0.5/+0.0/+0.0) | ..."
 _BATTERY = re.compile(
     r"^\s*(\w+)\s*\|\s*[\d.]+m?\s*\|\s*([+\-]?[\d.]+)/([+\-]?[\d.]+)/([+\-]?[\d.]+)\s*"
-    r"\(([+\-]?[\d.]+)/([+\-]?[\d.]+)/([+\-]?[\d.]+)\)")
+    r"\(([+\-]?[\d.]+)/([+\-]?[\d.]+)/([+\-]?[\d.]+)\)"
+)
 
 
 def parse_battery(log_text: str) -> list:
@@ -41,9 +43,13 @@ def parse_battery(log_text: str) -> list:
     for line in log_text.splitlines():
         m = _BATTERY.match(line)
         if m:
-            rows.append({"label": m.group(1),
-                         "actual": (float(m.group(2)), float(m.group(3)), float(m.group(4))),
-                         "cmd": (float(m.group(5)), float(m.group(6)), float(m.group(7)))})
+            rows.append(
+                {
+                    "label": m.group(1),
+                    "actual": (float(m.group(2)), float(m.group(3)), float(m.group(4))),
+                    "cmd": (float(m.group(5)), float(m.group(6)), float(m.group(7))),
+                }
+            )
     return rows
 
 
@@ -52,15 +58,25 @@ def classify_behavior(rows: list) -> str:
     STANDS (vx~0 for all move cmds → tracking too weak) vs CREEPS (~const speed regardless of cmd →
     tracking gradient-starved) vs TRACKS (actual varies with cmd)."""
     import math
-    move = [r for r in rows if max(abs(c) for c in r["cmd"][:2]) > 0.1]   # linear move commands
+
+    move = [
+        r for r in rows if max(abs(c) for c in r["cmd"][:2]) > 0.1
+    ]  # linear move commands
     if not move:
         return "no_move_commands_in_battery"
     sp = [math.hypot(r["actual"][0], r["actual"][1]) for r in move]
-    err = [math.hypot(r["actual"][0] - r["cmd"][0], r["actual"][1] - r["cmd"][1]) for r in move]
+    err = [
+        math.hypot(r["actual"][0] - r["cmd"][0], r["actual"][1] - r["cmd"][1])
+        for r in move
+    ]
     if all(s < 0.10 for s in sp):
-        return "STANDS — vx~0 for all move commands (tracking reward too weak vs standing)"
+        return (
+            "STANDS — vx~0 for all move commands (tracking reward too weak vs standing)"
+        )
     if (max(sp) - min(sp)) < 0.12:
-        return "CREEPS — ~constant speed regardless of command (tracking gradient-starved)"
+        return (
+            "CREEPS — ~constant speed regardless of command (tracking gradient-starved)"
+        )
     if max(err) < 0.12:
         return "TRACKS — actual matches commanded speed"
     return "PARTIAL — actual varies with command but with error (tracking imprecise)"
@@ -71,7 +87,11 @@ def parse_provenance(log_text: str) -> dict:
     m = _PROV.search(log_text)
     if not m:
         return {"checkpoint": "", "terrain": "", "num_envs": 0}
-    return {"checkpoint": m.group(1), "terrain": m.group(2), "num_envs": int(m.group(3))}
+    return {
+        "checkpoint": m.group(1),
+        "terrain": m.group(2),
+        "num_envs": int(m.group(3)),
+    }
 
 
 def parse_scorecard(log_text: str) -> Dict[str, dict]:
@@ -94,8 +114,11 @@ def merge_runs(run_results: Iterable[Dict[str, dict]]) -> Dict[str, dict]:
         for key, val in res.items():
             if key not in merged:
                 merged[key] = dict(val)
-            elif not val["ok"]:                       # any failing occurrence fails the gate
-                merged[key] = {"ok": False, "detail": val["detail"] + " (failed in one run)"}
+            elif not val["ok"]:  # any failing occurrence fails the gate
+                merged[key] = {
+                    "ok": False,
+                    "detail": val["detail"] + " (failed in one run)",
+                }
     return merged
 
 
@@ -111,6 +134,7 @@ def aggregate_files(paths: Iterable[str]) -> dict:
     """Read several physeval_blind log files → taili_spec §2 verdict. Missing/unreadable files are
     skipped with a note in the result (honest — a skipped terrain run = its gates not evaluated)."""
     from pathlib import Path
+
     texts, skipped = [], []
     for p in paths:
         try:
@@ -120,9 +144,14 @@ def aggregate_files(paths: Iterable[str]) -> dict:
     v = aggregate(texts)
     v["runs_read"] = len(texts)
     v["runs_skipped"] = skipped
-    v["runs"] = [{"path": str(p), **parse_provenance(t),
-                  "behavior": classify_behavior(parse_battery(t))}
-                 for p, t in zip(paths, texts)]
+    v["runs"] = [
+        {
+            "path": str(p),
+            **parse_provenance(t),
+            "behavior": classify_behavior(parse_battery(t)),
+        }
+        for p, t in zip(paths, texts)
+    ]
     return v
 
 
@@ -130,10 +159,20 @@ def write_report(verdict: dict, path: str, stamp: str = "") -> str:
     """Persist the §2 verdict + per-run provenance as an auditable acceptance report (§12)."""
     import json
     from pathlib import Path
-    report = {"stamp": stamp, "passed": verdict["passed"], "n_present": verdict["n_present"],
-              "n_hard": verdict["n_hard"], "failed": verdict["failed"], "missing": verdict["missing"],
-              "runs": verdict.get("runs", []), "families": verdict["families"], "soft": verdict["soft"]}
-    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+
+    report = {
+        "stamp": stamp,
+        "passed": verdict["passed"],
+        "n_present": verdict["n_present"],
+        "n_hard": verdict["n_hard"],
+        "failed": verdict["failed"],
+        "missing": verdict["missing"],
+        "runs": verdict.get("runs", []),
+        "families": verdict["families"],
+        "soft": verdict["soft"],
+    }
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return str(p)
 
@@ -155,18 +194,23 @@ if __name__ == "__main__":
     # Aggregate physeval_blind log file(s) → §2 verdict. Usage:
     #   python -m products.taili.blind_locomotion.acceptance_aggregate <physeval_log>... [--out report.json]
     import sys
+
     args = sys.argv[1:]
     out_path = None
     if "--out" in args:
         i = args.index("--out")
         out_path = args[i + 1] if i + 1 < len(args) else None
-        args = args[:i] + args[i + 2:]
+        args = args[:i] + args[i + 2 :]
     if not args:
-        print("usage: python -m products.taili.blind_locomotion.acceptance_aggregate <physeval_log>... [--out report.json]")
+        print(
+            "usage: python -m products.taili.blind_locomotion.acceptance_aggregate <physeval_log>... [--out report.json]"
+        )
         sys.exit(2)
     v = aggregate_files(args)
     print(render_verdict(v))
-    print(f"\n(read {v['runs_read']} run(s); gates seen: {', '.join(v['gates_seen']) or 'none'})")
+    print(
+        f"\n(read {v['runs_read']} run(s); gates seen: {', '.join(v['gates_seen']) or 'none'})"
+    )
     for r in v["runs"]:
         print(f"  run {r['path']}: ckpt={r['checkpoint']} terrain={r['terrain']}")
     for s in v["runs_skipped"]:

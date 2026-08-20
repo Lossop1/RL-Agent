@@ -1,6 +1,8 @@
 """Execution tests for generated reward, telemetry, and gate semantics."""
 from __future__ import annotations
 
+# Torch is optional in the test environment; importorskip must run first.
+# ruff: noqa: E402
 from types import SimpleNamespace
 
 import pytest

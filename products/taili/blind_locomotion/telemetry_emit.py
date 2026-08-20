@@ -182,7 +182,6 @@ class TrainingTelemetryEmitter:
         curr = payload["curriculum"]
         health = payload["health"]
         command = payload.get("command", {})
-        counters = payload.get("counters", {})
         paths = payload.get("paths", {})
         step = payload["step"]
         total = payload.get("total_steps") or 0

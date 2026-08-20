@@ -43,7 +43,6 @@ def build_slices(df: pd.DataFrame, thresholds: DiagnosticThresholds | None = Non
     # Event-window slices around any major event.
     event_window = thresholds.event_window_s
     if "time" in d.columns:
-        t = numeric_col(d, "time", 0.0)
         pre = pd.Series(False, index=d.index)
         post = pd.Series(False, index=d.index)
         group_cols = group_key_columns(d)

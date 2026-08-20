@@ -122,7 +122,9 @@ def get_code_facts(query: str = "", max_defs: int = 14) -> Dict[str, Any]:
     matched = set()
     for tok in tokens:
         for name, entries in idx.items():
-            if tok == name or (len(tok) >= 3 and (tok in name or name in tok)):
+            # 只允许查询词包含在真实符号名中；反向匹配会把任意长的未知词
+            # 因为恰好包含某个短符号名而错误标记为已找到。
+            if tok == name or (len(tok) >= 3 and tok in name):
                 matched.add(tok)
                 for e in entries:
                     k = (e["ref"].file, e["ref"].line_start, e["name"])

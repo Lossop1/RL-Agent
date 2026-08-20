@@ -330,7 +330,6 @@ def main(argv: list[str] | None = None) -> int:
         ))
 
     import gymnasium as gym
-    import skrl
     import torch
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
     from isaaclab_tasks.utils import parse_env_cfg

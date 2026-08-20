@@ -7,7 +7,7 @@ Read-only (runs adapt() for the derived band; no materialize, no remote, no GPU)
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Tuple
 
 from pydantic import BaseModel, Field
 

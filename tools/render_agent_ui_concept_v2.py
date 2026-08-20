@@ -37,7 +37,7 @@ def font(size: int, bold: bool = False):
     return ImageFont.load_default()
 
 
-F11, F12, F13, F14, F15, F16, F18 = [font(n) for n in (11, 12, 13, 14, 15, 16, 18)]
+F10, F11, F12, F13, F14, F15, F16, F18 = [font(n) for n in (10, 11, 12, 13, 14, 15, 16, 18)]
 F20B, F24B, F30B, F38B, F48B = [font(n, True) for n in (20, 24, 30, 38, 48)]
 
 
@@ -132,7 +132,6 @@ def plot(draw: ImageDraw.ImageDraw, box, values, *, color, lo=0.0, hi=1.0, width
 def main() -> None:
     workbench = fetch("/agent/workbench")
     telemetry = fetch("/run/current/telemetry")
-    scoreboard = fetch("/run/current/scoreboard")
     latest = telemetry.get("latest") or {}
     curriculum = latest.get("curriculum") or {}
     command = latest.get("command") or {}
@@ -143,7 +142,6 @@ def main() -> None:
     progress = curriculum.get("progress_gate")
     progress_floor = get(curriculum, "phase_gate", "conditions", "progress_min")
     slip = command.get("stance_slip_high_fraction")
-    slip_metric = metric_from_scoreboard(scoreboard, "stance_slip_high_fraction")
     diagonal = command.get("diagonal_contact")
     diagonal_floor = get(curriculum, "phase_gate", "conditions", "diagonal_min")
     duty = command.get("duty_balance")
