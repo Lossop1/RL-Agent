@@ -15,7 +15,8 @@
 | 层 | 权威目录 | 允许承担的职责 |
 |---|---|---|
 | 机制 | `autotuner/mechanisms/` | 奖励、指标、门控的声明、校验、编译和安全运行时 |
-| 研究 | `autotuner/research/` | 状态、台账、证据、候选、实验周期、监督和结果学习 |
+| 研究 | `autotuner/research/` | 状态、台账、证据、候选、实验周期、协调器、监督和结果学习 |
+| 资产 | `autotuner/artifacts/` | 内容寻址资产、复用审批、来源和运行绑定 |
 | 基础设施 | `autotuner/infrastructure/` | SSH、进程和远程执行等可替换能力 |
 | 执行层 | `autotuner/execution/` | runtime 身份、payload/run 哈希、ChangeSet、resume 判定、远程 staging 与原子激活 |
 | 产品任务核心 | `products/<product>/core/` | 该产品的几何、观测、奖励数学、模型和课程纯逻辑 |
@@ -49,6 +50,8 @@ config/products/<product>.yaml
 - Taili 训练入口：`products/taili/blind_locomotion/launch_taili_train.py`
 - payload 清单：`products/taili/payload/payload_manifest.py`
 - payload 构建：`python -m products.taili.payload.build_payload`
+- 研究协调器：`autotuner.research.ResearchCoordinator`
+- 资产目录：`autotuner.artifacts.AssetCatalog`
 - 结构门：`python tools/check_repository_structure.py`
 - 前端源码：`locomotion-console-ui/`
 

@@ -33,6 +33,7 @@ class ProductPayload:
     task_contract_ref: str = ""
     task_bundle_digest: str = ""
     task_artifact_manifest_ref: str = ""
+    asset_binding_refs: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -70,12 +71,14 @@ def _normalise_result(value: Any) -> ProductPayload:
         digest = data.get("payload_digest") or data.get("digest")
         count = data.get("file_count", 0)
         root_name = data.get("root_name", "")
+        asset_binding_refs = data.get("asset_binding_refs", ())
     else:
         archive = getattr(value, "archive", None)
         manifest = getattr(value, "manifest", None)
         digest = getattr(value, "payload_digest", None) or getattr(value, "digest", None)
         count = getattr(value, "file_count", 0)
         root_name = getattr(value, "root_name", "")
+        asset_binding_refs = getattr(value, "asset_binding_refs", ())
     if not archive or not manifest or not digest:
         raise ProductPayloadError("payload builder must return archive, manifest and payload_digest")
     return ProductPayload(
@@ -84,6 +87,7 @@ def _normalise_result(value: Any) -> ProductPayload:
         payload_digest=str(digest),
         file_count=int(count or 0),
         root_name=str(root_name or ""),
+        asset_binding_refs=tuple(str(item) for item in asset_binding_refs if str(item).strip()),
     )
 
 
@@ -93,6 +97,7 @@ def build_product_payload(
     output_dir: str | Path | None = None,
     task_bundle: Any | None = None,
     task_artifacts: Any | None = None,
+    asset_bindings: Any | None = None,
 ) -> ProductPayload:
     """调用产品清单声明的构建器，并在返回前完成本地归档校验。"""
     data = _contract_data(contract)
@@ -112,6 +117,8 @@ def build_product_payload(
         kwargs["task_bundle"] = task_bundle
     if task_artifacts is not None and ("task_artifacts" in parameters or accepts_kwargs):
         kwargs["task_artifacts"] = task_artifacts
+    if asset_bindings is not None and ("asset_bindings" in parameters or accepts_kwargs):
+        kwargs["asset_bindings"] = asset_bindings
     result = _normalise_result(builder(**kwargs))
     payload_manifest = load_payload_manifest(result.manifest)
     payload_manifest.validate(require_digest=True)
@@ -156,6 +163,13 @@ def build_product_payload(
                 or ""
             ),
         )
+    if asset_bindings is not None:
+        refs: list[str] = []
+        for binding in asset_bindings:
+            value = binding.model_dump(mode="json") if hasattr(binding, "model_dump") else binding
+            if isinstance(value, Mapping) and str(value.get("binding_ref") or "").strip():
+                refs.append(str(value["binding_ref"]))
+        result = replace(result, asset_binding_refs=tuple(dict.fromkeys(refs)))
     return result
 
 

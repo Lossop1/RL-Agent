@@ -10,7 +10,7 @@ from autotuner.mechanisms.mechanism_specs import (
     RewardTermSpec,
     SignalSpec,
 )
-from autotuner.mechanisms.mechanism_synthesis import MechanismIntent
+from autotuner.mechanisms.mechanism_specs import MechanismPatch, MechanismOperation
 
 
 def _baseline() -> MechanismBundle:
@@ -163,9 +163,15 @@ def test_approval_validates_mechanism_before_contract_revision(monkeypatch):
     calls = []
 
     class FakePipeline:
-        def revise(self, *args, **kwargs):
+        def revise_and_prepare(self, *args, **kwargs):
             calls.append(kwargs)
-            return args[2], SimpleNamespace(ref="task.taili@2")
+            stored = SimpleNamespace(ref="task.taili@2")
+            pipeline_result = SimpleNamespace(stored_contract=stored)
+            return SimpleNamespace(
+                revised_bundle=args[2],
+                stored_contract=stored,
+                pipeline_result=pipeline_result,
+            )
 
     applied = research_proposal.apply_research_proposal(
         FakePipeline(),
@@ -174,9 +180,64 @@ def test_approval_validates_mechanism_before_contract_revision(monkeypatch):
         proposal,
         _request(baseline_mechanism=baseline),
         approved_by="human",
+        run_id="run-approved",
     )
 
     assert applied.mechanism_patch is not None
     assert applied.mechanism_validation is not None
     assert applied.mechanism_validation.ok
     assert calls[0]["approved_by"] == "human"
+    assert calls[0]["run_id"] == "run-approved"
+    assert applied.pipeline_result.stored_contract.ref == "task.taili@2"
+
+
+def test_direct_mechanism_proposal_cannot_bypass_protection_validation():
+    baseline = _baseline()
+    patch = MechanismPatch(
+        id="patch:untrusted",
+        baseline_bundle_ref=baseline.id,
+        baseline_fingerprint=baseline.fingerprint(),
+        candidate_bundle_id="bundle:untrusted",
+        problem_ref="case:flat",
+        operations=(
+            MechanismOperation(
+                action="replace",
+                target_kind="reward",
+                target_id="reward:progress",
+                value=baseline.rewards[0].model_dump(mode="json"),
+                reason="test direct patch",
+            ),
+        ),
+        expected_effects=("effect",),
+        protected_capabilities=("different-capability",),
+        required_evaluators=("evaluator:flat",),
+        generated_by="untrusted",
+    )
+    proposal = research_proposal.ResearchProposal.model_validate(
+        _payload(
+            mechanism_intents=[],
+            task_changes={
+                "training": {
+                    "mechanism_proposals": [{"patch": patch.model_dump(mode="json")}],
+                }
+            },
+        )
+    )
+    class FakePipeline:
+        def revise_and_prepare(self, *args, **kwargs):
+            raise AssertionError("invalid mechanism must be rejected before materialization")
+
+    try:
+        research_proposal.apply_research_proposal(
+            FakePipeline(),
+            SimpleNamespace(),
+            baseline,
+            proposal,
+            _request(baseline_mechanism=baseline),
+            approved_by="human",
+            run_id="run-untrusted",
+        )
+    except research_proposal.ResearchProposalError as exc:
+        assert "changed protected capabilities" in str(exc)
+    else:
+        raise AssertionError("untrusted direct mechanism proposal was accepted")

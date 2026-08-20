@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
+from autotuner.artifacts.asset_catalog import AssetBinding, AssetCatalog, AssetLineage, ReusableAsset
 from autotuner.execution import DeploymentSpec
 from autotuner.research.research_ledger import (
     ArtifactRef,
@@ -32,9 +33,7 @@ from .payload import (
     make_deployment_spec,
 )
 from .task_contract import (
-    ResolvedTaskContract,
     TaskContractBundle,
-    TaskContractError,
     revise_task_bundle,
 )
 from .task_materializer import MaterializedTaskBundle, TaskBundleMaterializer
@@ -108,6 +107,8 @@ class TaskPipelineResult:
     deployment_spec: DeploymentSpec
     run_manifest: Path
     launch_plan: TrainingLaunchPlan | None = None
+    registered_assets: tuple[ReusableAsset, ...] = ()
+    asset_bindings: tuple[AssetBinding, ...] = ()
     ledger_events: tuple[LedgerEvent, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -119,7 +120,28 @@ class TaskPipelineResult:
             "deployment": _deployment_dict(self.deployment_spec),
             "run_manifest": str(self.run_manifest),
             "launch_plan": self.launch_plan.to_dict() if self.launch_plan else None,
+            "registered_asset_refs": [asset.asset_ref for asset in self.registered_assets],
+            "asset_binding_refs": [binding.binding_ref for binding in self.asset_bindings],
             "ledger_event_ids": [event.event_id for event in self.ledger_events],
+        }
+
+
+@dataclass(frozen=True)
+class PreparedTaskRevision:
+    """合同修订及其完整可执行交接，二者共享同一条谱系。"""
+
+    revised_bundle: TaskContractBundle
+    pipeline_result: TaskPipelineResult
+
+    @property
+    def stored_contract(self) -> StoredTaskContract:
+        return self.pipeline_result.stored_contract
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": TASK_PIPELINE_SCHEMA,
+            "revised_bundle": self.revised_bundle.to_dict(),
+            "pipeline": self.pipeline_result.to_dict(),
         }
 
 
@@ -133,11 +155,82 @@ class TaskExecutionPipeline:
         contract_store: TaskContractStore | None = None,
         ledger: ResearchLedgerStore | None = None,
         materializer: TaskBundleMaterializer | None = None,
+        asset_catalog: AssetCatalog | None = None,
     ) -> None:
         self.output_root = Path(output_root)
         self.contract_store = contract_store or TaskContractStore(self.output_root / "task_contracts")
         self.ledger = ledger or ResearchLedgerStore(self.output_root / "research" / "ledger")
         self.materializer = materializer or TaskBundleMaterializer()
+        self.asset_catalog = asset_catalog or AssetCatalog(self.output_root / "assets" / "catalog")
+
+    def _register_product_assets(
+        self,
+        product: Any,
+        *,
+        actor: str,
+    ) -> tuple[ReusableAsset, ...]:
+        """登记产品合同已经解析并哈希的资产，不在这里授予复用资格。"""
+        product_data = _product_data(product)
+        product_ref = (
+            f"{product_data.get('product_id', '')}@{product_data.get('product_version', '')}"
+        )
+        reuse = product_data.get("asset_reuse", {})
+        reuse = reuse if isinstance(reuse, Mapping) else {}
+        declarations = reuse.get("assets", {})
+        declarations = declarations if isinstance(declarations, Mapping) else {}
+        records: list[ReusableAsset] = []
+        for raw_asset in product_data.get("assets", []):
+            if not isinstance(raw_asset, Mapping):
+                continue
+            asset_id = str(raw_asset.get("id") or "").strip()
+            digest = str(raw_asset.get("sha256") or "").strip()
+            if not asset_id or not digest or not bool(raw_asset.get("exists", False)):
+                continue
+            declaration = declarations.get(asset_id, {})
+            declaration = declaration if isinstance(declaration, Mapping) else {}
+            evidence = [
+                str(value)
+                for value in declaration.get("validation_evidence_refs", [])
+                if str(value).strip()
+            ]
+            kind = str(raw_asset.get("kind") or "asset")
+            if kind not in {
+                "checkpoint",
+                "policy_checkpoint",
+                "training_baseline",
+                "optimizer_state",
+                "normalizer_state",
+            }:
+                evidence.append(
+                    f"evidence:asset-hash:{product_data.get('contract_digest', '')}:{asset_id}"
+                )
+            records.append(
+                self.asset_catalog.register_asset(
+                    asset_id=asset_id,
+                    kind=kind,
+                    sha256=digest,
+                    locator=str(raw_asset.get("resolved_path") or raw_asset.get("declared_path") or ""),
+                    compatibility=(
+                        declaration.get("compatibility", {})
+                        if isinstance(declaration.get("compatibility", {}), Mapping)
+                        else {}
+                    ),
+                    capability_scope=(
+                        declaration.get("capability_scope", [])
+                        if isinstance(declaration.get("capability_scope", []), (list, tuple))
+                        else []
+                    ),
+                    validation_evidence_refs=evidence,
+                    lineage=AssetLineage(source_product_ref=product_ref),
+                    metadata={
+                        "required": bool(raw_asset.get("required", False)),
+                        "declared_sha256": str(raw_asset.get("declared_sha256") or ""),
+                        "file_count": int(raw_asset.get("file_count") or 0),
+                    },
+                    actor=actor,
+                )
+            )
+        return tuple(records)
 
     @staticmethod
     def _validate_bundle_product(bundle: TaskContractBundle, product: Any) -> None:
@@ -221,6 +314,7 @@ class TaskExecutionPipeline:
         supersedes_ref: str = "",
         actor: str = "task-pipeline",
         launch_request: TrainingLaunchRequest | Mapping[str, Any] | None = None,
+        asset_reuse_approval_refs: Sequence[str] = (),
     ) -> TaskPipelineResult:
         """生成合同、artifact、payload 和运行交接；不启动远程进程。"""
         self._validate_bundle_product(bundle, product)
@@ -230,6 +324,17 @@ class TaskExecutionPipeline:
             parent_ref=parent_ref,
             supersedes_ref=supersedes_ref,
             actor=actor,
+        )
+        registered_assets = self._register_product_assets(product, actor=actor)
+        asset_bindings = tuple(
+            self.asset_catalog.bind_approved_reuse(
+                str(approval_ref),
+                target_contract_ref=stored.ref,
+                target_run_ref=run_id,
+                actor=actor,
+            )
+            for approval_ref in asset_reuse_approval_refs
+            if str(approval_ref).strip()
         )
         materialized = self.materializer.materialize(
             bundle,
@@ -242,6 +347,7 @@ class TaskExecutionPipeline:
             output_dir=self.output_root / "payloads" / run_id,
             task_bundle=bundle,
             task_artifacts=materialized,
+            asset_bindings=asset_bindings,
         )
 
         launch_plan: TrainingLaunchPlan | None = None
@@ -256,6 +362,30 @@ class TaskExecutionPipeline:
             if request.run_id != run_id:
                 raise TaskPipelineError("launch_request.run_id must match run_id")
             launch_plan = build_training_launch_plan(product, request)
+        checkpoint_bindings: list[AssetBinding] = []
+        for binding in asset_bindings:
+            asset = self.asset_catalog.get_asset(binding.asset_ref)
+            if binding.role in {"initial_checkpoint", "resume_checkpoint", "checkpoint"} or asset.kind in {
+                "checkpoint",
+                "policy_checkpoint",
+                "training_baseline",
+                "optimizer_state",
+                "normalizer_state",
+            }:
+                checkpoint_bindings.append(binding)
+        if len(checkpoint_bindings) > 1:
+            raise TaskPipelineError("a run cannot bind more than one checkpoint asset")
+        if checkpoint_bindings:
+            if launch_plan is None or not launch_plan.resume:
+                raise TaskPipelineError("a checkpoint asset binding requires a resume launch plan")
+            if launch_plan.checkpoint_asset_ref != checkpoint_bindings[0].asset_ref:
+                raise TaskPipelineError(
+                    "launch_request.checkpoint_asset_ref does not match the approved checkpoint asset"
+                )
+        elif launch_plan is not None and launch_plan.checkpoint_asset_ref:
+            raise TaskPipelineError(
+                "launch_request.checkpoint_asset_ref has no approved asset reuse binding"
+            )
         run_manifest = self.output_root / "runs" / run_id / "runtime_manifest.json"
         lineage: dict[str, Any] = {}
         if launch_plan is not None:
@@ -263,6 +393,7 @@ class TaskExecutionPipeline:
                 "resume": launch_plan.resume,
                 "source_run": launch_plan.source_run,
                 "checkpoint": launch_plan.checkpoint,
+                "checkpoint_asset_ref": launch_plan.checkpoint_asset_ref,
                 "remote_boot_id": launch_plan.remote_boot_id,
                 "resume_state": dict(
                     (launch_request.resume_state if isinstance(launch_request, TrainingLaunchRequest) else {})
@@ -275,6 +406,8 @@ class TaskExecutionPipeline:
             lineage["source_task_bundle_digest"] = str(
                 resume_state.get("source_task_bundle_digest") or ""
             )
+        revision = bundle.contract.provenance.get("revision", {})
+        revision = revision if isinstance(revision, Mapping) else {}
         manifest: dict[str, Any] = {
             "schema_version": TASK_PIPELINE_SCHEMA,
             "generated_at": _utc_now(),
@@ -301,8 +434,25 @@ class TaskExecutionPipeline:
             "contract_bundle_ref": stored.ref,
             "task_contract_ref": stored.ref,
             "task_bundle_digest": bundle.bundle_digest,
+            "contract_lineage": {
+                "parent_ref": stored.parent_ref,
+                "supersedes_ref": stored.supersedes_ref,
+                "evidence_refs": [
+                    str(value)
+                    for value in revision.get("evidence_refs", [])
+                    if str(value).strip()
+                ],
+                "approved_by": str(revision.get("approved_by") or ""),
+            },
             "task_artifact_manifest_ref": materialized.manifest_ref,
             "task_artifacts": materialized.to_dict(),
+            "assets": {
+                "catalog_root": str(self.asset_catalog.root),
+                "registered": [asset.model_dump(mode="json") for asset in registered_assets],
+                "reuse_bindings": [
+                    binding.model_dump(mode="json") for binding in asset_bindings
+                ],
+            },
             "payload": payload.to_dict(),
             "execution": {
                 "task_contract_ref": stored.ref,
@@ -311,6 +461,7 @@ class TaskExecutionPipeline:
                 "task_artifact_manifest_ref": materialized.manifest_ref,
                 "payload_digest": payload.payload_digest,
                 "runtime_digest": str(_product_data(product).get("runtime", {}).get("digest", "")),
+                "asset_binding_refs": [binding.binding_ref for binding in asset_bindings],
             },
             "lineage": lineage,
             "configuration": {
@@ -370,6 +521,8 @@ class TaskExecutionPipeline:
             deployment_spec=deployment_spec,
             run_manifest=run_manifest,
             launch_plan=launch_plan,
+            registered_assets=registered_assets,
+            asset_bindings=asset_bindings,
             ledger_events=tuple(ledger_events),
         )
 
@@ -400,9 +553,46 @@ class TaskExecutionPipeline:
         )
         return revised, stored
 
+    def revise_and_prepare(
+        self,
+        product: Any,
+        base: TaskContractBundle,
+        approved_change: Mapping[str, Any],
+        *,
+        evidence_refs: tuple[str, ...] | list[str],
+        approved_by: str,
+        run_id: str,
+        actor: str = "task-pipeline",
+        launch_request: TrainingLaunchRequest | Mapping[str, Any] | None = None,
+        asset_reuse_approval_refs: Sequence[str] = (),
+    ) -> PreparedTaskRevision:
+        """创建证据驱动的新合同版本，并立即生成对应的完整训练交接。"""
+        revised, stored = self.revise(
+            product,
+            base,
+            approved_change,
+            evidence_refs=evidence_refs,
+            approved_by=approved_by,
+            actor=actor,
+        )
+        prepared = self.prepare(
+            product,
+            revised,
+            run_id=run_id,
+            parent_ref=stored.parent_ref,
+            supersedes_ref=stored.supersedes_ref,
+            actor=actor,
+            launch_request=launch_request,
+            asset_reuse_approval_refs=asset_reuse_approval_refs,
+        )
+        if prepared.stored_contract.ref != stored.ref:
+            raise TaskPipelineError("prepared revision does not match the stored contract")
+        return PreparedTaskRevision(revised_bundle=revised, pipeline_result=prepared)
+
 
 __all__ = [
     "TASK_PIPELINE_SCHEMA",
+    "PreparedTaskRevision",
     "TaskExecutionPipeline",
     "TaskPipelineError",
     "TaskPipelineResult",

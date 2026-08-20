@@ -265,6 +265,68 @@ class ExperimentOutcome(LedgerRecord):
     knowledge_updates: list[str] = Field(default_factory=list)
 
 
+class ResearchRunLifecycle(LedgerRecord):
+    """研究协调器管理的一次候选运行及其恢复所需上下文。"""
+
+    run_ref: str
+    contract_ref: str
+    parent_contract_ref: str = ""
+    proposal_ref: str = ""
+    pipeline_manifest_ref: str
+    required_evaluators: list[str] = Field(default_factory=list)
+    protected_capabilities: list[str] = Field(default_factory=list)
+    previous_active_run_ref: str = ""
+    previous_checkpoint_ref: str = ""
+    previous_contract_ref: str = ""
+    deployment_receipt_ref: str = ""
+    launch_plan_digest: str = ""
+    training_start_receipt_ref: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    disposition: Literal["", "promote", "continue", "rollback", "inconclusive"] = ""
+    status: Literal[
+        "prepared",
+        "deployed",
+        "observing",
+        "promoted",
+        "continued",
+        "rollback_required",
+        "rolled_back",
+        "failed",
+    ] = "prepared"
+
+
+class DeploymentReceipt(LedgerRecord):
+    """远程激活或回滚的可审计回执，不包含认证信息。"""
+
+    run_ref: str
+    contract_ref: str = ""
+    operation: Literal["deploy", "rollback"]
+    status: Literal["activated", "rolled_back", "failed"]
+    target_run_ref: str = ""
+    previous_active_run_ref: str = ""
+    runtime_ref: str = ""
+    payload_ref: str = ""
+    remote_run_ref: str = ""
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+    error: str = ""
+
+
+class TrainingStartReceipt(LedgerRecord):
+    """Auditable result of starting the training process after deployment."""
+
+    run_ref: str
+    contract_ref: str = ""
+    deployment_receipt_ref: str = ""
+    status: Literal["started", "failed"]
+    remote_run_ref: str = ""
+    run_dir: str = ""
+    handle_ref: str = ""
+    process_pattern: str = ""
+    plan_digest: str = ""
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+    error: str = ""
+
+
 class KnowledgeClaim(LedgerRecord):
     statement: str
     status: Literal["tentative", "validated", "rejected", "superseded"] = "tentative"
@@ -333,6 +395,9 @@ RECORD_MODELS: dict[str, Type[BaseModel]] = {
     "experiment_plan": ExperimentPlan,
     "decision": DecisionRecord,
     "experiment_outcome": ExperimentOutcome,
+    "research_run": ResearchRunLifecycle,
+    "deployment_receipt": DeploymentReceipt,
+    "training_start_receipt": TrainingStartReceipt,
     "knowledge_claim": KnowledgeClaim,
     "handoff": HandoffSnapshot,
 }
@@ -381,6 +446,41 @@ def validate_record(record_type: str, record: BaseModel | dict[str, Any]) -> lis
             issues.append(LedgerValidationIssue(code="evidence.facts_missing", message="human evidence requires structured observed facts"))
     if record_type == "experiment_outcome" and not value.experiment_ref:
         issues.append(LedgerValidationIssue(code="outcome.experiment_missing", message="outcome requires experiment_ref"))
+    if record_type == "research_run":
+        for name in ("run_ref", "contract_ref", "pipeline_manifest_ref"):
+            if not str(getattr(value, name, "")).strip():
+                issues.append(
+                    LedgerValidationIssue(
+                        code=f"research_run.{name}_missing",
+                        message=f"research run requires {name}",
+                    )
+                )
+        if value.status not in {"prepared", "failed"} and not value.deployment_receipt_ref:
+            issues.append(
+                LedgerValidationIssue(
+                    code="research_run.deployment_receipt_missing",
+                    message="a deployed research run requires deployment_receipt_ref",
+                )
+            )
+        if value.status == "observing" and not value.training_start_receipt_ref:
+            issues.append(
+                LedgerValidationIssue(
+                    code="research_run.training_start_receipt_missing",
+                    message="an observing research run requires training_start_receipt_ref",
+                )
+            )
+    if record_type == "deployment_receipt":
+        if not value.run_ref:
+            issues.append(LedgerValidationIssue(code="deployment.run_missing", message="deployment receipt requires run_ref"))
+        if value.status == "failed" and not value.error:
+            issues.append(LedgerValidationIssue(code="deployment.error_missing", message="failed deployment requires error"))
+    if record_type == "training_start_receipt":
+        if not value.run_ref:
+            issues.append(LedgerValidationIssue(code="training_start.run_missing", message="training start receipt requires run_ref"))
+        if value.status == "started" and not value.handle_ref:
+            issues.append(LedgerValidationIssue(code="training_start.handle_missing", message="started training requires handle_ref"))
+        if value.status == "failed" and not value.error:
+            issues.append(LedgerValidationIssue(code="training_start.error_missing", message="failed training start requires error"))
     if record_type == "reward_mechanism_graph" and not value.positive_drives:
         issues.append(LedgerValidationIssue(code="mechanism.positive_drive_missing", message="mechanism graph requires at least one positive drive"))
     if record_type == "mechanism_candidate":
@@ -460,7 +560,6 @@ def resume_edge_from_runtime_manifest(manifest: dict[str, Any], manifest_path: s
     run_id = str(run.get("run_id") or manifest.get("run_id") or "")
     restored = edge.get("restored") if isinstance(edge.get("restored"), dict) else {}
     execution = manifest.get("execution") if isinstance(manifest.get("execution"), dict) else {}
-    lineage = manifest.get("lineage") if isinstance(manifest.get("lineage"), dict) else {}
     status = str(edge.get("status") or "")
     return ResumeEdge(
         id=f"resume:{run_id or uuid.uuid4().hex}",

@@ -151,6 +151,54 @@ class VersionedPayloadDeployExecutor:
                 pass
 
 
+class VersionedTrainingStartExecutor:
+    """把产品生成的启动计划桥接到安全的远程训练启动器。
+
+    该适配器只负责建立 SSH、转换传输协议和关闭连接；会话冲突、marker、
+    进程可见性及禁止杀死既有训练等规则全部由执行层启动器负责。
+    """
+
+    def __init__(self, ssh_json: str = "config/ssh.json"):
+        self.ssh_json = ssh_json
+
+    @staticmethod
+    def _failure(plan, error: str):
+        from autotuner.execution import TrainingStartResult
+
+        run_id = str(getattr(plan, "run_id", ""))
+        run_dir = str(getattr(plan, "run_dir", ""))
+        session = str(getattr(plan, "tmux_session", ""))
+        return TrainingStartResult(
+            status="failed",
+            run_id=run_id,
+            run_dir=run_dir,
+            handle_ref=f"tmux:{session}" if session else "",
+            process_pattern=str(getattr(plan, "process_pattern", "")),
+            error=error,
+        )
+
+    def start(self, plan):
+        """启动一次已物料化的计划，并将连接或远端异常转为失败回执。"""
+        from autotuner.adapter.remote_deploy import from_ssh_json
+        from autotuner.execution import VersionedRemoteTrainingStarter
+
+        try:
+            ssh = from_ssh_json(self.ssh_json)
+        except Exception as exc:  # noqa: BLE001
+            return self._failure(plan, f"ssh setup failed: {type(exc).__name__}: {exc}")
+        try:
+            # ParamikoSSH 已经提供正式退出码；显式走适配器以固定执行层边界。
+            transport = RemoteSSHTransportAdapter(ssh, legacy_stderr=False)
+            return VersionedRemoteTrainingStarter(transport).start(plan)
+        except Exception as exc:  # noqa: BLE001
+            return self._failure(plan, f"training start raised: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                ssh.close()
+            except Exception:
+                pass
+
+
 def launch_training(ssh, train_cmd: str, session: str, log: str) -> StepResult:
     """Fire a long-running training job in a fresh tmux session (non-blocking). The orchestrator does
     NOT wait for it — monitoring is via the poll cron. Returns immediately with launch status."""
@@ -167,3 +215,12 @@ def launch_training(ssh, train_cmd: str, session: str, log: str) -> StepResult:
     ok = "YES" in alive
     return StepResult("launch_training", ok, f"tmux {session} {'started' if ok else 'failed'}",
                       {"session": session, "log": log, "attach": f"tmux attach -t {session}"})
+
+
+__all__ = [
+    "RemoteDeployExecutor",
+    "RemoteSSHTransportAdapter",
+    "VersionedPayloadDeployExecutor",
+    "VersionedTrainingStartExecutor",
+    "launch_training",
+]

@@ -7,7 +7,7 @@ mechanism AST 校验、产品能力校验和人工批准，才会进入任务合
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,6 +29,8 @@ from autotuner.product import (
     ResolvedProductContract,
     TaskContractBundle,
     TaskExecutionPipeline,
+    TaskPipelineResult,
+    TrainingLaunchRequest,
 )
 from .client import LLMResponse, call_llm_with_schema
 
@@ -115,11 +117,12 @@ class ResearchProposalResult:
 
 @dataclass(frozen=True)
 class AppliedResearchProposal:
-    """批准后的合同修订和可选机制校验结果。"""
+    """批准后的合同修订、机制校验和完整可训练交接。"""
 
     proposal: ResearchProposal
     revised_bundle: TaskContractBundle
     stored_contract: Any
+    pipeline_result: TaskPipelineResult
     mechanism_patch: MechanismPatch | None
     mechanism_validation: ValidationReport | None
 
@@ -328,6 +331,7 @@ def propose_research_change(request: ResearchProposalRequest) -> ResearchProposa
             ResearchProposal.model_validate(response.parsed),
             request,
         )
+        _validate_declared_mechanism_proposals(proposal, request)
     except Exception as exc:
         return ResearchProposalResult(None, response, f"proposal_invalid:{exc}")
     return ResearchProposalResult(proposal, response)
@@ -367,6 +371,55 @@ def _mechanism_patch(
     return patch, report
 
 
+def _validate_declared_mechanism_proposals(
+    proposal: ResearchProposal,
+    request: ResearchProposalRequest,
+) -> None:
+    """校验提案中直接声明的 patch，防止绕过 intent 合成路径。"""
+    training = proposal.task_changes.get("training", {})
+    if not isinstance(training, Mapping) or "mechanism_proposals" not in training:
+        return
+    raw_proposals = training["mechanism_proposals"]
+    if not isinstance(raw_proposals, (list, tuple)) or not raw_proposals:
+        raise ResearchProposalError("training.mechanism_proposals must be a non-empty list")
+    baseline = request.baseline_mechanism
+    if baseline is None:
+        raise ResearchProposalError(
+            "direct mechanism proposals require a baseline mechanism bundle"
+        )
+    context = ValidationContext(
+        required_evaluator_refs=request.required_evaluators,
+        protected_capabilities=request.protected_capabilities,
+        runtime_signal_names=frozenset(item.name for item in baseline.signals),
+    )
+    for index, raw in enumerate(raw_proposals):
+        if not isinstance(raw, Mapping):
+            raise ResearchProposalError(
+                f"training.mechanism_proposals[{index}] must be a mapping"
+            )
+        patch_data = raw.get("patch", raw)
+        try:
+            patch = MechanismPatch.model_validate(patch_data)
+        except Exception as exc:
+            raise ResearchProposalError(
+                f"training.mechanism_proposals[{index}] is not a valid mechanism patch: {exc}"
+            ) from exc
+        if set(patch.protected_capabilities) != set(request.protected_capabilities):
+            raise ResearchProposalError(
+                f"training.mechanism_proposals[{index}] changed protected capabilities"
+            )
+        if set(patch.required_evaluators) != set(request.required_evaluators):
+            raise ResearchProposalError(
+                f"training.mechanism_proposals[{index}] changed required evaluators"
+            )
+        _, report = validate_patch(baseline, patch, context)
+        if not report.ok:
+            raise ResearchProposalError(
+                f"training.mechanism_proposals[{index}] failed validation: "
+                + "; ".join(issue.message for issue in report.errors)
+            )
+
+
 def apply_research_proposal(
     pipeline: TaskExecutionPipeline,
     product: ResolvedProductContract,
@@ -375,11 +428,15 @@ def apply_research_proposal(
     request: ResearchProposalRequest,
     *,
     approved_by: str,
+    run_id: str,
     actor: str = "research-proposal",
+    launch_request: TrainingLaunchRequest | Mapping[str, Any] | None = None,
+    asset_reuse_approval_refs: Sequence[str] = (),
 ) -> AppliedResearchProposal:
-    """批准提案并创建新合同版本；旧合同和候选不会被覆盖。"""
+    """批准提案并生成新合同版本及其完整训练交接。"""
     request.validate()
     _validate_proposal(proposal, request)
+    _validate_declared_mechanism_proposals(proposal, request)
     approver = str(approved_by or "").strip()
     if not approver:
         raise ResearchProposalError("approved_by is required")
@@ -408,18 +465,22 @@ def apply_research_proposal(
         changes["training"] = training
     if not changes:
         raise ResearchProposalError("approved proposal contains no task or mechanism change")
-    revised, stored = pipeline.revise(
+    prepared_revision = pipeline.revise_and_prepare(
         product,
         base,
         {"changes": changes},
         evidence_refs=list(proposal.evidence_refs),
         approved_by=approver,
+        run_id=run_id,
         actor=actor,
+        launch_request=launch_request,
+        asset_reuse_approval_refs=asset_reuse_approval_refs,
     )
     return AppliedResearchProposal(
         proposal=proposal,
-        revised_bundle=revised,
-        stored_contract=stored,
+        revised_bundle=prepared_revision.revised_bundle,
+        stored_contract=prepared_revision.stored_contract,
+        pipeline_result=prepared_revision.pipeline_result,
         mechanism_patch=mechanism_patch,
         mechanism_validation=mechanism_report,
     )

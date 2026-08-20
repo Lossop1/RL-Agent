@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from autotuner.artifacts import AssetCatalog, AssetLineage
 from autotuner.product import (
     ProductPayload,
     TaskBundleMaterializer,
@@ -154,7 +155,7 @@ def test_task_pipeline_binds_payload_runtime_and_ledger_provenance(monkeypatch, 
     product = resolve_product_contract("taili")
     bundle = TaskContractCompiler().compile_bundle(product, _request())
 
-    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts):
+    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts, asset_bindings=()):
         return ProductPayload(
             archive=tmp_path / "payload.tar.gz",
             manifest=tmp_path / "payload.json",
@@ -201,11 +202,47 @@ def test_evidence_revision_creates_parent_and_supersedes_edges(tmp_path: Path) -
     assert stored.supersedes_ref == "artifact-test.taili@1"
 
 
+def test_evidence_revision_can_materialize_complete_run_handoff(monkeypatch, tmp_path: Path) -> None:
+    product = resolve_product_contract("taili")
+    base = TaskContractCompiler().compile_bundle(product, _request(approved=True))
+
+    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts, asset_bindings=()):
+        return ProductPayload(
+            archive=tmp_path / "payload.tar.gz",
+            manifest=tmp_path / "payload.json",
+            payload_digest="r" * 64,
+        )
+
+    monkeypatch.setattr("autotuner.product.task_pipeline.build_product_payload", fake_payload)
+    pipeline = TaskExecutionPipeline(tmp_path / "pipeline")
+    pipeline.contract_store.save(base, actor="test")
+
+    revision = pipeline.revise_and_prepare(
+        product,
+        base,
+        {"changes": {"training": {"experiment": {"mode": "approved"}}}},
+        evidence_refs=["evidence:diagnostic:42"],
+        approved_by="human",
+        run_id="run-revision-2",
+    )
+
+    manifest = json.loads(revision.pipeline_result.run_manifest.read_text(encoding="utf-8"))
+    assert revision.stored_contract.ref == "artifact-test.taili@2"
+    assert manifest["contract_lineage"] == {
+        "parent_ref": "artifact-test.taili@1",
+        "supersedes_ref": "artifact-test.taili@1",
+        "evidence_refs": ["evidence:diagnostic:42"],
+        "approved_by": "human",
+    }
+    assert manifest["task_contract_ref"] == revision.stored_contract.ref
+    assert revision.pipeline_result.deployment_spec.task_contract_ref == revision.stored_contract.ref
+
+
 def test_task_pipeline_records_declared_resume_edge(monkeypatch, tmp_path: Path) -> None:
     product = resolve_product_contract("taili")
     bundle = TaskContractCompiler().compile_bundle(product, _request(approved=True))
 
-    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts):
+    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts, asset_bindings=()):
         return ProductPayload(
             archive=tmp_path / "payload.tar.gz",
             manifest=tmp_path / "payload.json",
@@ -233,3 +270,122 @@ def test_task_pipeline_records_declared_resume_edge(monkeypatch, tmp_path: Path)
     assert manifest["resume_edge"]["status"] == "declared"
     edge = next(event for event in result.ledger_events if event.record_type == "resume_edge")
     assert edge.payload["status"] == "partial"
+
+
+def test_task_pipeline_binds_only_preapproved_reuse_assets(monkeypatch, tmp_path: Path) -> None:
+    product = resolve_product_contract("taili")
+    bundle = TaskContractCompiler().compile_bundle(product, _request(approved=True))
+    catalog = AssetCatalog(tmp_path / "asset-catalog")
+    baseline = catalog.register_asset(
+        asset_id="validated-baseline",
+        kind="training_baseline",
+        sha256="c" * 64,
+        locator="archive/run-source/agent.pt",
+        capability_scope=["quality"],
+        validation_evidence_refs=["evidence:source:diagnostic"],
+        lineage=AssetLineage(
+            source_task_contract_ref="source-task@7",
+            source_run_ref="run-source",
+        ),
+        actor="test",
+    )
+    approval = catalog.decide_reuse(
+        baseline.asset_ref,
+        approval_ref="approval:task-run-asset",
+        expected_digest="c" * 64,
+        target_contract_ref="artifact-test.taili@1",
+        target_run_ref="run-with-asset",
+        role="initial_checkpoint",
+        target_context={},
+        required_capabilities=["quality"],
+        evidence_refs=["evidence:review:task-run-asset"],
+        approved_by="human",
+        decision="approved",
+        reason="validated source baseline preserves the protected capability",
+        actor="test",
+    )
+
+    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts, asset_bindings=()):
+        return ProductPayload(
+            archive=tmp_path / "payload.tar.gz",
+            manifest=tmp_path / "payload.json",
+            payload_digest="s" * 64,
+        )
+
+    monkeypatch.setattr("autotuner.product.task_pipeline.build_product_payload", fake_payload)
+    result = TaskExecutionPipeline(
+        tmp_path / "pipeline",
+        asset_catalog=catalog,
+    ).prepare(
+        product,
+        bundle,
+        run_id="run-with-asset",
+        launch_request=TrainingLaunchRequest(
+            payload_root="/remote/payload",
+            run_id="run-with-asset",
+            checkpoint="/remote/checkpoints/source.pt",
+            checkpoint_asset_ref=baseline.asset_ref,
+            resume=True,
+        ),
+        asset_reuse_approval_refs=[approval.approval_ref],
+    )
+
+    manifest = json.loads(result.run_manifest.read_text(encoding="utf-8"))
+    assert len(result.asset_bindings) == 1
+    assert manifest["assets"]["reuse_bindings"][0]["asset_ref"] == baseline.asset_ref
+    assert manifest["execution"]["asset_binding_refs"] == [result.asset_bindings[0].binding_ref]
+
+
+def test_checkpoint_asset_must_match_launch_reference(monkeypatch, tmp_path: Path) -> None:
+    product = resolve_product_contract("taili")
+    bundle = TaskContractCompiler().compile_bundle(product, _request(approved=True))
+    catalog = AssetCatalog(tmp_path / "asset-catalog")
+    baseline = catalog.register_asset(
+        asset_id="validated-baseline",
+        kind="training_baseline",
+        sha256="e" * 64,
+        locator="archive/run-source/agent.pt",
+        validation_evidence_refs=["evidence:source:diagnostic"],
+        lineage=AssetLineage(
+            source_task_contract_ref="source-task@7",
+            source_run_ref="run-source",
+        ),
+        actor="test",
+    )
+    approval = catalog.decide_reuse(
+        baseline.asset_ref,
+        approval_ref="approval:mismatch",
+        expected_digest="e" * 64,
+        target_contract_ref="artifact-test.taili@1",
+        target_run_ref="run-mismatch",
+        role="resume_checkpoint",
+        target_context={},
+        evidence_refs=["evidence:review:mismatch"],
+        approved_by="human",
+        decision="approved",
+        reason="approved for identity mismatch test",
+        actor="test",
+    )
+
+    def fake_payload(*, contract, output_dir, task_bundle, task_artifacts, asset_bindings=()):
+        return ProductPayload(
+            archive=tmp_path / "payload.tar.gz",
+            manifest=tmp_path / "payload.json",
+            payload_digest="t" * 64,
+        )
+
+    monkeypatch.setattr("autotuner.product.task_pipeline.build_product_payload", fake_payload)
+    with pytest.raises(ValueError, match="checkpoint_asset_ref"):
+        TaskExecutionPipeline(tmp_path / "pipeline", asset_catalog=catalog).prepare(
+            product,
+            bundle,
+            run_id="run-mismatch",
+            launch_request=TrainingLaunchRequest(
+                payload_root="/remote/payload",
+                run_id="run-mismatch",
+                checkpoint="/remote/checkpoints/source.pt",
+                checkpoint_asset_ref="asset:training_baseline:" + "f" * 64 + ":other",
+                resume=True,
+            ),
+            asset_reuse_approval_refs=[approval.approval_ref],
+        )

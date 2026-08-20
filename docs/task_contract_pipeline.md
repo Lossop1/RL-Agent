@@ -10,6 +10,14 @@
   -> TaskContractStore + TaskBundleMaterializer
   -> payload / run manifest / research ledger
 
+研究闭环在上述准备阶段之上由 `autotuner.research.ResearchCoordinator` 统一编排：
+
+```text
+证据 -> 受限 LLM/机制合成候选 -> 确定性校验 -> 人工批准
+     -> revise_and_prepare -> 远程激活 -> 证据导入
+     -> promote / continue / rollback
+```
+
 ## 边界
 
 - autotuner/product/ 只定义合同、版本仓库和通用物料化协议。
@@ -17,6 +25,8 @@
 - products/<product>/ 承担该产品的训练、奖励、诊断、payload 和产品专用物料化。
 - autotuner/execution/ 只消费 runtime、payload、run 和合同引用，不导入产品实现。
 - autotuner/research/ 记录运行快照和证据来源，不把遥测或 LLM 判断直接升级为事实。
+- autotuner/artifacts/asset_catalog.py 记录内容寻址资产、来源谱系和一次性复用批准；
+  它不根据文件名或目录自动授予 checkpoint/训练基线复用资格。
 
 ## 合同版本
 
@@ -68,3 +78,17 @@ LLM 可以提出结构化任务意图和候选修改，但不能自行批准合�
 artifact 的执行路径只用于当前机器读取；跨机器和历史查询使用 `task-artifact-manifest:*`、`task-artifact:*` 等逻辑引用及 digest。
 
 `TaskExecutionPipeline.revise()` 只能接收带 evidence refs 的已批准变更，生成新合同版本并建立父子谱系。LLM 可以提出意图，但不能伪造批准、跳过确定性校验或直接启动远程训练。
+
+需要进入下一次训练时使用 `TaskExecutionPipeline.revise_and_prepare()`，而不是只调用
+`revise()`。它会在新版本上重新生成五类 artifact、payload、运行 manifest 和
+`DeploymentSpec`；旧版本不覆盖。批准的资产绑定会写入 manifest，resume checkpoint
+还必须在启动计划中携带同一 `checkpoint_asset_ref`，否则交接被拒绝。
+
+`ResearchCoordinator` 的验收规则是确定性的：必需 evaluator 和受保护能力全部通过
+才可 promote；证据不完整进入 continue；受保护能力回归或终止性失败进入 rollback。
+远程回滚暂时不可用时，状态会保留 `rollback_required`，进程重启后可从 ledger 恢复。
+
+部署与训练启动是两个独立边界：`deploy_prepared()` 成功后运行处于 `deployed`，
+必须再由 `start_deployed()` 通过启动计划、tmux 会话、marker 和进程可见性校验，
+运行才进入 `observing`。启动失败保留 `deployed`，允许从同一运行重试；证据和评估
+不能绕过启动回执直接附着到尚未验证启动的运行。

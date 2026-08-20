@@ -18,6 +18,7 @@ from .adapter import ProductAdapterSpec, resolve_product_adapter
 LAUNCH_PLAN_SCHEMA = "rl-agent.training-launch/v1"
 SUPPORTED_LAUNCHER_PROTOCOL = "rl-agent.payload-train/v1"
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]*$")
 _SAFE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_PATH = re.compile(r"/[A-Za-z0-9_.:/-]+")
 
@@ -67,6 +68,15 @@ def _safe_token(value: Any, name: str) -> str:
     return result
 
 
+def _safe_ref(value: Any, name: str, *, required: bool = False) -> str:
+    result = str(value or "").strip()
+    if not result and not required:
+        return ""
+    if not _SAFE_REF.fullmatch(result) or ".." in result.split("/"):
+        raise TrainingLaunchError(f"{name} is not a safe reference: {result!r}")
+    return result
+
+
 @dataclass(frozen=True)
 class TrainingLaunchRequest:
     """一次训练启动所需的运行态输入；不含产品实现细节。"""
@@ -74,6 +84,7 @@ class TrainingLaunchRequest:
     payload_root: str
     run_id: str
     checkpoint: str = ""
+    checkpoint_asset_ref: str = ""
     source_run: str = ""
     remote_boot_id: str = ""
     resume: bool = False
@@ -89,6 +100,7 @@ class TrainingLaunchRequest:
             payload_root=str(data.get("payload_root") or ""),
             run_id=str(data.get("run_id") or ""),
             checkpoint=str(data.get("checkpoint") or ""),
+            checkpoint_asset_ref=str(data.get("checkpoint_asset_ref") or ""),
             source_run=str(data.get("source_run") or ""),
             remote_boot_id=str(data.get("remote_boot_id") or ""),
             resume=bool(data.get("resume", False)),
@@ -116,6 +128,7 @@ class TrainingLaunchPlan:
     environment: Mapping[str, str]
     argv: tuple[str, ...]
     remote_boot_id: str = ""
+    checkpoint_asset_ref: str = ""
     schema_version: str = LAUNCH_PLAN_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
@@ -166,6 +179,7 @@ class TrainingLaunchPlan:
             "payload": self.payload_root,
             "source_run": self.source_run,
             "checkpoint": self.checkpoint,
+            "checkpoint_asset_ref": self.checkpoint_asset_ref,
             "tmux_session": self.tmux_session,
             "remote_boot_id": self.remote_boot_id,
             "resume": self.resume,
@@ -237,11 +251,17 @@ def build_training_launch_plan(
     payload_root = _safe_path(launch_request.payload_root, "launch_request.payload_root")
     run_id = _safe_id(launch_request.run_id, "launch_request.run_id")
     checkpoint = _safe_path(launch_request.checkpoint, "launch_request.checkpoint", required=False)
+    checkpoint_asset_ref = _safe_ref(
+        launch_request.checkpoint_asset_ref,
+        "launch_request.checkpoint_asset_ref",
+    )
     source_run = _safe_path(launch_request.source_run, "launch_request.source_run", required=False)
     if launch_request.resume and not checkpoint:
         raise TrainingLaunchError("resume launch requires a checkpoint")
     if not launch_request.resume and checkpoint:
         raise TrainingLaunchError("fresh launch cannot carry a checkpoint")
+    if checkpoint_asset_ref and not checkpoint:
+        raise TrainingLaunchError("checkpoint_asset_ref requires a checkpoint")
 
     total_steps = _positive(
         launch_request.total_steps if launch_request.total_steps is not None else launch.get("total_steps"),
@@ -301,6 +321,7 @@ def build_training_launch_plan(
         environment=_environment(launch, launch_request),
         argv=tuple(argv),
         remote_boot_id=_safe_token(launch_request.remote_boot_id, "launch_request.remote_boot_id"),
+        checkpoint_asset_ref=checkpoint_asset_ref,
     )
 
 

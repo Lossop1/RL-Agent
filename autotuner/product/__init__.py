@@ -31,6 +31,7 @@ from .task_materializer import (
 from .task_store import STORE_SCHEMA, StoredTaskContract, TaskContractStore
 from .task_pipeline import (
     TASK_PIPELINE_SCHEMA,
+    PreparedTaskRevision,
     TaskExecutionPipeline,
     TaskPipelineError,
     TaskPipelineResult,
@@ -97,6 +98,7 @@ __all__ = [
     "StoredTaskContract",
     "TaskContractStore",
     "TASK_PIPELINE_SCHEMA",
+    "PreparedTaskRevision",
     "TaskExecutionPipeline",
     "TaskPipelineError",
     "TaskPipelineResult",

@@ -3,13 +3,15 @@
 > **文档性质**：本文件是系统的顶层设计，作为实现、讨论与评审的共同基准，不是单方面权威；
 > 实现中发现的设计问题以讨论结论为准，本文件随讨论持续修订。
 >
-> **系统代号**：`rl-agent`（端到端机器人强化学习智能体）。建议新建顶层包 `agent/`，与 `autotuner/` 并列；
-> 通过适配器复用 `autotuner` 既有能力（payload/诊断/console）。是否并入 `autotuner` 属实现细节，可提案。
+> **系统代号**：`rl-agent`（端到端机器人强化学习智能体）。当前实现落在 `autotuner/` 的通用模块中，
+> 由 `product`、`mechanisms`、`artifacts`、`research`、`execution` 分层承担职责；具体机器人和任务位于
+> `products/<product>/`，不再另建一套与现有执行层重复的 `agent/` 包。
 >
 > **阅读顺序**：
 > ① 本文件 → ② `docs/taili_spec.md`（验收契约范式）→ ③ `docs/taili_strategy_decisions.md`（机制契约范式）
 > → ④ `docs/taili_live_handoff.md`（活状态范式）→ ⑤ `docs/archive/research-agent/rl_agent_design.md`（设计论证过程）
 > → ⑥ `docs/archive/taili/taili_session_lessons.md`（历史素材，仅作背景，不作为实现依据）。
+> 当前可执行链和恢复规则见 `docs/task_contract_pipeline.md` 与 `docs/research_runtime_contract.md`。
 >
 > **术语**：实例（Instance）= 三元组 (机器人, 任务, 仿真世界)；家族（Family）= 验收契约中的一组硬门槛；
 > 口径（Orthodoxy）= 部署侧约束（盲、mean-action、无特权）；谱系（Lineage）= 检查点/resume 的 DAG；
@@ -331,7 +333,7 @@ permission: { object_class, ops, permission: auto|confirm|manual|forbidden, laye
 | TRAINING | 已启动 | 进入监控循环 | MONITORING |
 | MONITORING | 训练中 | §5.2 循环 | DIAGNOSING / ACCEPTING / PAUSED |
 | DIAGNOSING | 干预或惊讶触发 | 强制诊断 + 交叉验证 | TUNING（归因后）/ MONITORING（无问题） |
-| TUNING | 归因完成 | 提案 → 检查清单 → 授权 → 执行 → 部署 → 恢复训练 | MONITORING |
+| TUNING | 归因完成 | 提案 → 检查清单 → 授权 → 执行 → 部署 → 启动校验 → 恢复训练 | MONITORING |
 | ACCEPTING | 阶段里程碑 | battery + 覆盖审计 | TRANSFERRING / **TUNING（发现问题回去修）** / MONITORING |
 | TRANSFERRING | 验收过 | sim2sim 保真核对 → sim2real 口径检查 | DONE / **TUNING（迁移暴露问题回去修）** |
 | DONE | 交付 | 策略 + 谱系 + 报告 | — |

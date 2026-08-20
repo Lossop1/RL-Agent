@@ -34,6 +34,10 @@ _EXPORTS = {
     "RuntimeIdentity": ("runtime", "RuntimeIdentity"),
     "capture_runtime_identity": ("runtime", "capture_runtime_identity"),
     "resolve_runtime_identity": ("runtime", "resolve_runtime_identity"),
+    "TrainingStartPlan": ("training", "TrainingStartPlan"),
+    "TrainingStartResult": ("training", "TrainingStartResult"),
+    "TRAINING_START_SCHEMA": ("training", "TRAINING_START_SCHEMA"),
+    "VersionedRemoteTrainingStarter": ("training", "VersionedRemoteTrainingStarter"),
 }
 
 
