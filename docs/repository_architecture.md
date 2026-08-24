@@ -24,6 +24,8 @@
 | 产品运维插件 | `products/<product>/ops/` | 产品特有的知识、playbook、验收和调参插件 |
 | 控制台适配 | `autotuner/locomotion_console/` | FastAPI、数据源、UI API、LLM 工具和研究/远程适配 |
 | 机器人适配 | `autotuner/adapter/` | 按产品合同消费机器人资产，生成通用部署计划；不保存某个机器人实现 |
+| 传统控制核心 | `autotuner/control/` | 与产品和仿真器无关的状态契约、MPC、连续步态、接触估计、WBC、伺服和诊断 |
+| 传统控制产品适配 | `products/<product>/traditional_control/` | 产品 profile、运动学、仿真器 I/O、评测和可重建 bundle 入口 |
 | 诊断库 | `tools/isaaclab_quad_diag_observation/` | 可独立打包的诊断度量、记录和报告协议 |
 
 执行层的唯一交付链是：
@@ -54,6 +56,8 @@ config/products/<product>.yaml
 - 资产目录：`autotuner.artifacts.AssetCatalog`
 - 结构门：`python tools/check_repository_structure.py`
 - 前端源码：`locomotion-console-ui/`
+- 传统控制地图：`docs/traditional_control/PROJECT_MAP.md`
+- 传统控制名义 bundle：`python tools/traditional_control/build_bundle.py`
 
 ## 依赖方向
 

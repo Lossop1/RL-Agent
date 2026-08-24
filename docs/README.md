@@ -9,6 +9,8 @@
 | 仓库目录和依赖方向 | [`repository_architecture.md`](repository_architecture.md) |
 | 修改、清理和验证标准 | [`maintenance_standard.md`](maintenance_standard.md) |
 | 当前训练/部署操作 | [`taili_ops_runbook.md`](taili_ops_runbook.md)、[`locomotion_console_startup.md`](locomotion_console_startup.md) |
+| Taili 传统控制工程地图与当前状态 | [`traditional_control/PROJECT_MAP.md`](traditional_control/PROJECT_MAP.md) |
+| Taili 传统控制维护与提交规则 | [`traditional_control/maintenance.md`](traditional_control/maintenance.md) |
 | 研究 Agent 当前运行闭环 | [`rl_agent_architecture.md`](rl_agent_architecture.md)、[`rl_agent_live_system_operations.md`](rl_agent_live_system_operations.md) |
 
 ## 专题资料
@@ -23,4 +25,3 @@
 
 设计提案、长篇交接、调参日志和旧基线只用于追溯，不作为当前配置或验收依据。
 它们统一放在 [`archive/`](archive/README.md)；当前活状态仍以运行台账和明确的 live handoff 为准。
-

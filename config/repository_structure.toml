@@ -35,6 +35,9 @@ training_config = "products/taili/blind_locomotion/taili_blind_config.yaml"
 payload_manifest = "python -m products.taili.payload.payload_manifest"
 payload_builder = "python -m products.taili.payload.build_payload"
 structure_check = "python tools/check_repository_structure.py"
+traditional_control_map = "docs/traditional_control/PROJECT_MAP.md"
+traditional_control_bundle = "python tools/traditional_control/build_bundle.py"
+traditional_control_acceptance = "python tools/traditional_control/run_acceptance.py"
 
 [dependency_rules]
 # 每行表示“左侧包禁止直接依赖右侧包”。兼容转发文件不作为业务依赖。

@@ -41,6 +41,11 @@ frontend/dist/
 # into the repo it holds console_config.json / remote_profile.json — keep it out.
 locomotion_console_state/
 .runtime_logs/
+.runtime/
+.tmp/
+output/traditional_control/
+products/taili/traditional_control/.build/
+products/taili/payload/.build/
 .codegraph/
 .claude/
 .codex_staging/
