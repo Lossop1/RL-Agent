@@ -1,0 +1,7 @@
+# Nominal Taili model-based controller dependencies.
+numpy>=1.24
+scipy>=1.10
+osqp>=1.0,<2
+PyYAML>=6.0
+# MuJoCo is optional for pure controller tests and required by the adapter.
+mujoco>=3.2

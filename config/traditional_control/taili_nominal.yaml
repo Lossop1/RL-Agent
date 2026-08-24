@@ -1,0 +1,186 @@
+schema_version: taili_traditional_control_v1
+
+robot:
+  urdf: locomotion-console-ui/public/robot/taili_dog_description/urdf/robot.urdf
+  nominal_base_height: 0.5471961541
+  mass_kg: 38.98
+  q_default: [0.0, 0.0, 0.0, 0.0, 0.7, 0.7, 0.7, 0.7, -1.4, -1.4, -1.4, -1.4]
+
+actuator:
+  # The impedance loop runs at physics_dt; these gains are the nominal
+  # position/velocity gains for the model-based controller, not RL gains.
+  kp: {hip: 120.0, thigh: 120.0, calf: 120.0}
+  kd: {hip: 10.0, thigh: 10.0, calf: 10.0}
+
+# Linear centroidal MPC. The model controller owns these targets; no RL
+# reward, curriculum, or policy output is consumed here.
+mpc:
+  horizon: 12
+  dt: 0.02
+  inertia_kg_m2: [0.16908639, 0.50696312, 0.59809978]
+  # World x/y/z and roll/pitch/yaw channels, in that order.
+  state_weight: [12.0, 12.0, 24.0, 16.0, 16.0, 8.0]
+  terminal_weight: [24.0, 24.0, 40.0, 28.0, 28.0, 16.0]
+  input_weight: [0.08, 0.08, 0.8, 0.3, 0.3, 0.02]
+  max_acceleration: [5.0, 5.0, 8.0, 8.0, 8.0, 6.0]
+  # Commands are velocities, not an unbounded world-path objective. Limiting
+  # reference lead prevents wind-up when stairs require a temporary slowdown.
+  max_position_error: 0.15
+  max_yaw_error: 0.35
+
+gait:
+  period: 0.72
+  period_min: 0.58
+  period_slope: 0.05
+  yaw_speed_equivalent: 0.30
+  duty_factor: 0.68
+  swing_clearance: 0.06
+  command_ramp_time: 0.30
+  contact_blend_phase: 0.08
+  # Raibert 速度反馈只修正连续落脚点，不改变步态相位或接触状态。
+  # Taili 对较大的反馈非常敏感；0.35 会放大横向误差并破坏核心稳定。
+  foothold_velocity_gain: 0.06
+  foothold_yaw_rate_gain: 0.10
+  max_foothold_correction: [0.12, 0.06]
+  # Start from the all-support portion of the continuous oscillator so the
+  # body can establish command velocity before the first diagonal swing.
+  start_phase: 0.32
+  lateral_start_phase: 0.32
+  # Ignore millimetre-scale contact/model correction; only a real support
+  # level change uses a world-height swing target.
+  height_transition_threshold: 0.03
+  # Delay horizontal crossing of a riser until the swing has lifted.
+  obstacle_lift_delay: 0.20
+  # Ordinary stair motion keeps the configured diagonal gait. Once a real
+  # tread-height transition is latched, this caps concurrent swing legs so
+  # the remaining support is preserved.
+  stair_max_swing_legs: 1
+
+wbc:
+  dt: 0.02
+  # 浮基与摆腿是软任务；全身动力学、承重足、摩擦和执行器边界在 QP 中为硬约束。
+  base_acceleration_weight: [100.0, 150.0, 250.0, 300.0, 300.0, 100.0]
+  base_acceleration_limit: [5.0, 5.0, 8.0, 8.0, 8.0, 6.0]
+  swing_acceleration_weight: [20.0, 20.0, 20.0]
+  # Only a genuine change of tread height gets stronger vertical tracking.
+  height_transition_vertical_weight: 50.0
+  # Once a swing endpoint is latched in the world frame, all three axes are
+  # a physical contact obligation. Leaving x/y at ordinary swing priority
+  # lets an infeasible body task drag the foot away from the landing point.
+  contact_acquisition_horizontal_weight: 300.0
+  contact_acquisition_vertical_weight: 300.0
+  # A completed touchdown is pressed gently into the measured terrain until
+  # normal load is real; this is removed immediately after contact admission.
+  contact_acquisition_downward_acceleration: 0.8
+  # A held touchdown must reach its physical landing target before the
+  # nominal joint posture is resumed; ordinary stance keeps posture weight 4.
+  # 接触捕获只改变足端的明确目标，不取消整条腿的名义姿态稳定。
+  contact_acquisition_posture_acceleration_weight: 4.0
+  # Do not release posture during a predictive lift; release it only after the
+  # body target is actually transitioning to an established support level.
+  contact_acquisition_body_height_error_threshold: 0.03
+  posture_acceleration_weight: 4.0
+  generalized_acceleration_regularization: 0.000001
+  contact_force_regularization: 0.00001
+  joint_torque_regularization: 0.000001
+  height_position_gain: 30.0
+  height_velocity_gain: 8.0
+  orientation_position_gain: 35.0
+  orientation_velocity_gain: 7.0
+  swing_position_gain: 140.0
+  swing_velocity_gain: 22.0
+  max_swing_acceleration: 60.0
+  posture_position_gain: 18.0
+  posture_velocity_gain: 4.0
+  posture_acceleration_limit: [120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0, 120.0]
+  contact_friction: 0.8
+  # A contact admitted by the WBC must carry a small positive load. This
+  # prevents a nominally active support from silently unloading during a
+  # stair transfer while leaving the force distribution otherwise free.
+  minimum_contact_normal_force: 50.0
+  max_contact_normal_force: 400.0
+  osqp_absolute_tolerance: 0.00001
+  osqp_relative_tolerance: 0.00001
+  osqp_max_iterations: 4000
+
+contact:
+  height_filter_alpha: 0.25
+  normal_force_threshold: 5.0
+  # A global body-height target is valid only when active support feet agree
+  # on one tread. Mixed adjacent treads keep local estimates but do not
+  # create an artificial intermediate support plane.
+  support_level_tolerance: 0.04
+  # Only upward-facing contacts can enter support-force allocation. A foot
+  # touching a stair riser remains collision evidence, not vertical support.
+  # Nominal treads are horizontal. A corner/riser resultant with a large
+  # horizontal component is collision evidence, not load-bearing support.
+  support_normal_min_z: 0.9
+  # Known scene geometry remains authoritative. Contact can only correct
+  # small model/collision offsets, never substitute a neighbouring tread.
+  height_max_correction: 0.025
+  minimum_support_contacts: 2
+
+simulation:
+  physics_dt: 0.0025
+  policy_dt: 0.02
+
+scenarios:
+  flat:
+    terrain: {type: flat, height: 0.0}
+    command: [0.0, 0.0, 0.0]
+  flat_forward:
+    terrain: {type: flat, height: 0.0}
+    command: [0.40, 0.0, 0.0]
+  flat_backward:
+    terrain: {type: flat, height: 0.0}
+    command: [-0.30, 0.0, 0.0]
+  flat_left:
+    terrain: {type: flat, height: 0.0}
+    gait: {max_swing_legs: 1}
+    command: [0.0, 0.12, 0.0]
+  flat_right:
+    terrain: {type: flat, height: 0.0}
+    gait: {max_swing_legs: 1, lateral_start_phase: 0.50}
+    command: [0.0, -0.12, 0.0]
+  flat_yaw_left:
+    terrain: {type: flat, height: 0.0}
+    command: [0.0, 0.0, 0.45]
+  flat_yaw_right:
+    terrain: {type: flat, height: 0.0}
+    command: [0.0, 0.0, -0.45]
+  stairs_up:
+    terrain: {type: stairs, rise: 0.15, run: 0.30, start_x: 0.20, width: 1.2, max_steps: 8}
+    # 两只前脚处在新台阶、后脚仍在旧台阶时，不得提前抬高机身。
+    contact: {minimum_support_contacts: 3}
+    # A 15 cm rise plus nominal clearance is not acceleration-feasible inside
+    # the flat gait's 0.23 s swing. Slow only the continuous stair gait; no
+    # step-index state machine or prescribed leg sequence is introduced.
+    gait: {period: 1.10, period_min: 1.10, duty_factor: 0.68}
+    command: [0.18, 0.0, 0.0]
+  stairs_down:
+    terrain: {type: stairs, rise: 0.15, run: 0.30, start_x: -0.20, width: 1.2, max_steps: 8}
+    contact: {minimum_support_contacts: 3}
+    gait: {period: 1.10, period_min: 1.10, duty_factor: 0.68}
+    command: [-0.20, 0.0, 0.0]
+
+evaluation:
+  scenarios: [flat, flat_forward, flat_backward, flat_left, flat_right, flat_yaw_left, flat_yaw_right, stairs_up, stairs_down]
+  duration_s:
+    default: 3.0
+    stairs_up: 6.0
+    stairs_down: 6.0
+  required_metrics: [velocity_tracking_rmse, yaw_rate_tracking_rmse, progress_ratio, cross_track_error, base_height_error_rms, tilt_rms_rad, torque_saturation_fraction, max_dynamics_residual, max_contact_acceleration_residual]
+  thresholds:
+    max_tilt_rad: 0.35
+    max_height_error_rms: 0.035
+    max_torque_saturation_fraction: 0.15
+    max_dynamics_residual: 0.001
+    max_contact_acceleration_residual: 0.0001
+    max_velocity_tracking_rmse: 0.22
+    max_yaw_rate_tracking_rmse: 0.25
+    min_progress_ratio: 0.55
+    max_cross_track_error: 0.20
+    max_standing_drift: 0.03
+    max_standing_mean_speed: 0.03
+    min_stair_expected_height_change: 0.14
+    min_terrain_height_progress_ratio: 0.55
