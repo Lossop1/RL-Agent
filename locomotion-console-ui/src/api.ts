@@ -978,19 +978,139 @@ export interface DiagnosticPlaybackFrame {
   terrain_level?: number | null;
 }
 
+export interface DiagnosticPlaybackPrimitive {
+  id: string;
+  type: string;
+  center: [number, number, number];
+  size: [number, number, number];
+  color?: string;
+}
+
+export interface DiagnosticPlaybackRobot {
+  id: string;
+  label: string;
+  urdf_url: string;
+  base_link: string;
+  joint_order: string[];
+  leg_order: string[];
+}
+
+export interface DiagnosticPlaybackScene {
+  id: string;
+  label: string;
+  terrain_primitives: DiagnosticPlaybackPrimitive[];
+}
+
 export interface DiagnosticPlayback {
   available: boolean;
   message: string;
-  source: "fake" | "real";
+  source: "fake" | "real" | "local";
   output_dir?: string | null;
+  manifest_path?: string | null;
+  result_path?: string | null;
   fps: number;
   joint_order: string[];
   leg_order: string[];
+  robot: DiagnosticPlaybackRobot;
+  scene: DiagnosticPlaybackScene;
   frames: DiagnosticPlaybackFrame[];
   source_rows: number;
   stride: number;
   selected_env_id?: number | null;
   available_env_ids: number[];
+}
+
+export interface TraditionalControlControllerInfo {
+  id: string;
+  label: string;
+  description: string;
+  provider_id: string;
+  provider_ids: string[];
+}
+
+export interface TraditionalControlSceneInfo {
+  id: string;
+  label: string;
+  description: string;
+  terrain_type: string;
+  command: number[];
+  duration_s: number;
+  provider_id: string;
+  provider_ids: string[];
+  controller_ids: string[];
+}
+
+export interface TraditionalControlProductInfo {
+  id: string;
+  label: string;
+  robot: DiagnosticPlaybackRobot;
+  controllers: TraditionalControlControllerInfo[];
+  scenes: TraditionalControlSceneInfo[];
+  data_sources: TraditionalControlDataSourceInfo[];
+}
+
+export interface TraditionalControlDataSourceInfo {
+  id: string;
+  label: string;
+  /** Provider-defined capability; "replay" is handled by the local loader. */
+  kind: string;
+  available: boolean;
+  description: string;
+  replay_id?: string | null;
+  provider_id: string;
+}
+
+export interface TraditionalControlJobStatus {
+  state: "idle" | "starting" | "running" | "complete" | "error" | "cancelled";
+  run_id?: string | null;
+  product_id?: string | null;
+  controller_id?: string | null;
+  scene_id?: string | null;
+  data_source_id?: string | null;
+  output_dir?: string | null;
+  manifest_path?: string | null;
+  result_path?: string | null;
+  playback_available: boolean;
+  progress: number;
+  elapsed_s: number;
+  message: string;
+  error: string;
+}
+
+export interface TraditionalControlCatalog {
+  available: boolean;
+  message: string;
+  products: TraditionalControlProductInfo[];
+  data_sources: TraditionalControlDataSourceInfo[];
+  recent_runs: TraditionalControlJobStatus[];
+}
+
+export interface TraditionalControlRunRequest {
+  product_id: string;
+  controller_id: string;
+  scene_id: string;
+  duration_s: number;
+  data_source_id: string;
+  replay_id?: string | null;
+}
+
+export const DEFAULT_TRADITIONAL_CONTROL_PLAYBACK_FRAMES = 900;
+
+export interface TraditionalControlMetricInfo {
+  id: string;
+  label: string;
+  value: unknown;
+  unit: string;
+  precision: number;
+}
+
+export interface TraditionalControlResult {
+  available: boolean;
+  verdict: "passed" | "failed" | "unknown";
+  summary: string;
+  metrics: TraditionalControlMetricInfo[];
+  failure_reasons: string[];
+  raw: Record<string, unknown>;
 }
 
 async function jsonRequest<T>(url: string, init: RequestInit = {}): Promise<T> {
@@ -1181,6 +1301,46 @@ export interface ChatResponse {
   grounding?: Grounding | null;
   proposal_id?: string | null;
   context_envelope?: ContextEnvelopeInfo | null;
+}
+
+export function getTraditionalControlCatalog(): Promise<TraditionalControlCatalog> {
+  return jsonRequest("/traditional-control/catalog");
+}
+
+export function startTraditionalControlRun(request: TraditionalControlRunRequest): Promise<TraditionalControlJobStatus> {
+  return jsonRequest("/traditional-control/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+}
+
+export function cancelTraditionalControlRun(): Promise<TraditionalControlJobStatus> {
+  return jsonRequest("/traditional-control/cancel", { method: "POST" });
+}
+
+export function getTraditionalControlStatus(runId?: string | null): Promise<TraditionalControlJobStatus> {
+  const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return jsonRequest(`/traditional-control/status${suffix}`);
+}
+
+export function getTraditionalControlPlayback(
+  maxFrames = DEFAULT_TRADITIONAL_CONTROL_PLAYBACK_FRAMES,
+  runId?: string | null,
+): Promise<DiagnosticPlayback> {
+  const params = new URLSearchParams({ max_frames: String(maxFrames) });
+  if (runId) params.set("run_id", runId);
+  return jsonRequest(`/traditional-control/playback?${params.toString()}`);
+}
+
+export function getTraditionalControlResult(runId?: string | null): Promise<TraditionalControlResult> {
+  const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return jsonRequest(`/traditional-control/result${suffix}`);
+}
+
+export function getTraditionalControlManifest(runId?: string | null): Promise<Record<string, unknown>> {
+  const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return jsonRequest(`/traditional-control/manifest${suffix}`);
 }
 
 export interface AgentProgressEvent {

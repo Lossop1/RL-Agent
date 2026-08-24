@@ -166,6 +166,13 @@ class LocomotionConsoleSettings:
     )
     local_state_root: str = _default_state_root()
     diagnostic_task: str = field(default_factory=_default_diagnostic_task)
+    # Local, workspace-contained traditional-control demo artifacts.
+    traditional_control_output_root: str = field(
+        default_factory=lambda: os.environ.get(
+            "LOCOMOTION_TRADITIONAL_CONTROL_ROOT",
+            str(PROJECT_ROOT / "output" / "traditional_control"),
+        )
+    )
 
 
 def get_settings() -> LocomotionConsoleSettings:
@@ -216,4 +223,8 @@ def get_settings() -> LocomotionConsoleSettings:
         ),
         local_state_root=local_state_root,
         diagnostic_task=diagnostic_task,
+        traditional_control_output_root=os.environ.get(
+            "LOCOMOTION_TRADITIONAL_CONTROL_ROOT",
+            str(PROJECT_ROOT / "output" / "traditional_control"),
+        ),
     )

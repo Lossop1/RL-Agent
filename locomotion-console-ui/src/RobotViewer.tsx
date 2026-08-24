@@ -15,12 +15,7 @@ type UrdfRobot = THREE.Object3D & {
   joints?: Record<string, { setJointValue?: (value: number) => void }>;
 };
 
-const FOOT_COLORS: Record<string, number> = {
-  FL: 0x70a7ff,
-  FR: 0xff786e,
-  RL: 0x7bd88f,
-  RR: 0xc49aff,
-};
+const FOOT_COLORS = [0x70a7ff, 0xff786e, 0x7bd88f, 0xc49aff, 0xf5c451, 0x66c7cc];
 
 const PLAYBACK_RATES = [0.25, 0.5, 1, 2, 4];
 
@@ -77,6 +72,7 @@ export default function RobotViewer({
     caseAnchorsRef.current = anchors;
     playheadRef.current = 0;
     setFrameIndex(0);
+    setPlaying(Boolean(playback?.available && playback.frames.length));
     setViewerError("");
     setViewerState(
       playback === null
@@ -142,22 +138,73 @@ export default function RobotViewer({
     const terrainGroup = new THREE.Group();
     scene.add(terrainGroup);
     const terrainOutlines = new Map<string, THREE.LineSegments>();
+    const terrainSolids = new Map<string, THREE.Mesh>();
     const outlineGeo = new THREE.EdgesGeometry(new THREE.PlaneGeometry(0.105, 0.105));
     let lastCaseKey = "";
     let lastFrameT = -1;
     let lastUiUpdateMs = -Infinity;
+
+    const updateTerrainGeometry = (
+      frame: DiagnosticPlaybackFrame | undefined,
+      data: DiagnosticPlayback | null,
+      anchorFrame: DiagnosticPlaybackFrame | undefined,
+    ) => {
+      const primitives = data?.scene?.terrain_primitives ?? [];
+      const anchor = anchorFrame?.base_position ?? [0, 0, 0];
+      const anchorTerrain = anchorFrame?.terrain_height ?? 0;
+      ground.visible = primitives.length === 0;
+      const primitiveKey = (primitive: typeof primitives[number]) =>
+        `${data?.scene?.id || "scene"}:${primitive.id}:${primitive.type}:${primitive.size.join(",")}`;
+      const known = new Set(primitives.map(primitiveKey));
+      for (const [id, mesh] of terrainSolids) {
+        if (!known.has(id)) {
+          terrainGroup.remove(mesh);
+          mesh.geometry.dispose();
+          (mesh.material as THREE.Material).dispose();
+          terrainSolids.delete(id);
+        }
+      }
+      for (const primitive of primitives) {
+        if (primitive.type !== "box" && primitive.type !== "plane") continue;
+        const id = primitiveKey(primitive);
+        let mesh = terrainSolids.get(id);
+        if (!mesh) {
+          const color = primitive.color || (primitive.type === "plane" ? "#30382f" : "#5f6d5e");
+          const renderHeight = primitive.type === "plane" ? 0.01 : Math.max(0.01, primitive.size[2]);
+          mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(
+              Math.max(0.01, primitive.size[0]),
+              Math.max(0.01, primitive.size[1]),
+              renderHeight,
+            ),
+            new THREE.MeshStandardMaterial({ color, roughness: 0.9, metalness: 0.02 }),
+          );
+          mesh.receiveShadow = true;
+          mesh.castShadow = primitive.type === "box";
+          terrainSolids.set(id, mesh);
+          terrainGroup.add(mesh);
+        }
+        mesh.position.set(
+          primitive.center[0] - anchor[0],
+          primitive.center[1] - anchor[1],
+          primitive.center[2] - anchorTerrain - (primitive.type === "plane" ? 0.005 : 0),
+        );
+      }
+      void frame;
+    };
 
     const world = new THREE.Group();
     scene.add(world);
     robotGroupRef.current = world;
 
     const footMarkers: Record<string, THREE.Mesh> = {};
-    for (const leg of ["FL", "FR", "RL", "RR"]) {
+    const legOrder = playback?.robot?.leg_order ?? [];
+    legOrder.forEach((leg, legIndex) => {
       const marker = new THREE.Mesh(
         new THREE.SphereGeometry(0.035, 16, 12),
         new THREE.MeshStandardMaterial({
-          color: FOOT_COLORS[leg],
-          emissive: FOOT_COLORS[leg],
+          color: FOOT_COLORS[legIndex % FOOT_COLORS.length],
+          emissive: FOOT_COLORS[legIndex % FOOT_COLORS.length],
           emissiveIntensity: 0.18,
           roughness: 0.45,
         })
@@ -165,13 +212,14 @@ export default function RobotViewer({
       marker.castShadow = true;
       footMarkers[leg] = marker;
       scene.add(marker);
-    }
+    });
     feetRef.current = footMarkers;
 
     let disposed = false;
     const loader = new URDFLoader();
-    loader.load(
-      "/robot/taili_dog_description/urdf/robot.urdf",
+    const urdfUrl = playback?.robot?.urdf_url || playbackRef.current?.robot?.urdf_url || "";
+    if (urdfUrl) loader.load(
+      urdfUrl,
       (robot) => {
         if (disposed) return;
         const urdf = robot as UrdfRobot;
@@ -212,6 +260,7 @@ export default function RobotViewer({
         setViewerState("error");
       }
     );
+    else setViewerState("empty");
 
     const resize = () => {
       const width = Math.max(1, mount.clientWidth);
@@ -259,6 +308,7 @@ export default function RobotViewer({
           const anchorFrame = caseAnchorsRef.current.get(currentCaseKey) ?? data.frames[0];
           const aPos = anchorFrame?.base_position ?? [0, 0, 0];
           const aTer = anchorFrame?.terrain_height ?? 0;
+          updateTerrainGeometry(frame, data, anchorFrame);
           for (const foot of Object.values(frame.feet)) {
             if (!foot.contact) continue;
             const fx = foot.position[0] - aPos[0];
@@ -320,6 +370,11 @@ export default function RobotViewer({
         (outline.material as THREE.Material).dispose();
       });
       terrainOutlines.clear();
+      terrainSolids.forEach((mesh) => {
+        mesh.geometry.dispose();
+        (mesh.material as THREE.Material).dispose();
+      });
+      terrainSolids.clear();
       outlineGeo.dispose();
       renderer.dispose();
       renderer.forceContextLoss();
@@ -335,7 +390,7 @@ export default function RobotViewer({
       controlsRef.current = null;
       feetRef.current = {};
     };
-  }, []);
+  }, [playback?.robot?.urdf_url, playback?.robot?.leg_order.join(",")]);
 
   const currentFrame = playback?.frames[frameIndex] ?? null;
   const frameCount = playback?.frames.length ?? 0;
@@ -395,7 +450,7 @@ export default function RobotViewer({
           <span className="robot-loading error">{viewerError || t.robotViewer.error}</span>
         )}
         <div className="robot-file-label">
-          {playback?.available ? `record.csv / ${frameCount} frames` : t.robotViewer.record}
+          {playback?.available ? `${playback.source} playback / ${frameCount} frames` : t.robotViewer.record}
         </div>
       </div>
       <div className="robot-view-controls">

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RunStatus(BaseModel):
@@ -898,19 +898,150 @@ class DiagnosticPlaybackFrame(BaseModel):
     terrain_level: Optional[int] = None
 
 
+class DiagnosticPlaybackPrimitive(BaseModel):
+    """Simulator-independent terrain primitive used by browser playback."""
+
+    id: str = ""
+    type: str = "box"
+    center: list[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    size: list[float] = Field(default_factory=lambda: [1.0, 1.0, 0.1])
+    color: str = ""
+
+
+class DiagnosticPlaybackRobot(BaseModel):
+    """Robot asset and naming contract consumed by the generic viewer."""
+
+    id: str = ""
+    label: str = ""
+    urdf_url: str = ""
+    base_link: str = ""
+    joint_order: list[str] = Field(default_factory=list)
+    leg_order: list[str] = Field(default_factory=list)
+
+
+class DiagnosticPlaybackScene(BaseModel):
+    """Optional scene geometry; the viewer does not know product or simulator names."""
+
+    id: str = ""
+    label: str = ""
+    terrain_primitives: list[DiagnosticPlaybackPrimitive] = Field(default_factory=list)
+
+
 class DiagnosticPlayback(BaseModel):
     available: bool
     message: str = ""
-    source: Literal["fake", "real"]
+    source: Literal["fake", "real", "local"]
     output_dir: Optional[str] = None
+    manifest_path: Optional[str] = None
+    result_path: Optional[str] = None
     fps: float = 50.0
     joint_order: list[str] = Field(default_factory=list)
     leg_order: list[str] = Field(default_factory=list)
+    robot: DiagnosticPlaybackRobot = Field(default_factory=DiagnosticPlaybackRobot)
+    scene: DiagnosticPlaybackScene = Field(default_factory=DiagnosticPlaybackScene)
     frames: list[DiagnosticPlaybackFrame] = Field(default_factory=list)
     source_rows: int = 0
     stride: int = 1
     selected_env_id: Optional[int] = None
     available_env_ids: List[int] = Field(default_factory=list)
+
+
+class TraditionalControlControllerInfo(BaseModel):
+    id: str
+    label: str
+    description: str = ""
+    provider_id: str = ""
+    provider_ids: list[str] = Field(default_factory=list)
+
+
+class TraditionalControlSceneInfo(BaseModel):
+    id: str
+    label: str
+    description: str = ""
+    terrain_type: str = ""
+    command: list[float] = Field(default_factory=list)
+    duration_s: float = 3.0
+    provider_id: str = ""
+    provider_ids: list[str] = Field(default_factory=list)
+    controller_ids: list[str] = Field(default_factory=list)
+
+
+class TraditionalControlProductInfo(BaseModel):
+    id: str
+    label: str
+    robot: DiagnosticPlaybackRobot = Field(default_factory=DiagnosticPlaybackRobot)
+    controllers: list[TraditionalControlControllerInfo] = Field(default_factory=list)
+    scenes: list[TraditionalControlSceneInfo] = Field(default_factory=list)
+    data_sources: list[TraditionalControlDataSourceInfo] = Field(default_factory=list)
+
+
+class TraditionalControlDataSourceInfo(BaseModel):
+    id: str
+    label: str
+    # Provider-defined capability.  The service reserves ``replay`` for its
+    # local artifact loader; other kinds are delegated to the provider.
+    kind: str = Field(min_length=1, max_length=80)
+    available: bool = True
+    description: str = ""
+    replay_id: Optional[str] = None
+    provider_id: str = ""
+
+
+class TraditionalControlCatalog(BaseModel):
+    available: bool = True
+    message: str = ""
+    products: list[TraditionalControlProductInfo] = Field(default_factory=list)
+    data_sources: list[TraditionalControlDataSourceInfo] = Field(default_factory=list)
+    recent_runs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TraditionalControlRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: str = Field(min_length=1, max_length=120)
+    controller_id: str = Field(min_length=1, max_length=120)
+    scene_id: str = Field(min_length=1, max_length=120)
+    duration_s: float = Field(gt=0.0, le=600.0)
+    data_source_id: str = Field(min_length=1, max_length=120)
+    replay_id: Optional[str] = Field(default=None, max_length=240)
+
+
+class TraditionalControlJobStatus(BaseModel):
+    state: Literal["idle", "starting", "running", "complete", "error", "cancelled"]
+    run_id: Optional[str] = None
+    product_id: Optional[str] = None
+    controller_id: Optional[str] = None
+    scene_id: Optional[str] = None
+    data_source_id: Optional[str] = None
+    output_dir: Optional[str] = None
+    manifest_path: Optional[str] = None
+    result_path: Optional[str] = None
+    playback_available: bool = False
+    progress: float = 0.0
+    elapsed_s: float = 0.0
+    message: str = ""
+    error: str = ""
+
+
+class TraditionalControlHistory(BaseModel):
+    items: list[TraditionalControlJobStatus] = Field(default_factory=list)
+
+
+class TraditionalControlMetricInfo(BaseModel):
+    id: str
+    label: str
+    value: Any = None
+    unit: str = ""
+    precision: int = 3
+
+
+class TraditionalControlResult(BaseModel):
+    available: bool = True
+    verdict: Literal["passed", "failed", "unknown"] = "unknown"
+    summary: str = ""
+    metrics: list[TraditionalControlMetricInfo] = Field(default_factory=list)
+    failure_reasons: list[str] = Field(default_factory=list)
+    raw: dict[str, Any] = Field(default_factory=dict)
 
 
 # ── 目标记分牌（Objective Scoreboard）────────────────────────────────────────

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -152,6 +153,8 @@ def run_mujoco_episode(
     config_path: str | Path | None = None,
     trace_path: str | Path | None = None,
     trace_dynamics: bool = False,
+    progress: Callable[[float], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> EpisodeResult:
     bundle = build_taili_controller(scenario, config_path)
     if duration_s is None:
@@ -191,7 +194,11 @@ def run_mujoco_episode(
     trace_rows: list[dict[str, object]] = []
     runtime_failure: dict[str, object] | None = None
     completed_steps = 0
-    for _ in range(policy_steps):
+    cancelled_early = False
+    for policy_index in range(policy_steps):
+        if cancelled is not None and cancelled():
+            cancelled_early = True
+            break
         state = backend.read_state()
         try:
             output = controller.step(state, command)
@@ -230,6 +237,8 @@ def run_mujoco_episode(
         for _ in range(physics_steps):
             backend.step_physics()
         completed_steps += 1
+        if progress is not None:
+            progress((policy_index + 1) / policy_steps)
 
     final_state = backend.read_state()
     if not heights:
@@ -310,6 +319,8 @@ def run_mujoco_episode(
         )
     if trace_path is not None:
         write_trace_rows(trace_path, trace_rows)
+    if cancelled_early:
+        raise InterruptedError("traditional-control episode cancelled")
     return EpisodeResult(
         scenario=scenario,
         steps=completed_steps,

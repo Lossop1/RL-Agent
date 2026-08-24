@@ -260,6 +260,11 @@ simulation:
       command: [rl_sim_mujoco, taili, "{scene}"]
       physics_timestep_s: 0.0025
       policy_period_s: 0.02
+      traditional_control:
+        config: config/traditional_control/taili_nominal.yaml
+        playback:
+          robot:
+            urdf_url: /robot/taili_dog_description/urdf/robot.urdf
   sim2sim:
     required: true
     adapter: rl_sar_taili
@@ -413,6 +418,8 @@ knowledge:
 
 # 控制台与研究层只依赖这些角色；入口的实现属于 Taili 产品插件。
 plugins:
+  traditional_control_demo:
+    provider: products.taili.traditional_control.demo_provider:build_provider
   materializer:
     task_bundle: products.taili.payload.task_materializer:materialize_task_bundle
   playbook:

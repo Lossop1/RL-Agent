@@ -30,6 +30,7 @@ from .schemas import (
     DiagnosticPlayback,
     DiagnosticPlaybackFoot,
     DiagnosticPlaybackFrame,
+    DiagnosticPlaybackRobot,
     DiagnosticPlan,
     DiagnosticPreset,
     DiagnosticReport,
@@ -747,6 +748,29 @@ class DiagnosticsController:
             return tuple(str(item) for item in values["leg_order"])
         return ()
 
+    def _playback_robot(self) -> DiagnosticPlaybackRobot:
+        runtime = getattr(self, "runtime", None)
+        robot = runtime.robot if runtime is not None else {}
+        urdf_url = ""
+        assets = getattr(getattr(runtime, "contract", None), "assets", ())
+        for asset in assets:
+            if str(getattr(asset, "kind", "")) != "urdf":
+                continue
+            path = str(getattr(asset, "declared_path", "") or "").replace("\\", "/")
+            marker = "locomotion-console-ui/public/"
+            urdf_url = "/" + path.split(marker, 1)[1] if marker in path else ""
+            break
+        joint_order = self._joint_order() or tuple(str(item) for item in robot.get("joint_order", ()) if item)
+        leg_order = self._leg_order() or tuple(str(item) for item in robot.get("leg_order", ()) if item)
+        return DiagnosticPlaybackRobot(
+            id=str(robot.get("id") or ""),
+            label=str(robot.get("label") or ""),
+            urdf_url=urdf_url,
+            base_link=str(robot.get("base_link") or ""),
+            joint_order=list(joint_order),
+            leg_order=list(leg_order),
+        )
+
     def _phase_environment_name(self) -> str:
         runtime = getattr(self, "runtime", None)
         deployment = runtime.deployment if runtime is not None else {}
@@ -1093,6 +1117,7 @@ class DiagnosticsController:
                 message="No diagnostic job has been started; no record.csv is available for playback.",
                 joint_order=list(self._joint_order()),
                 leg_order=list(self._leg_order()),
+                robot=self._playback_robot(),
             )
         if self.settings.source == "fake":
             return _fake_playback(
@@ -1100,6 +1125,7 @@ class DiagnosticsController:
                 max_frames=max_frames,
                 joint_order=self._joint_order(),
                 leg_order=self._leg_order(),
+                robot=self._playback_robot(),
             )
         try:
             remote = self.source._get_remote()
@@ -1112,6 +1138,7 @@ class DiagnosticsController:
                 output_dir=job.output_dir,
                 joint_order=list(self._joint_order()),
                 leg_order=list(self._leg_order()),
+                robot=self._playback_robot(),
             )
         return _playback_from_record_texts(
             job,
@@ -1120,6 +1147,7 @@ class DiagnosticsController:
             max_frames=max_frames,
             joint_order=self._joint_order(),
             leg_order=self._leg_order(),
+            robot=self._playback_robot(),
         )
 
     def _latest_checkpoint(self, remote: Any) -> str:
@@ -2215,6 +2243,7 @@ def _playback_from_record_texts(
     max_frames: int,
     joint_order: tuple[str, ...] | None = None,
     leg_order: tuple[str, ...] | None = None,
+    robot: DiagnosticPlaybackRobot | None = None,
 ) -> DiagnosticPlayback:
     joint_order = joint_order or tuple(_JOINT_ORDER)
     leg_order = leg_order or tuple(_LEG_ORDER)
@@ -2248,6 +2277,9 @@ def _playback_from_record_texts(
             source_rows=source_rows,
             selected_env_id=selected_env_id,
             available_env_ids=available_env_ids,
+            robot=robot or DiagnosticPlaybackRobot(
+                joint_order=list(joint_order), leg_order=list(leg_order)
+            ),
         )
     rows_only = [row for _, row in selected_rows]
     sampled_rows, stride = _downsample(rows_only, max_frames)
@@ -2286,6 +2318,9 @@ def _playback_from_record_texts(
         stride=stride,
         selected_env_id=selected_env_id,
         available_env_ids=available_env_ids,
+        robot=robot or DiagnosticPlaybackRobot(
+            joint_order=list(joint_order), leg_order=list(leg_order)
+        ),
     )
 
 
@@ -2294,6 +2329,7 @@ def _fake_playback(
     max_frames: int = 900,
     joint_order: tuple[str, ...] | None = None,
     leg_order: tuple[str, ...] | None = None,
+    robot: DiagnosticPlaybackRobot | None = None,
 ) -> DiagnosticPlayback:
     joint_order = joint_order or tuple(_JOINT_ORDER)
     leg_order = leg_order or tuple(_LEG_ORDER)
@@ -2367,6 +2403,9 @@ def _fake_playback(
         stride=1,
         selected_env_id=0,
         available_env_ids=[0],
+        robot=robot or DiagnosticPlaybackRobot(
+            joint_order=list(joint_order), leg_order=list(leg_order)
+        ),
     )
 
 

@@ -16,10 +16,11 @@ import Chat, { INITIAL_CHAT_MESSAGES, type ChatMessage } from "./Chat";
 import ConfigWorkspace from "./ConfigWorkspace";
 import Diagnostics from "./Diagnostics";
 import Scoreboard from "./Scoreboard";
+import TraditionalControlDemo from "./TraditionalControlDemo";
 import { formatError } from "./i18n/format";
 import LineChart from "./LineChart";
 
-type ToolView = "agent" | "scoreboard" | "diagnostics" | "config";
+type ToolView = "agent" | "scoreboard" | "diagnostics" | "traditional-control" | "config";
 type DirectAction = "deploy-payload" | "start" | "resume" | "kill";
 
 const WORKBENCH_POLL_MS = 5000;
@@ -141,6 +142,7 @@ export default function App() {
     agent: true,
     scoreboard: false,
     diagnostics: false,
+    "traditional-control": false,
     config: false,
   });
   const [workbench, setWorkbench] = useState<AgentWorkbenchInfo | null>(null);
@@ -317,6 +319,7 @@ export default function App() {
           <button className={view === "agent" ? "active" : ""} onClick={() => openView("agent")}>智能体</button>
           <button className={view === "scoreboard" ? "active" : ""} onClick={() => openView("scoreboard")}>目标记分牌</button>
           <button className={view === "diagnostics" ? "active" : ""} onClick={() => openView("diagnostics")}>诊断工具</button>
+          <button className={view === "traditional-control" ? "active" : ""} onClick={() => openView("traditional-control")}>传统控制</button>
           <button className={view === "config" ? "active" : ""} onClick={() => openView("config")}>配置工具</button>
         </nav>
         <button className="secondary-button" disabled={busy === "refresh"} onClick={() => void refreshWorkbench()}>
@@ -357,6 +360,11 @@ export default function App() {
             <DiagnosticsErrorBoundary>
               <Diagnostics active={view === "diagnostics"} />
             </DiagnosticsErrorBoundary>
+          </main>
+        )}
+        {visitedViews["traditional-control"] && (
+          <main className="tool-host workspace-pane" hidden={view !== "traditional-control"}>
+            <TraditionalControlDemo active={view === "traditional-control"} />
           </main>
         )}
         {visitedViews.config && (

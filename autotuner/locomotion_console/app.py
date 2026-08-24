@@ -50,6 +50,7 @@ from .datasource import make_source
 from .context_manager import build_context_envelope, should_probe_remote_for_context
 from .definitions import list_definitions
 from .diagnostics import DiagnosticsController
+from .traditional_control_demo import TraditionalControlDemoService
 from .framework_catalog import FrameworkCatalogInfo, build_framework_catalog
 from .framework_profile import list_framework_profiles
 from .llm_session import LLMSessionStore
@@ -109,6 +110,11 @@ from .schemas import (
     TensorboardScalarCatalog,
     TensorboardSeriesResponse,
     TrainingTelemetry,
+    TraditionalControlCatalog,
+    TraditionalControlHistory,
+    TraditionalControlJobStatus,
+    TraditionalControlRunRequest,
+    TraditionalControlResult,
 )
 
 settings = get_settings()
@@ -214,6 +220,7 @@ app.add_middleware(
 
 source = make_source(settings)
 diagnostics = DiagnosticsController(settings, source)
+traditional_control_demo = TraditionalControlDemoService(settings)
 llm_session = LLMSessionStore(settings)
 
 
@@ -1691,6 +1698,64 @@ async def diagnostics_report(job_id: str | None = None) -> DiagnosticReport:
 @app.get("/diagnostics/playback", response_model=DiagnosticPlayback)
 async def diagnostics_playback(max_frames: int = 900, job_id: str | None = None) -> DiagnosticPlayback:
     return await diagnostics.playback_for_job(max_frames=max_frames, job_id=job_id)
+
+
+@app.get("/traditional-control/catalog", response_model=TraditionalControlCatalog)
+async def traditional_control_catalog() -> TraditionalControlCatalog:
+    return await traditional_control_demo.catalog()
+
+
+@app.post("/traditional-control/run", response_model=TraditionalControlJobStatus)
+async def traditional_control_run(req: TraditionalControlRunRequest) -> TraditionalControlJobStatus:
+    try:
+        return await traditional_control_demo.start(req)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/traditional-control/status", response_model=TraditionalControlJobStatus)
+async def traditional_control_status(run_id: str | None = None) -> TraditionalControlJobStatus:
+    try:
+        return await traditional_control_demo.status(run_id=run_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/traditional-control/history", response_model=TraditionalControlHistory)
+async def traditional_control_history(limit: int = 30) -> TraditionalControlHistory:
+    return await traditional_control_demo.history(limit=limit)
+
+
+@app.post("/traditional-control/cancel", response_model=TraditionalControlJobStatus)
+async def traditional_control_cancel() -> TraditionalControlJobStatus:
+    return await traditional_control_demo.cancel()
+
+
+@app.get("/traditional-control/playback", response_model=DiagnosticPlayback)
+async def traditional_control_playback(
+    max_frames: int = 900,
+    run_id: str | None = None,
+) -> DiagnosticPlayback:
+    try:
+        return await traditional_control_demo.playback(max_frames=max_frames, run_id=run_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/traditional-control/result", response_model=TraditionalControlResult)
+async def traditional_control_result(run_id: str | None = None) -> TraditionalControlResult:
+    try:
+        return await traditional_control_demo.result(run_id=run_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/traditional-control/manifest")
+async def traditional_control_manifest(run_id: str | None = None) -> dict:
+    try:
+        return await traditional_control_demo.manifest(run_id=run_id)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 def _publish_chat_progress(

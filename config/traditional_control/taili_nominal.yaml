@@ -1,5 +1,21 @@
 schema_version: taili_traditional_control_v1
 
+demo:
+  provider_id: taili_mujoco
+  controller:
+    id: taili_mpc_wbc
+    label: Taili MPC + WBC
+    description: Configuration-driven centroidal MPC, gait, and whole-body control.
+  data_sources:
+    - id: local_headless
+      kind: headless
+      label: 本机无头运行
+      description: Execute MuJoCo without a viewer and record a browser playback trace.
+    - id: local_replay
+      kind: replay
+      label: 已有本地回放
+      description: Load a previously recorded manifest and control trace.
+
 robot:
   urdf: locomotion-console-ui/public/robot/taili_dog_description/urdf/robot.urdf
   nominal_base_height: 0.5471961541
@@ -126,29 +142,45 @@ simulation:
 
 scenarios:
   flat:
+    label: 原地站立
+    description: 在平地保持站立并观察姿态、接触和漂移。
     terrain: {type: flat, height: 0.0}
     command: [0.0, 0.0, 0.0]
   flat_forward:
+    label: 平地前进
+    description: 在平地跟踪正向速度命令。
     terrain: {type: flat, height: 0.0}
     command: [0.40, 0.0, 0.0]
   flat_backward:
+    label: 平地后退
+    description: 在平地跟踪反向速度命令。
     terrain: {type: flat, height: 0.0}
     command: [-0.30, 0.0, 0.0]
   flat_left:
+    label: 平地左移
+    description: 在平地跟踪左向横移命令。
     terrain: {type: flat, height: 0.0}
     gait: {max_swing_legs: 1}
     command: [0.0, 0.12, 0.0]
   flat_right:
+    label: 平地右移
+    description: 在平地跟踪右向横移命令。
     terrain: {type: flat, height: 0.0}
     gait: {max_swing_legs: 1, lateral_start_phase: 0.50}
     command: [0.0, -0.12, 0.0]
   flat_yaw_left:
+    label: 原地左转
+    description: 在平地跟踪正向偏航角速度命令。
     terrain: {type: flat, height: 0.0}
     command: [0.0, 0.0, 0.45]
   flat_yaw_right:
+    label: 原地右转
+    description: 在平地跟踪反向偏航角速度命令。
     terrain: {type: flat, height: 0.0}
     command: [0.0, 0.0, -0.45]
   stairs_up:
+    label: 上楼梯
+    description: 沿参数化楼梯向上运动。
     terrain: {type: stairs, rise: 0.15, run: 0.30, start_x: 0.20, width: 1.2, max_steps: 8}
     # 两只前脚处在新台阶、后脚仍在旧台阶时，不得提前抬高机身。
     contact: {minimum_support_contacts: 3}
@@ -158,6 +190,8 @@ scenarios:
     gait: {period: 1.10, period_min: 1.10, duty_factor: 0.68}
     command: [0.18, 0.0, 0.0]
   stairs_down:
+    label: 下楼梯
+    description: 从上平台沿参数化楼梯向下运动。
     terrain: {type: stairs, rise: 0.15, run: 0.30, start_x: -0.20, width: 1.2, max_steps: 8}
     contact: {minimum_support_contacts: 3}
     gait: {period: 1.10, period_min: 1.10, duty_factor: 0.68}
