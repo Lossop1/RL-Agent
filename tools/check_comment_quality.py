@@ -270,7 +270,11 @@ def main():
     for issue in all_issues:
         if issue.file != current_file:
             current_file = issue.file
-            print(f"\n{issue.file.relative_to(Path.cwd())}:")
+            try:
+                display_path = issue.file.relative_to(Path.cwd())
+            except ValueError:
+                display_path = issue.file
+            print(f"\n{display_path}:")
 
         prefix = "  ERROR" if issue.severity == "error" else "  WARNING"
         print(f"{prefix} 第 {issue.line} 行: {issue.reason}")

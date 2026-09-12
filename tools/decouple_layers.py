@@ -117,7 +117,7 @@ def apply_fix(fix: dict, dry_run: bool) -> bool:
     file_path = Path(fix["file"])
 
     if not file_path.exists():
-        print(f"⚠️  跳过：文件不存在 {file_path}")
+        print(f"WARNING 跳过：文件不存在 {file_path}")
         return False
 
     content = file_path.read_text(encoding="utf-8")
@@ -131,13 +131,13 @@ def apply_fix(fix: dict, dry_run: bool) -> bool:
             comment = " " * indent + fix["add_comment"] + "\n"
 
             if dry_run:
-                print(f"📝 {file_path}:{line_num + 1}")
+                print(f"MODIFY {file_path}:{line_num + 1}")
                 print(f"   添加注释: {fix['add_comment']}")
                 print(f"   原因: {fix['reason']}")
             else:
                 lines.insert(line_num, comment)
                 file_path.write_text("".join(lines), encoding="utf-8")
-                print(f"✅ {file_path}:{line_num + 1} - 已添加注释")
+                print(f"OK {file_path}:{line_num + 1} - 已添加注释")
 
             return True
 
@@ -156,15 +156,15 @@ def apply_fix(fix: dict, dry_run: bool) -> bool:
 
         if new_content != content:
             if dry_run:
-                print(f"📝 {file_path}")
+                print(f"MODIFY {file_path}")
                 print(f"   替换: {pattern[:60]}...")
                 print(f"   原因: {fix['reason']}")
             else:
                 file_path.write_text(new_content, encoding="utf-8")
-                print(f"✅ {file_path} - 已替换")
+                print(f"OK {file_path} - 已替换")
             return True
         else:
-            print(f"⚠️  {file_path} - 未找到匹配内容")
+            print(f"WARNING {file_path} - 未找到匹配内容")
             return False
 
     return False
@@ -177,14 +177,15 @@ def verify_fixes() -> bool:
     result = subprocess.run(
         ["python", "tools/check_repository_structure.py"],
         capture_output=True,
-        text=True
+        text=True,
+        encoding="utf-8"
     )
 
     if result.returncode == 0:
-        print("✅ 结构检查通过")
+        print("OK 结构检查通过")
         return True
     else:
-        print("❌ 结构检查失败:")
+        print("ERROR 结构检查失败:")
         print(result.stdout)
         print(result.stderr)
         return False

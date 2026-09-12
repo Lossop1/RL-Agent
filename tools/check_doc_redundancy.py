@@ -224,9 +224,17 @@ def main():
 
     for issue in issues:
         prefix = "ERROR" if issue.severity == "error" else "WARNING"
-        print(f"{prefix}: {issue.file1.relative_to(Path.cwd())}")
+        try:
+            file1_path = issue.file1.relative_to(Path.cwd())
+        except ValueError:
+            file1_path = issue.file1
+        print(f"{prefix}: {file1_path}")
         if issue.file2:
-            print(f"       vs {issue.file2.relative_to(Path.cwd())}")
+            try:
+                file2_path = issue.file2.relative_to(Path.cwd())
+            except ValueError:
+                file2_path = issue.file2
+            print(f"       vs {file2_path}")
         print(f"       {issue.reason}\n")
 
     # 自动修复（移动到 archive）
