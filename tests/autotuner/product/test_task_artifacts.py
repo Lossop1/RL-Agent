@@ -13,6 +13,7 @@ from autotuner.product import (
     TaskContractError,
     TaskContractStore,
     TaskExecutionPipeline,
+    TrainingLaunchError,
     TrainingLaunchRequest,
     resolve_product_contract,
 )
@@ -177,6 +178,27 @@ def test_task_pipeline_binds_payload_runtime_and_ledger_provenance(monkeypatch, 
         "contract_bundle",
         "effective_run_snapshot",
     }
+
+
+def test_task_pipeline_rejects_invalid_launch_before_persisting(tmp_path: Path) -> None:
+    product = resolve_product_contract("taili")
+    bundle = TaskContractCompiler().compile_bundle(product, _request(approved=True))
+    root = tmp_path / "preflight"
+
+    with pytest.raises(TrainingLaunchError):
+        TaskExecutionPipeline(root).prepare(
+            product,
+            bundle,
+            run_id="preflight-run",
+            launch_request=TrainingLaunchRequest(
+                payload_root="relative/payload",
+                run_id="preflight-run",
+            ),
+        )
+
+    assert not (root / "task_contracts").exists()
+    assert not (root / "task_artifacts").exists()
+    assert not (root / "payloads").exists()
 
 
 def test_evidence_revision_creates_parent_and_supersedes_edges(tmp_path: Path) -> None:

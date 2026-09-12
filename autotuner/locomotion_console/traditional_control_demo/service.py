@@ -35,6 +35,23 @@ _PLAYBACK_NAME = "playback.json"
 _MANIFEST_SCHEMA = "traditional_control_demo_manifest_v1"
 
 
+def _optional_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def _optional_int(value: Any) -> int | None:
+    parsed = _optional_float(value)
+    if parsed is None or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
 @dataclass
 class _DemoJob:
     run_id: str
@@ -214,6 +231,19 @@ class TraditionalControlDemoService:
         if playback_path.is_file():
             raw = json.loads(playback_path.read_text(encoding="utf-8"))
             playback = DiagnosticPlayback.model_validate(raw)
+            # Older artifacts predate the command-vector field. Let the
+            # provider reconstruct the trace when possible so historical
+            # records still show the requested direction in the viewer.
+            if not playback.command:
+                try:
+                    provider = self.registry.provider(job.provider_id)
+                    reconstructed = await asyncio.to_thread(
+                        provider.load_playback, job.output_dir, max_frames
+                    )
+                    if reconstructed.available and reconstructed.command:
+                        playback = reconstructed
+                except Exception:
+                    pass
         elif job.playback is not None:
             playback = job.playback
         else:
@@ -483,6 +513,7 @@ class TraditionalControlDemoService:
 
     def _status(self, job: _DemoJob) -> TraditionalControlJobStatus:
         elapsed = max(0.0, (job.finished_at or time.time()) - job.started_at)
+        result_summary = self._result_status_fields(job.result_path)
         return TraditionalControlJobStatus(
             state=job.state,  # type: ignore[arg-type]
             run_id=job.run_id,
@@ -501,7 +532,43 @@ class TraditionalControlDemoService:
             elapsed_s=elapsed,
             message=job.message,
             error=job.error,
+            created_at=job.started_at,
+            finished_at=job.finished_at,
+            requested_duration_s=job.request.duration_s,
+            **result_summary,
         )
+
+    @staticmethod
+    def _result_status_fields(result_path: Path | None) -> dict[str, Any]:
+        if result_path is None or not result_path.is_file():
+            return {}
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, Mapping):
+            return {}
+        raw = payload.get("raw") if isinstance(payload.get("raw"), Mapping) else {}
+        failure_reasons = payload.get("failure_reasons")
+        if not isinstance(failure_reasons, list):
+            failure_reasons = []
+        runtime_failure = raw.get("runtime_failure") if isinstance(raw.get("runtime_failure"), Mapping) else {}
+        failure_code = str(runtime_failure.get("code") or "")
+        failure_message = str(runtime_failure.get("message") or "")
+        termination_reason = ": ".join(part for part in (failure_code, failure_message) if part)
+        if not termination_reason and failure_reasons:
+            termination_reason = ", ".join(str(item) for item in failure_reasons)
+        verdict = str(payload.get("verdict") or "unknown")
+        if verdict not in {"passed", "failed", "unknown"}:
+            verdict = "unknown"
+        return {
+            "simulated_duration_s": _optional_float(raw.get("elapsed_s")),
+            "completed_steps": _optional_int(raw.get("steps")),
+            "requested_steps": _optional_int(raw.get("requested_steps")),
+            "verdict": verdict,
+            "failure_reasons": [str(item) for item in failure_reasons],
+            "termination_reason": termination_reason,
+        }
 
     @staticmethod
     def _artifact_record(path: Path, *, include_digest: bool = True) -> dict[str, Any]:

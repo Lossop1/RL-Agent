@@ -360,6 +360,43 @@ class ChatResponse(BaseModel):
     context_envelope: Optional[ContextEnvelopeInfo] = None
 
 
+class TaskIntakeRequest(BaseModel):
+    """User intent submitted for deterministic contract preparation only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_text: str = Field(min_length=1, max_length=12000)
+    product_id: str = Field(default="", max_length=120)
+    run_id: str = Field(default="", max_length=128)
+    approved: bool = False
+    approved_by: str = Field(default="", max_length=200)
+    launch: Optional[dict[str, Any]] = None
+
+
+class TaskIntakeResponse(BaseModel):
+    """Traceable preparation result; no field represents a started process."""
+
+    ok: bool
+    ready: bool
+    product_id: str = ""
+    run_id: str = ""
+    confidence: float = 0.0
+    model: str = ""
+    clarifications: List[str] = Field(default_factory=list)
+    error: str = ""
+    contract_ref: str = ""
+    contract_status: str = ""
+    contract_digest: str = ""
+    bundle_digest: str = ""
+    output_root: str = ""
+    materialization_manifest: str = ""
+    artifacts: List[dict[str, Any]] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    run_manifest: str = ""
+    launch_plan: Optional[dict[str, Any]] = None
+    ledger_event_ids: List[str] = Field(default_factory=list)
+
+
 class ChatProposalInfo(BaseModel):
     id: str
     created_at: str
@@ -931,6 +968,9 @@ class DiagnosticPlayback(BaseModel):
     available: bool
     message: str = ""
     source: Literal["fake", "real", "local"]
+    # Command vector is optional for older diagnostic recordings but is
+    # populated by traditional-control providers so viewers can show intent.
+    command: list[float] = Field(default_factory=list)
     output_dir: Optional[str] = None
     manifest_path: Optional[str] = None
     result_path: Optional[str] = None
@@ -1021,6 +1061,15 @@ class TraditionalControlJobStatus(BaseModel):
     elapsed_s: float = 0.0
     message: str = ""
     error: str = ""
+    created_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    requested_duration_s: Optional[float] = None
+    simulated_duration_s: Optional[float] = None
+    completed_steps: Optional[int] = None
+    requested_steps: Optional[int] = None
+    verdict: Literal["passed", "failed", "unknown"] = "unknown"
+    failure_reasons: list[str] = Field(default_factory=list)
+    termination_reason: str = ""
 
 
 class TraditionalControlHistory(BaseModel):

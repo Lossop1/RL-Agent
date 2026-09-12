@@ -1005,6 +1005,7 @@ export interface DiagnosticPlayback {
   available: boolean;
   message: string;
   source: "fake" | "real" | "local";
+  command: number[];
   output_dir?: string | null;
   manifest_path?: string | null;
   result_path?: string | null;
@@ -1075,6 +1076,19 @@ export interface TraditionalControlJobStatus {
   elapsed_s: number;
   message: string;
   error: string;
+  created_at?: number | null;
+  finished_at?: number | null;
+  requested_duration_s?: number | null;
+  simulated_duration_s?: number | null;
+  completed_steps?: number | null;
+  requested_steps?: number | null;
+  verdict: "passed" | "failed" | "unknown";
+  failure_reasons: string[];
+  termination_reason: string;
+}
+
+export interface TraditionalControlHistory {
+  items: TraditionalControlJobStatus[];
 }
 
 export interface TraditionalControlCatalog {
@@ -1304,7 +1318,23 @@ export interface ChatResponse {
 }
 
 export function getTraditionalControlCatalog(): Promise<TraditionalControlCatalog> {
-  return jsonRequest("/traditional-control/catalog");
+  return jsonRequest<unknown>("/traditional-control/catalog").then((data) => {
+    if (!isRecord(data) || !Array.isArray(data.products)) {
+      throw new Error("传统控制目录接口返回结构无效，请检查开发服务器代理 /traditional-control -> 8000。");
+    }
+    const products = asArray<Record<string, unknown>>(data.products).filter(isRecord).map((product) => ({
+      ...product,
+      controllers: asArray<TraditionalControlControllerInfo>(product.controllers),
+      scenes: asArray<TraditionalControlSceneInfo>(product.scenes),
+      data_sources: asArray<TraditionalControlDataSourceInfo>(product.data_sources),
+    })) as TraditionalControlProductInfo[];
+    return {
+      ...data,
+      products,
+      data_sources: asArray<TraditionalControlDataSourceInfo>(data.data_sources),
+      recent_runs: asArray<TraditionalControlJobStatus>(data.recent_runs),
+    } as TraditionalControlCatalog;
+  });
 }
 
 export function startTraditionalControlRun(request: TraditionalControlRunRequest): Promise<TraditionalControlJobStatus> {
@@ -1322,6 +1352,15 @@ export function cancelTraditionalControlRun(): Promise<TraditionalControlJobStat
 export function getTraditionalControlStatus(runId?: string | null): Promise<TraditionalControlJobStatus> {
   const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
   return jsonRequest(`/traditional-control/status${suffix}`);
+}
+
+export function getTraditionalControlHistory(limit = 30): Promise<TraditionalControlHistory> {
+  return jsonRequest<unknown>(`/traditional-control/history?limit=${encodeURIComponent(String(limit))}`).then((data) => {
+    if (!isRecord(data)) {
+      throw new Error("传统控制历史接口返回结构无效。");
+    }
+    return { items: asArray<TraditionalControlJobStatus>(data.items) };
+  });
 }
 
 export function getTraditionalControlPlayback(
@@ -1620,11 +1659,34 @@ export function getLLMReadiness(): Promise<LLMReadinessInfo> {
 
 export function getAgentWorkbench(): Promise<AgentWorkbenchInfo> {
   return jsonRequest<AgentWorkbenchInfo>("/agent/workbench").then((data) => {
-    if (!data || typeof data !== "object" || !data.attempt || !data.judgement || !Array.isArray(data.evidence)) {
+    if (!data || typeof data !== "object" || !isRecord(data.attempt) || !isRecord(data.judgement) || !Array.isArray(data.evidence)) {
       throw new Error("工作台接口返回结构无效，请检查开发服务器代理 /agent -> 8000。");
     }
-    return data;
+    // The backend contract normally supplies every collection. Keep the UI alive
+    // when a stale/partial response omits an optional collection during startup.
+    const judgement = data.judgement as AgentWorkbenchJudgementInfo;
+    return {
+      ...data,
+      service_loop: asArray<string>(data.service_loop),
+      evidence: asArray<AgentWorkbenchEvidenceInfo>(data.evidence),
+      proposals: asArray<ChatProposalInfo>(data.proposals),
+      actions: asArray<AgentWorkbenchActionInfo>(data.actions),
+      notes: asArray<string>(data.notes),
+      judgement: {
+        ...judgement,
+        evidence_ids: asArray<string>(judgement.evidence_ids),
+        gaps: asArray<string>(judgement.gaps),
+      },
+    };
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
 }
 
 export function runLLMSystemAudit(includeLlm = true): Promise<LLMWorkflowResult> {

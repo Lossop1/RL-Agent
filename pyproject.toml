@@ -2,7 +2,7 @@
 # Tests live under tests/ and mirror the package layout (tests/autotuner/...).
 # pythonpath="." lets them import the `autotuner` package without an install step.
 minversion = "7.0"
-addopts = "-q --strict-markers"
+addopts = "-q --strict-markers --basetemp=.pytest-tmp"
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [

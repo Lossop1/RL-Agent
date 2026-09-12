@@ -97,6 +97,7 @@ class _Provider:
             verdict="passed",
             summary="fake run",
             metrics=[TraditionalControlMetricInfo(id="steps", label="Steps", value=1)],
+            raw={"steps": 1, "requested_steps": 5, "elapsed_s": 0.02},
         )
         return ProviderRunResult(result=result, playback=self._playback(output_dir), raw_artifacts={"trace": trace})
 
@@ -191,6 +192,7 @@ def test_taili_replay_conversion_does_not_build_simulator_controller(tmp_path: P
     playback = provider.load_playback(run_dir)
     assert playback.available is True
     assert playback.robot.id == "robot.taili"
+    assert playback.command == [0.0, 0.0, 0.0]
     assert playback.scene.terrain_primitives
 
 
@@ -217,12 +219,19 @@ def test_service_writes_manifest_and_can_reload_as_replay(tmp_path: Path) -> Non
         return status.run_id or "", Path(status.output_dir or ""), playback
 
     run_id, output_dir, playback = asyncio.run(scenario())
+    status = asyncio.run(service.status(run_id=run_id))
+    assert status.requested_duration_s == pytest.approx(0.1)
+    assert status.simulated_duration_s == pytest.approx(0.02)
+    assert status.completed_steps == 1
+    assert status.requested_steps == 5
+    assert status.verdict == "passed"
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema_version"] == "traditional_control_demo_manifest_v1"
     assert manifest["provider_id"] == "fake_provider"
     assert manifest["artifacts"]["trace"]["available"] is True
     assert len(manifest["artifacts"]["trace"]["sha256"]) == 64
     assert playback.available and playback.robot.urdf_url == "/robot/fake.urdf"
+    assert playback.command == []
 
     limited = asyncio.run(service.playback(max_frames=3, run_id=run_id))
     expanded = asyncio.run(service.playback(max_frames=8, run_id=run_id))
@@ -254,6 +263,54 @@ def test_replay_path_cannot_escape_output_root(tmp_path: Path) -> None:
     )
     with pytest.raises(Exception, match="inside|output root"):
         asyncio.run(service.start(request))
+
+
+def test_history_exposes_early_termination_reason(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    run_dir = service.output_root / "20260825_000000_failed"
+    run_dir.mkdir()
+    request = TraditionalControlRunRequest(
+        product_id="fake_product",
+        controller_id="fake_controller",
+        scene_id="flat",
+        duration_s=3.0,
+        data_source_id="local_headless",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps({
+            "state": "complete",
+            "provider_id": "fake_provider",
+            "request": request.model_dump(mode="json"),
+            "progress": 1.0,
+        }),
+        encoding="utf-8",
+    )
+    (run_dir / "playback.json").write_text(
+        json.dumps(_Provider()._playback(run_dir).model_dump(mode="json")),
+        encoding="utf-8",
+    )
+    (run_dir / "result.json").write_text(
+        json.dumps({
+            "verdict": "failed",
+            "failure_reasons": ["controller_failure:qp_unsolved"],
+            "raw": {
+                "steps": 88,
+                "requested_steps": 150,
+                "elapsed_s": 1.76,
+                "runtime_failure": {
+                    "code": "qp_unsolved",
+                    "message": "floating-base WBC QP failed",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    status = asyncio.run(service.status(run_id=run_dir.name))
+    assert status.simulated_duration_s == pytest.approx(1.76)
+    assert status.completed_steps == 88
+    assert status.requested_steps == 150
+    assert status.termination_reason == "qp_unsolved: floating-base WBC QP failed"
 
 
 def test_catalog_merges_compatible_providers_without_product_duplicates(tmp_path: Path) -> None:

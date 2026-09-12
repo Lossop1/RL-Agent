@@ -2165,6 +2165,60 @@ dd {
   font-family: var(--font-mono);
 }
 
+.robot-foot-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+}
+
+.robot-foot-legend-title {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.robot-foot-status {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 5px 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.robot-foot-status strong {
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.robot-foot-status em {
+  color: var(--text);
+  font-style: normal;
+}
+
+.robot-foot-status small {
+  color: var(--faint);
+  font-family: var(--font-mono);
+}
+
+.robot-foot-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .16);
+}
+
+.robot-trajectory-swatch {
+  background: #66c7cc;
+}
+
 .history-list {
   display: grid;
   gap: 8px;
@@ -2240,7 +2294,7 @@ dd {
 
 .traditional-control-status code {
   grid-column: 1 / -1;
-  color: var(--danger);
+  color: var(--red);
   white-space: pre-wrap;
 }
 
@@ -2256,6 +2310,10 @@ dd {
 
 .traditional-control-result strong {
   color: var(--text);
+}
+
+.traditional-control-result .traditional-control-terminated {
+  color: var(--red);
 }
 
 .traditional-control-result code {
@@ -2285,6 +2343,110 @@ dd {
   overflow-wrap: anywhere;
 }
 
+.traditional-control-history {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.traditional-control-history-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: end;
+}
+
+.traditional-control-history-heading h2 {
+  margin: .15rem 0 0;
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.traditional-control-history-heading > span,
+.traditional-control-history-empty {
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.traditional-control-history-list {
+  margin-top: .65rem;
+  border-top: 1px solid var(--line);
+}
+
+.traditional-control-history-list button {
+  display: grid;
+  grid-template-columns: 5rem minmax(14rem, 1fr) minmax(8rem, auto) 4rem;
+  gap: .8rem;
+  align-items: center;
+  width: 100%;
+  min-height: 3.5rem;
+  padding: .55rem .4rem;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.traditional-control-history-list button:not(:disabled):hover,
+.traditional-control-history-list button.active {
+  background: var(--panel-inset);
+}
+
+.traditional-control-history-list button.active {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.traditional-control-history-list button:disabled {
+  cursor: default;
+  opacity: .65;
+}
+
+.traditional-control-history-verdict {
+  font-weight: 700;
+  font-size: .78rem;
+}
+
+.traditional-control-history-verdict.passed {
+  color: var(--green);
+}
+
+.traditional-control-history-verdict.failed {
+  color: var(--red);
+}
+
+.traditional-control-history-main,
+.traditional-control-history-measure {
+  display: grid;
+  min-width: 0;
+  gap: .15rem;
+}
+
+.traditional-control-history-main strong,
+.traditional-control-history-main small,
+.traditional-control-history-measure,
+.traditional-control-history-action {
+  overflow-wrap: anywhere;
+}
+
+.traditional-control-history-main small,
+.traditional-control-history-measure small {
+  color: var(--muted);
+  font-size: .72rem;
+}
+
+.traditional-control-history-measure {
+  font-variant-numeric: tabular-nums;
+  font-size: .78rem;
+}
+
+.traditional-control-history-action {
+  color: var(--accent);
+  text-align: right;
+  font-size: .78rem;
+}
+
 @media (max-width: 1050px) {
   .traditional-control-form {
     grid-template-columns: repeat(3, minmax(8rem, 1fr));
@@ -2307,6 +2469,15 @@ dd {
   .traditional-control-status progress {
     grid-column: 1 / -1;
     grid-row: 2;
+  }
+
+  .traditional-control-history-list button {
+    grid-template-columns: 4.5rem minmax(0, 1fr) 3.5rem;
+    gap: .55rem;
+  }
+
+  .traditional-control-history-measure {
+    grid-column: 2 / -1;
   }
 }
 

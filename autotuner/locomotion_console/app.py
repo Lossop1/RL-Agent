@@ -107,6 +107,8 @@ from .schemas import (
     Scoreboard,
     RunStatus,
     SpecCoverageReport,
+    TaskIntakeRequest,
+    TaskIntakeResponse,
     TensorboardScalarCatalog,
     TensorboardSeriesResponse,
     TrainingTelemetry,
@@ -1596,6 +1598,38 @@ async def _action_lock():
         yield
     finally:
         _ACTION_LOCK.release()
+
+
+def _task_intake_service():
+    from .task_intake_service import TaskIntakeService
+
+    return TaskIntakeService()
+
+
+@app.post("/tasks/intake", response_model=TaskIntakeResponse)
+async def tasks_intake(req: TaskIntakeRequest) -> TaskIntakeResponse:
+    """Translate user intent into a workspace-contained, non-executing handoff."""
+    from .task_intake_service import TaskIntakeError
+
+    try:
+        async with _action_lock():
+            prepared = await asyncio.to_thread(
+                _task_intake_service().prepare,
+                req.user_text,
+                product_id=req.product_id,
+                run_id=req.run_id or None,
+                approved=req.approved,
+                approved_by=req.approved_by,
+                launch=req.launch,
+            )
+    except TaskIntakeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - surface deterministic preparation failures
+        raise HTTPException(
+            status_code=409,
+            detail=f"task intake preparation failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    return TaskIntakeResponse.model_validate(prepared.response_dict())
 
 
 @app.post("/action/deploy-payload", response_model=ActionResult)

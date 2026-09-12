@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  structure-check:
+    name: 仓库结构检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 检查仓库结构
+        run: python tools/check_repository_structure.py
+
+      - name: 检查层级解耦
+        run: python tools/decouple_layers.py --check
+
+      - name: 检查文档冗余
+        run: python tools/check_doc_redundancy.py
+
+  comment-quality:
+    name: 中文注释质量
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: 检查中文注释覆盖率
+        run: python tools/check_comment_quality.py
+
+  backend-tests:
+    name: 后端测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: 运行 pytest
+        run: python -m pytest -v
+
+  frontend-verify:
+    name: 前端验证
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: locomotion-console-ui
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: locomotion-console-ui/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 运行验证（i18n + typecheck + build）
+        run: npm run verify
+
+  commit-message-check:
+    name: 提交信息检查
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: 检查提交信息格式
+        run: |
+          # 获取 PR 中的所有提交
+          git log --format=%B origin/${{ github.base_ref }}..HEAD | while IFS= read -r line; do
+            # 跳过空行和 merge 提交
+            if [[ -z "$line" ]] || [[ "$line" =~ ^(Merge|Revert) ]]; then
+              continue
+            fi
+
+            # 检查约定式提交格式
+            if ! echo "$line" | grep -qE "^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?: .+"; then
+              echo "错误: 提交信息格式不符合约定式提交规范"
+              echo "  $line"
+              exit 1
+            fi
+
+            # 检查是否包含中文
+            if ! echo "$line" | grep -qP '[\p{Han}]'; then
+              echo "错误: 提交信息必须包含中文描述"
+              echo "  $line"
+              exit 1
+            fi
+          done
+
+  atomic-problems-sync:
+    name: 原子问题同步检查
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 检查是否更新原子问题跟踪表
+        run: |
+          # 如果 PR 修改了核心文件，检查是否更新了 atomic_problems.md
+          changed_files=$(git diff --name-only origin/${{ github.base_ref }}..HEAD)
+
+          core_changed=false
+          if echo "$changed_files" | grep -qE "^(autotuner/(mechanisms|research|execution|artifacts)|products/taili/core)/"; then
+            core_changed=true
+          fi
+
+          atomic_changed=false
+          if echo "$changed_files" | grep -q "docs/atomic_problems.md"; then
+            atomic_changed=true
+          fi
+
+          if [[ "$core_changed" == "true" ]] && [[ "$atomic_changed" == "false" ]]; then
+            echo "警告: 核心模块有变更，但未更新 docs/atomic_problems.md"
+            echo "建议检查是否有相关原子问题需要标记为完成或更新状态"
+            # 仅警告，不阻止合并
+          fi

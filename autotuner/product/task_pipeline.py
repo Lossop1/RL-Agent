@@ -319,6 +319,21 @@ class TaskExecutionPipeline:
         """生成合同、artifact、payload 和运行交接；不启动远程进程。"""
         self._validate_bundle_product(bundle, product)
         run_id = _safe_id(run_id, "run_id")
+
+        # 在任何持久化动作前校验启动计划。这样 draft、错误路径或不兼容的
+        # launcher 请求不会先留下合同、artifact 和 payload 再失败。
+        launch_plan: TrainingLaunchPlan | None = None
+        if launch_request is not None:
+            bundle.contract.require_approved()
+            request = (
+                launch_request
+                if isinstance(launch_request, TrainingLaunchRequest)
+                else TrainingLaunchRequest.from_mapping(launch_request)
+            )
+            if request.run_id != run_id:
+                raise TaskPipelineError("launch_request.run_id must match run_id")
+            launch_plan = build_training_launch_plan(product, request)
+
         stored = self.contract_store.save(
             bundle,
             parent_ref=parent_ref,
@@ -350,18 +365,6 @@ class TaskExecutionPipeline:
             asset_bindings=asset_bindings,
         )
 
-        launch_plan: TrainingLaunchPlan | None = None
-        if launch_request is not None:
-            # 生成远程启动计划会改变外部状态，draft 合同只能物料化，不能进入启动路径。
-            bundle.contract.require_approved()
-            request = (
-                launch_request
-                if isinstance(launch_request, TrainingLaunchRequest)
-                else TrainingLaunchRequest.from_mapping(launch_request)
-            )
-            if request.run_id != run_id:
-                raise TaskPipelineError("launch_request.run_id must match run_id")
-            launch_plan = build_training_launch_plan(product, request)
         checkpoint_bindings: list[AssetBinding] = []
         for binding in asset_bindings:
             asset = self.asset_catalog.get_asset(binding.asset_ref)

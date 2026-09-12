@@ -124,3 +124,12 @@ modules = [
   "autotuner.locomotion_console.gate_calibration",
   "autotuner.locomotion_console.campaign_journal",
 ]
+
+# 层级定义：数字越大越上层，底层不能感知上层
+[layer_hierarchy]
+6 = ["autotuner.mechanisms", "products.taili.core"]  # 物理仿真与数学原语
+5 = []  # 观测与奖励契约（已包含在第 6 层）
+4 = ["autotuner.blind_locomotion"]  # 训练运行时与课程门控
+3 = ["autotuner.research"]  # 研究协调与证据裁决
+2 = ["autotuner.infrastructure", "autotuner.execution", "autotuner.adapter", "autotuner.product"]  # 任务编排与远程部署
+1 = ["autotuner.locomotion_console"]  # 用户界面与交互控制台

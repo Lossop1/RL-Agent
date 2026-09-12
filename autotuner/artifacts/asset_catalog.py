@@ -72,7 +72,10 @@ def _path_component(value: str) -> str:
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    # Keep the staging name short. Content-addressed asset paths can already be
+    # deep on Windows, where an unnecessarily long temporary name exceeds the
+    # legacy path limit even though the final target is valid.
+    temporary = path.with_name(f".{uuid.uuid4().hex[:12]}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as handle:
             handle.write(_canonical(value) + "\n")

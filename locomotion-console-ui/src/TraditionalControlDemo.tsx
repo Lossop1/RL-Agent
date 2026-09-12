@@ -3,6 +3,7 @@ import RobotViewer from "./RobotViewer";
 import {
   cancelTraditionalControlRun,
   getTraditionalControlCatalog,
+  getTraditionalControlHistory,
   getTraditionalControlPlayback,
   getTraditionalControlManifest,
   getTraditionalControlResult,
@@ -24,6 +25,7 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
   const [playback, setPlayback] = useState<DiagnosticPlayback | null>(null);
   const [result, setResult] = useState<TraditionalControlResult | null>(null);
   const [manifest, setManifest] = useState<Record<string, unknown> | null>(null);
+  const [historyRuns, setHistoryRuns] = useState<TraditionalControlJobStatus[]>([]);
   const [productId, setProductId] = useState("");
   const [controllerId, setControllerId] = useState("");
   const [sceneId, setSceneId] = useState("");
@@ -33,33 +35,36 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
+  const products = catalog?.products ?? [];
   const product = useMemo(
-    () => catalog?.products.find((item) => item.id === productId) ?? catalog?.products[0] ?? null,
-    [catalog, productId],
+    () => products.find((item) => item.id === productId) ?? products[0] ?? null,
+    [products, productId],
   );
+  const controllers = product?.controllers ?? [];
   const selectedController = useMemo(
-    () => product?.controllers.find((item) => item.id === controllerId) ?? product?.controllers[0] ?? null,
-    [product, controllerId],
+    () => controllers.find((item) => item.id === controllerId) ?? controllers[0] ?? null,
+    [controllers, controllerId],
   );
+  const productScenes = product?.scenes ?? [];
   const scenes = useMemo(() => {
     if (!product || !selectedController) return [];
-    return product.scenes.filter((item) =>
+    return productScenes.filter((item) =>
       (!item.controller_ids.length || item.controller_ids.includes(selectedController.id))
       && (!item.provider_ids.length || item.provider_ids.some((id) => selectedController.provider_ids.includes(id)))
     );
-  }, [product, selectedController]);
+  }, [product, productScenes, selectedController]);
   const selectedScene = useMemo(
     () => scenes.find((item) => item.id === sceneId) ?? scenes[0] ?? null,
     [scenes, sceneId],
   );
   const dataSources = useMemo(() => {
     if (!product || !selectedController || !selectedScene) return [];
-    return product.data_sources.filter((item) =>
+    return (product.data_sources ?? []).filter((item) =>
       selectedController.provider_ids.includes(item.provider_id)
       && selectedScene.provider_ids.includes(item.provider_id)
     );
   }, [product, selectedController, selectedScene]);
-  const replayRuns = catalog?.recent_runs.filter(
+  const replayRuns = historyRuns.filter(
     (item) => item.state === "complete"
       && item.product_id === product?.id
       && item.controller_id === selectedController?.id
@@ -79,6 +84,7 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
         ]);
         if (cancelled) return;
         setCatalog(next);
+        setHistoryRuns(await loadHistoryOrFallback(next.recent_runs));
         setError(next.message || "");
         if (current.state !== "idle") {
           setJob(current);
@@ -98,7 +104,7 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
               setManifest(record);
             }
           }
-        } else if (!productId && next.products[0]) {
+        } else if (!productId && next.products?.[0]) {
           setProductId(next.products[0].id);
         }
       } catch (reason) {
@@ -114,8 +120,8 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
     const source = dataSources.find((item) => item.id === dataSourceId)
       ?? dataSources.find((item) => item.available);
     if (source && source.id !== dataSourceId) setDataSourceId(source.id);
-    if (!product.controllers.some((item) => item.id === controllerId)) {
-      setControllerId(product.controllers[0]?.id ?? "");
+    if (!controllers.some((item) => item.id === controllerId)) {
+      setControllerId(controllers[0]?.id ?? "");
     }
     if (!scenes.some((item) => item.id === sceneId)) {
       setSceneId(scenes[0]?.id ?? "");
@@ -146,14 +152,19 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
         if (cancelled) return;
         setJob(next);
         if (next.state === "complete") {
-          const frames = await getTraditionalControlPlayback(DEFAULT_TRADITIONAL_CONTROL_PLAYBACK_FRAMES, next.run_id);
-          const values = await getTraditionalControlResult(next.run_id);
-          const record = await getTraditionalControlManifest(next.run_id);
+          const [frames, values, record, refreshedCatalog] = await Promise.all([
+            getTraditionalControlPlayback(DEFAULT_TRADITIONAL_CONTROL_PLAYBACK_FRAMES, next.run_id),
+            getTraditionalControlResult(next.run_id),
+            getTraditionalControlManifest(next.run_id),
+            getTraditionalControlCatalog(),
+          ]);
+          const history = await loadHistoryOrFallback(refreshedCatalog.recent_runs);
           if (!cancelled) {
             setPlayback(frames);
             setResult(values);
             setManifest(record);
-            setCatalog(await getTraditionalControlCatalog());
+            setCatalog(refreshedCatalog);
+            setHistoryRuns(history);
           }
         }
       } catch (reason) {
@@ -187,10 +198,12 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
           getTraditionalControlManifest(next.run_id),
           getTraditionalControlCatalog(),
         ]);
+        const history = await loadHistoryOrFallback(refreshedCatalog.recent_runs);
         setPlayback(frames);
         setResult(values);
         setManifest(record);
         setCatalog(refreshedCatalog);
+        setHistoryRuns(history);
       }
     } catch (reason) {
       setError(formatError(reason));
@@ -210,14 +223,42 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
     }
   }
 
+  async function openHistory(item: TraditionalControlJobStatus) {
+    if (!item.run_id || !item.playback_available) return;
+    setBusy(`history:${item.run_id}`);
+    setError("");
+    try {
+      const [status, frames] = await Promise.all([
+        getTraditionalControlStatus(item.run_id),
+        getTraditionalControlPlayback(DEFAULT_TRADITIONAL_CONTROL_PLAYBACK_FRAMES, item.run_id),
+      ]);
+      const [values, record] = await Promise.allSettled([
+        getTraditionalControlResult(item.run_id),
+        getTraditionalControlManifest(item.run_id),
+      ]);
+      setJob(status);
+      setPlayback(frames);
+      setResult(values.status === "fulfilled" ? values.value : null);
+      setManifest(record.status === "fulfilled" ? record.value : null);
+      if (status.product_id) setProductId(status.product_id);
+      if (status.controller_id) setControllerId(status.controller_id);
+      if (status.scene_id) setSceneId(status.scene_id);
+      if (status.data_source_id) setDataSourceId(status.data_source_id);
+    } catch (reason) {
+      setError(formatError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <section className="traditional-control-workspace">
       <div className="primary-panel traditional-control-header">
         <div className="panel-heading">
           <div>
             <p className="eyebrow">传统控制</p>
-            <h1>本机无头演示</h1>
-            <p className="panel-copy">通过统一回放协议查看控制器输出、足端接触和场景几何。</p>
+            <h1>传统控制测试与回放</h1>
+            <p className="panel-copy">选择控制器和场景执行测试，并查看机器人、足端接触与地形的完整回放。</p>
           </div>
           {job && <span className={`status-chip ${job.state}`}>{job.state}</span>}
         </div>
@@ -226,13 +267,13 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
           <label>
             产品
             <select value={product?.id ?? ""} onChange={(event) => setProductId(event.target.value)} disabled={!catalog}>
-              {catalog?.products.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+              {products.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
             </select>
           </label>
           <label>
             控制器
             <select value={selectedController?.id ?? ""} onChange={(event) => setControllerId(event.target.value)} disabled={!product}>
-              {product?.controllers.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+              {controllers.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
             </select>
           </label>
           <label>
@@ -285,6 +326,11 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
               <span key={metric.id}>{metric.label} {formatMetric(metric.value, metric.precision, metric.unit)}</span>
             ))}
             <span>失败原因 {result.failure_reasons.length ? result.failure_reasons.join(", ") : "无"}</span>
+            <span>请求时长 {formatSeconds(job?.requested_duration_s)}</span>
+            <span>实际仿真 {formatSeconds(job?.simulated_duration_s)}</span>
+            <span>完成步数 {formatSteps(job?.completed_steps, job?.requested_steps)}</span>
+            {isEarlyTermination(job) && <strong className="traditional-control-terminated">提前终止</strong>}
+            {job?.termination_reason && <span>终止原因 {job.termination_reason}</span>}
             <span>manifest {job?.manifest_path || "--"}</span>
             <code>{job?.result_path || ""}</code>
             <small>provider {String(manifest?.provider_id ?? "--")} · trace schema {String(manifest?.provenance && (manifest.provenance as Record<string, unknown>).trace_schema || "--")}</small>
@@ -296,10 +342,99 @@ export default function TraditionalControlDemo({ active = true }: { active?: boo
             <pre>{JSON.stringify(manifest, null, 2)}</pre>
           </details>
         )}
+        <section className="traditional-control-history" aria-labelledby="traditional-control-history-title">
+          <div className="traditional-control-history-heading">
+            <div>
+              <p className="eyebrow">历史回放</p>
+              <h2 id="traditional-control-history-title">最近测试记录</h2>
+            </div>
+            <span>{historyRuns.length} 条</span>
+          </div>
+          {historyRuns.length ? (
+            <div className="traditional-control-history-list">
+              {historyRuns.map((item) => (
+                <button
+                  type="button"
+                  className={item.run_id === job?.run_id ? "active" : ""}
+                  onClick={() => void openHistory(item)}
+                  disabled={!item.playback_available || Boolean(busy) || Boolean(job && ["starting", "running"].includes(job.state))}
+                  key={item.run_id}
+                  title={item.playback_available ? "打开并播放这次测试" : "这次测试没有可用回放"}
+                >
+                  <span className={`traditional-control-history-verdict ${item.verdict}`}>{historyVerdict(item)}</span>
+                  <span className="traditional-control-history-main">
+                    <strong>{historyTitle(item, products)}</strong>
+                    <small>{formatRunTime(item.created_at)} · {item.run_id}</small>
+                  </span>
+                  <span className="traditional-control-history-measure">
+                    {formatSeconds(item.simulated_duration_s)} / {formatSeconds(item.requested_duration_s)}
+                    <small>实际 / 请求 · 步数 {formatSteps(item.completed_steps, item.requested_steps)}</small>
+                  </span>
+                  <span className="traditional-control-history-action">
+                    {busy === `history:${item.run_id}` ? "加载中..." : item.playback_available ? "查看" : "无回放"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="traditional-control-history-empty">还没有测试记录。</p>
+          )}
+        </section>
       </div>
-      <RobotViewer playback={playback} active={active} />
+      <RobotViewer playback={playback} active={active} mode="traditional-control" />
     </section>
   );
+}
+
+function isEarlyTermination(job: TraditionalControlJobStatus | null) {
+  if (!job) return false;
+  if (job.completed_steps != null && job.requested_steps != null) {
+    return job.completed_steps < job.requested_steps;
+  }
+  if (job.simulated_duration_s != null && job.requested_duration_s != null) {
+    return job.simulated_duration_s + 0.001 < job.requested_duration_s;
+  }
+  return false;
+}
+
+function formatSeconds(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value) ? "--" : `${value.toFixed(2)} s`;
+}
+
+function formatSteps(completed: number | null | undefined, requested: number | null | undefined) {
+  if (completed == null && requested == null) return "--";
+  return `${completed ?? "--"} / ${requested ?? "--"}`;
+}
+
+function formatRunTime(timestamp: number | null | undefined) {
+  if (timestamp == null || !Number.isFinite(timestamp)) return "时间未知";
+  return new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function historyVerdict(item: TraditionalControlJobStatus) {
+  if (item.state === "error") return "执行错误";
+  if (item.state === "cancelled") return "已取消";
+  if (item.verdict === "passed") return "通过";
+  if (item.verdict === "failed") return "未通过";
+  return item.state === "complete" ? "已完成" : "未完成";
+}
+
+function historyTitle(
+  item: TraditionalControlJobStatus,
+  products: TraditionalControlCatalog["products"],
+) {
+  const product = products.find((candidate) => candidate.id === item.product_id);
+  const controller = product?.controllers.find((candidate) => candidate.id === item.controller_id);
+  const scene = product?.scenes.find((candidate) => candidate.id === item.scene_id);
+  return `${controller?.label ?? item.controller_id ?? "未知控制器"} · ${scene?.label ?? item.scene_id ?? "未知场景"}`;
+}
+
+async function loadHistoryOrFallback(fallback: TraditionalControlJobStatus[]) {
+  try {
+    return (await getTraditionalControlHistory()).items;
+  } catch {
+    return Array.isArray(fallback) ? fallback : [];
+  }
 }
 
 function formatMetric(value: unknown, precision: number, unit: string) {

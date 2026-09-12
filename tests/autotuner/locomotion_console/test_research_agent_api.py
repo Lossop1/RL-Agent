@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,8 +19,9 @@ from autotuner.research.research_state import ResearchState, ResearchStateStore 
 
 
 def test_research_root_keeps_request_paths_local_and_allows_env_isolation(
-    tmp_path, monkeypatch
+    monkeypatch,
 ):
+    external_root = PROJECT_ROOT.parent / f".locomotion-test-external-{os.getpid()}"
     relative = resolve_research_root("output/research-test")
     relative.relative_to(PROJECT_ROOT.resolve())
     assert resolve_research_root(PROJECT_ROOT / "output" / "research-test") == relative
@@ -30,12 +30,12 @@ def test_research_root_keeps_request_paths_local_and_allows_env_isolation(
         resolve_research_root("../outside-repository")
 
     with pytest.raises(ValueError, match="explicit research root"):
-        resolve_research_root(Path(tmp_path))
+        resolve_research_root(external_root)
 
-    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path))
-    assert resolve_research_root() == tmp_path.resolve()
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(external_root))
+    assert resolve_research_root() == external_root.resolve()
 
-    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path.anchor))
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(PROJECT_ROOT.anchor))
     with pytest.raises(ValueError, match="filesystem root"):
         resolve_research_root()
 
@@ -64,17 +64,19 @@ def test_research_read_tools_are_registered_and_state_is_durable(tmp_path, monke
     )
 
 
-def test_research_ledger_rejects_external_request_roots(tmp_path, monkeypatch):
-    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(tmp_path / "configured"))
+def test_research_ledger_rejects_external_request_roots(monkeypatch):
+    external_root = PROJECT_ROOT.parent / f".locomotion-test-external-{os.getpid()}"
+    requested_root = external_root / "requested"
+    monkeypatch.setenv("LOCOMOTION_RESEARCH_ROOT", str(external_root / "configured"))
 
     with TestClient(app_module.app) as client:
         response = client.get(
-            "/research/ledger", params={"root": str(tmp_path / "requested")}
+            "/research/ledger", params={"root": str(requested_root)}
         )
 
     assert response.status_code == 400
     assert "explicit research root" in response.json()["detail"]
-    result = agent._tool_get_research_ledger(None, root=str(tmp_path / "requested"))
+    result = agent._tool_get_research_ledger(None, root=str(requested_root))
     assert "explicit research root" in result["error"]
 
 

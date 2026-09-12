@@ -179,6 +179,7 @@ def _validated_dynamic_request(
     user_text: str,
     model: str,
     approved: bool,
+    approved_by: str = "",
 ) -> tuple[TaskRequest, tuple[str, ...], float]:
     clarifications_raw = parsed.get("clarifications", ())
     if not isinstance(clarifications_raw, (list, tuple)) or len(clarifications_raw) > 6:
@@ -213,6 +214,8 @@ def _validated_dynamic_request(
         # 批准权来自调用方，绝不读取模型输出中的 approved。
         "approved": bool(approved),
     }
+    if approved_by.strip():
+        task_data["metadata"]["approved_by"] = approved_by.strip()
     return TaskRequest.from_mapping(task_data), clarifications, confidence
 
 
@@ -221,7 +224,10 @@ def translate_dynamic(
     *,
     product_id: str | None = None,
     approved: bool = False,
+    approved_by: str = "",
     output_root: str | Path | None = None,
+    run_id: str | None = None,
+    launch_request: Mapping[str, Any] | Any | None = None,
     registry: ProductRegistry | None = None,
 ) -> DynamicTaskIntakeResult:
     """基于当前产品合同解析用户任务，并生成同源的派生规格。"""
@@ -244,12 +250,14 @@ def translate_dynamic(
             user_text=text,
             model=response.model,
             approved=approved,
+            approved_by=approved_by,
         )
         bundle = TaskContractCompiler().compile_bundle(contract, request)
         contract_ref = ""
         materialization_manifest = ""
         pipeline_result = None
-        if output_root is not None:
+        # 未解决的澄清只产生内存中的草案，不能提前物料化为可执行交接。
+        if output_root is not None and not clarifications:
             output_path = Path(output_root)
             # 保留旧的直接输出布局，同时把同一 bundle 纳入版本仓库，避免
             # 旧工具和新系统分别生成两份无法对齐的合同。
@@ -260,8 +268,13 @@ def translate_dynamic(
             ).prepare(
                 contract,
                 bundle,
-                run_id=f"intake-{bundle.contract.contract_id}-{bundle.contract.contract_version}",
+                run_id=(
+                    str(run_id).strip()
+                    if str(run_id or "").strip()
+                    else f"intake-{bundle.contract.contract_id}-{bundle.contract.contract_version}"
+                ),
                 actor="llm_task_intake",
+                launch_request=launch_request,
             )
             contract_ref = pipeline_result.stored_contract.ref
             materialization_manifest = str(pipeline_result.materialized.manifest)

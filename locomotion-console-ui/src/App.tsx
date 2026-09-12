@@ -58,6 +58,40 @@ class DiagnosticsErrorBoundary extends Component<
   }
 }
 
+class AgentWorkbenchErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Agent workbench rendering failed", error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <main className="agent-layout loading-layout">
+        <section className="primary-panel">
+          <p className="eyebrow">智能体工作台</p>
+          <h1>工作台暂时无法渲染</h1>
+          <p>服务上下文已建立，但部分遥测或工作台数据不完整，页面已保留在当前工作区。</p>
+          <div className="inline-alert" role="alert">
+            {this.state.error.message || "未知页面错误"}
+          </div>
+          <button className="secondary-button" onClick={() => window.location.reload()}>
+            重新加载页面
+          </button>
+        </section>
+      </main>
+    );
+  }
+}
+
 const AGENT_TREND_PRESETS = [
   {
     id: "phase",
@@ -198,7 +232,8 @@ export default function App() {
   useEffect(() => {
     if (!workbench) return;
     const attempt = workbench.attempt;
-    const values = workbench.evidence.find((item) => item.id === "telemetry")?.values ?? {};
+    const evidence = arrayValue<AgentWorkbenchEvidenceInfo>(workbench.evidence);
+    const values = evidence.find((item) => item.id === "telemetry")?.values ?? {};
     const curriculum = recordValue(values.curriculum);
     const command = recordValue(values.command);
     const gait = recordValue(values.gait);
@@ -296,7 +331,7 @@ export default function App() {
   }
 
   const pendingProposals = useMemo(
-    () => workbench?.proposals.filter((item) => item.status === "pending") ?? [],
+    () => arrayValue<ChatProposalInfo>(workbench?.proposals).filter((item) => item.status === "pending"),
     [workbench],
   );
 
@@ -336,19 +371,21 @@ export default function App() {
 
       <div className="workspace-keepalive">
         <div className="workspace-pane" hidden={view !== "agent"}>
-          <AgentWorkbench
-            workbench={workbench}
-            busy={busy}
-            pendingProposals={pendingProposals}
-            onDirectAction={runDirectAction}
-            onConfirmProposal={confirmProposal}
-            onCancelProposal={cancelProposal}
-            onOpenDiagnostics={() => openView("diagnostics")}
-            trainingTelemetry={trainingTelemetry}
-            chatContext={context}
-            chatMessages={chatMessages}
-            setChatMessages={setChatMessages}
-          />
+          <AgentWorkbenchErrorBoundary>
+            <AgentWorkbench
+              workbench={workbench}
+              busy={busy}
+              pendingProposals={pendingProposals}
+              onDirectAction={runDirectAction}
+              onConfirmProposal={confirmProposal}
+              onCancelProposal={cancelProposal}
+              onOpenDiagnostics={() => openView("diagnostics")}
+              trainingTelemetry={trainingTelemetry}
+              chatContext={context}
+              chatMessages={chatMessages}
+              setChatMessages={setChatMessages}
+            />
+          </AgentWorkbenchErrorBoundary>
         </div>
         {visitedViews.scoreboard && (
           <main className="tool-host workspace-pane" hidden={view !== "scoreboard"}>
@@ -472,6 +509,8 @@ function ObjectivePanel({ workbench }: { workbench: AgentWorkbenchInfo }) {
 
 function JudgementPanel({ workbench }: { workbench: AgentWorkbenchInfo }) {
   const judgement = workbench.judgement;
+  const gaps = arrayValue<string>(judgement.gaps);
+  const notes = arrayValue<string>(workbench.notes);
   return (
     <section className={`primary-panel judgement-panel flat-panel ${judgement.status}`}>
       <div className="panel-heading">
@@ -482,14 +521,14 @@ function JudgementPanel({ workbench }: { workbench: AgentWorkbenchInfo }) {
         <span className={`confidence ${judgement.confidence}`}>可信度 {confidenceLabel(judgement.confidence)}</span>
       </div>
       <p className="judgement-summary">{judgement.summary}</p>
-      {judgement.gaps.length > 0 && (
+      {gaps.length > 0 && (
         <div className="gap-list">
           <strong>证据缺口</strong>
-          {judgement.gaps.map((gap) => <span key={gap}>{gap}</span>)}
+          {gaps.map((gap) => <span key={gap}>{gap}</span>)}
         </div>
       )}
       <div className="note-list">
-        {workbench.notes.map((note) => <span key={note}>{note}</span>)}
+        {notes.map((note) => <span key={note}>{note}</span>)}
       </div>
     </section>
   );
@@ -505,9 +544,11 @@ function RunControlPanel({
   onDirectAction: (action: DirectAction) => Promise<void>;
 }) {
   const attempt = workbench.attempt;
-  const actionsById = new Map(workbench.actions.map((action) => [action.id, action]));
-  const remote = workbench.evidence.find((item) => item.id === "remote");
-  const telemetry = workbench.evidence.find((item) => item.id === "telemetry");
+  const actions = arrayValue<AgentWorkbenchActionInfo>(workbench.actions);
+  const evidence = arrayValue<AgentWorkbenchEvidenceInfo>(workbench.evidence);
+  const actionsById = new Map(actions.map((action) => [action.id, action]));
+  const remote = evidence.find((item) => item.id === "remote");
+  const telemetry = evidence.find((item) => item.id === "telemetry");
   const stateReliable = attempt.remote_ok
     && !["stale", "remote_unavailable", "unknown"].includes(attempt.runtime_state);
   const controls: Array<{ id: string; action: DirectAction; label: string; tone: "primary" | "secondary" | "danger" }> = [
@@ -619,7 +660,7 @@ function ProposalPanel({
 }
 
 function EvidencePanel({ evidence }: { evidence: AgentWorkbenchEvidenceInfo[] }) {
-  const visibleEvidence = evidence.filter((item) => item.id !== "telemetry");
+  const visibleEvidence = arrayValue<AgentWorkbenchEvidenceInfo>(evidence).filter((item) => item.id !== "telemetry");
   return (
     <section className="primary-panel flat-panel">
       <div className="panel-heading">
@@ -649,7 +690,8 @@ function TelemetryPanel({
   workbench: AgentWorkbenchInfo;
   trainingTelemetry: TrainingTelemetry | null;
 }) {
-  const telemetry = workbench.evidence.find((item) => item.id === "telemetry");
+  const evidence = arrayValue<AgentWorkbenchEvidenceInfo>(workbench.evidence);
+  const telemetry = evidence.find((item) => item.id === "telemetry");
   const values = telemetry?.values ?? {};
   const latestPoint = trainingTelemetry?.latest ?? null;
   const [trendPresetId, setTrendPresetId] = useState<AgentTrendPresetId>("phase");
@@ -1143,8 +1185,9 @@ function ActionPanel({
   busy: string | null;
   onOpenDiagnostics: () => void;
 }) {
-  const askAction = actions.find((action) => action.kind === "ask_agent");
-  const diagnosticAction = actions.find((action) => action.kind === "diagnostic");
+  const safeActions = arrayValue<AgentWorkbenchActionInfo>(actions);
+  const askAction = safeActions.find((action) => action.kind === "ask_agent");
+  const diagnosticAction = safeActions.find((action) => action.kind === "diagnostic");
   const askAgent = () => window.dispatchEvent(new CustomEvent("locomotion-console-send-command", {
     detail: "/ask 读取当前证据，解释现在的训练状态；如果需要动作，只生成待授权提案，不直接改变训练状态。",
   }));
@@ -1192,20 +1235,23 @@ function ProcessLog({ workbench, busy }: { workbench: AgentWorkbenchInfo; busy: 
 }
 
 function processRows(workbench: AgentWorkbenchInfo, busy: string | null) {
+  const evidence = arrayValue<AgentWorkbenchEvidenceInfo>(workbench.evidence);
+  const proposals = arrayValue<ChatProposalInfo>(workbench.proposals);
+  const notes = arrayValue<string>(workbench.notes);
   const time = new Date(workbench.generated_at * 1000).toLocaleTimeString("zh-CN", { hour12: false });
   const rows = [
     { key: "status", time, text: `状态：${workbench.attempt.summary || stateLabel(workbench.attempt.runtime_state)}` },
     { key: "judgement", time, text: `判断：${workbench.judgement.title}` },
-    { key: "evidence", time, text: `证据：${workbench.evidence.filter((item) => item.status === "ok").length}/${workbench.evidence.length} 可用` },
+    { key: "evidence", time, text: `证据：${evidence.filter((item) => item.status === "ok").length}/${evidence.length} 可用` },
   ];
-  const remote = workbench.evidence.find((item) => item.id === "remote");
+  const remote = evidence.find((item) => item.id === "remote");
   if (remote) {
     rows.push({ key: "remote", time, text: `远端：${remote.detail || evidenceStatusLabel(remote.status)}` });
   }
-  const pending = workbench.proposals.filter((item) => item.status === "pending").length;
+  const pending = proposals.filter((item) => item.status === "pending").length;
   if (pending > 0) rows.push({ key: "proposal", time, text: `待确认：${pending} 个提案` });
   if (busy) rows.unshift({ key: "busy", time: "现在", text: `正在执行：${busy}` });
-  for (const note of workbench.notes.slice(0, 2)) {
+  for (const note of notes.slice(0, 2)) {
     rows.push({ key: `note:${note}`, time, text: note });
   }
   return rows;
@@ -1261,6 +1307,10 @@ function shortPath(path: string) {
 
 function recordValue(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
+}
+
+function arrayValue<T>(value: unknown): T[] {
+  return Array.isArray(value) ? value as T[] : [];
 }
 
 function numberOrNull(value: unknown): number | null {
@@ -1384,7 +1434,7 @@ function numericTrendKeys(history: TrainingTelemetryPoint[], group: TelemetryGro
 }
 
 function recordForTrend(point: TrainingTelemetryPoint, group: TelemetryGroupKey): Record<string, unknown> {
-  return point[group] as Record<string, unknown>;
+  return recordValue(point[group]);
 }
 
 function labelForTrendField(key: string, fallbackGroup: string) {

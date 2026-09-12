@@ -67,7 +67,10 @@ export default function Chat({
   }, []);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const end = endRef.current;
+    if (end && typeof end.scrollIntoView === "function") {
+      end.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
   }, [messages, busy]);
 
   useEffect(() => {

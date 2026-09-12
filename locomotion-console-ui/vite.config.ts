@@ -29,6 +29,7 @@ export default defineConfig({
         ws: true,
       },
       "/spec": "http://127.0.0.1:8000",
+      "/traditional-control": "http://127.0.0.1:8000",
     },
   },
   build: {

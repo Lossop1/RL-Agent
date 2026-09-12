@@ -141,6 +141,49 @@ def check_source_boundaries(root: Path, layout: dict, report: CheckReport) -> No
                 report.warning(f"源码树包含本地生成目录，提交前应清理: {path.relative_to(root).as_posix()}")
 
 
+def check_layer_dependencies(root: Path, layout: dict, report: CheckReport) -> None:
+    """检查层级依赖规则：底层不能感知上层"""
+    layer_hierarchy = layout.get("layer_hierarchy", {})
+    if not layer_hierarchy:
+        return
+
+    # 构建层级映射：模块前缀 -> 层级编号（数字越大越上层）
+    module_to_layer: dict[str, int] = {}
+    for level, modules in layer_hierarchy.items():
+        for module in modules:
+            module_to_layer[module] = int(level)
+
+    for path in _python_files(root):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError):
+            continue
+
+        source_module = _module_name(path, root)
+        source_layer = None
+        for prefix, layer in module_to_layer.items():
+            if source_module.startswith(prefix):
+                source_layer = layer
+                break
+
+        if source_layer is None:
+            continue
+
+        # 检查导入的模块层级
+        for imported in _absolute_imports(tree):
+            target_layer = None
+            for prefix, layer in module_to_layer.items():
+                if imported == prefix or imported.startswith(prefix + "."):
+                    target_layer = layer
+                    break
+
+            if target_layer is not None and source_layer > target_layer:
+                report.error(
+                    f"层级依赖违规: {source_module} (第 {source_layer} 层) "
+                    f"-> {imported} (第 {target_layer} 层)，底层不能感知上层"
+                )
+
+
 def check_compatibility_shims(root: Path, layout: dict, report: CheckReport) -> None:
     compatibility = layout.get("compatibility", {})
     entries = [
@@ -205,6 +248,7 @@ def run(root: Path) -> CheckReport:
     check_required_paths(root, layout, report)
     check_encoding(root, report)
     check_source_boundaries(root, layout, report)
+    check_layer_dependencies(root, layout, report)
     check_compatibility_shims(root, layout, report)
     check_payload_manifest(root, report)
     return report
