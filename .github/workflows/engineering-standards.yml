@@ -1,0 +1,64 @@
+name: 工程标准检查
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  engineering-standards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+
+      - name: 设置Python环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 检查仓库结构
+        run: |
+          python tools/check_repository_structure.py
+          if [ $? -ne 0 ]; then
+            echo "ERROR: 仓库结构检查失败"
+            exit 1
+          fi
+
+      - name: 检查层依赖（预览模式）
+        run: |
+          python tools/decouple_layers.py --dry-run
+          # 当前为预览模式，不阻塞CI
+          # 待适配器实现后改为：
+          # if [ $? -ne 0 ]; then exit 1; fi
+
+      - name: 检查中文注释质量
+        run: |
+          python tools/check_comment_quality.py --path autotuner/
+          ERROR_COUNT=$(python tools/check_comment_quality.py --path autotuner/ 2>&1 | grep -oP '发现 \K\d+(?= 个错误)')
+          if [ "$ERROR_COUNT" -gt 50 ]; then
+            echo "ERROR: 中文注释错误过多（$ERROR_COUNT > 50）"
+            exit 1
+          fi
+
+      - name: 检查文档冗余
+        run: |
+          python tools/check_doc_redundancy.py
+          # 当前仅警告，不阻塞CI
+          # 文档清理后可改为严格模式
+
+      - name: 运行Python测试
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: 检查前端类型
+        run: |
+          cd locomotion-console-ui
+          npm install
+          npm run typecheck
