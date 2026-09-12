@@ -1,235 +1,245 @@
-#!/usr/bin/env python3
-"""检查文档冗余：识别重复内容和过期描述。
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""文档冗余检测工具：扫描 docs/ 目录中的重复内容。
 
-检查规则：
-1. 多处文档描述相同概念（如架构、层级定义）
-2. 文档与代码注释重复
-3. 示例代码在多处出现
-4. 过期的归档文档仍被引用
+检测规则：
+1. 文件名相似度 > 80%（编辑距离）
+2. 内容重复度 > 60%（行级去重后的重叠率）
+3. 同一概念在多个文件中重复定义
+4. 过时文档未归档到 docs/archive/
 
-运行方式：
+用法：
     python tools/check_doc_redundancy.py
-    python tools/check_doc_redundancy.py --fix-refs  # 自动修复过期引用
+    python tools/check_doc_redundancy.py --threshold 0.7
+    python tools/check_doc_redundancy.py --fix  # 自动移动到 archive
 """
-from __future__ import annotations
-
 import argparse
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+import re
+from typing import Sequence
 
 
 @dataclass
 class RedundancyIssue:
-    """冗余问题记录"""
-    type: str  # duplicate_concept, duplicate_code, stale_reference
-    files: list[Path]
-    description: str
-    severity: str  # error, warning
+    """文档冗余问题记录"""
+    severity: str  # "warning" | "error"
+    file1: Path
+    file2: Path | None
+    reason: str
+    similarity: float
 
 
-def _find_markdown_files(root: Path) -> Iterator[Path]:
-    """查找所有 Markdown 文档"""
-    docs_dir = root / "docs"
-    if docs_dir.exists():
-        yield from docs_dir.rglob("*.md")
-
-    readme = root / "README.md"
-    if readme.exists():
-        yield readme
-
-
-def _extract_headings(content: str) -> list[str]:
-    """提取文档中的所有标题"""
-    return re.findall(r"^#{1,6}\s+(.+)$", content, re.MULTILINE)
-
-
-def _extract_code_blocks(content: str) -> list[str]:
-    """提取代码块（用于检测重复示例）"""
-    blocks = re.findall(r"```[\w]*\n(.*?)```", content, re.DOTALL)
-    # 过滤掉太短的代码块（< 3 行）
-    return [block.strip() for block in blocks if block.count("\n") >= 2]
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """计算编辑距离"""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
 
 
-def check_duplicate_concepts(root: Path) -> list[RedundancyIssue]:
-    """检查重复概念描述"""
-    issues: list[RedundancyIssue] = []
+def filename_similarity(name1: str, name2: str) -> float:
+    """计算文件名相似度（0-1）"""
+    distance = levenshtein_distance(name1.lower(), name2.lower())
+    max_len = max(len(name1), len(name2))
+    return 1 - (distance / max_len) if max_len > 0 else 0
 
-    # 已知容易重复的关键概念
-    key_concepts = {
-        "层级": r"第?\s*[1-6六五四三二一]\s*层[：:]",
-        "架构": r"(架构|分层|层级结构)",
-        "解耦": r"解耦|依赖方向|底层.*上层",
-        "原子问题": r"原子问题",
-        "payload": r"payload\s*(清单|manifest)",
-    }
 
-    concept_locations: dict[str, list[tuple[Path, int]]] = defaultdict(list)
+def content_similarity(file1: Path, file2: Path) -> float:
+    """计算内容相似度（0-1）：去重后的行级重叠率"""
+    try:
+        lines1 = set(
+            line.strip()
+            for line in file1.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )
+        lines2 = set(
+            line.strip()
+            for line in file2.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )
+        if not lines1 or not lines2:
+            return 0.0
+        overlap = len(lines1 & lines2)
+        total = len(lines1 | lines2)
+        return overlap / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
 
-    for doc_path in _find_markdown_files(root):
-        content = doc_path.read_text(encoding="utf-8")
-        for concept_name, pattern in key_concepts.items():
-            for match in re.finditer(pattern, content, re.IGNORECASE):
-                line_num = content[:match.start()].count("\n") + 1
-                concept_locations[concept_name].append((doc_path, line_num))
 
-    # 出现在 3 处以上的概念可能冗余
-    for concept, locations in concept_locations.items():
-        if len(locations) >= 3:
-            unique_files = list(set(path for path, _ in locations))
-            if len(unique_files) >= 3:
+def extract_concepts(file: Path) -> set[str]:
+    """提取文档中的关键概念（标题、术语）"""
+    concepts = set()
+    try:
+        content = file.read_text(encoding="utf-8")
+        # 提取 Markdown 标题
+        for match in re.finditer(r"^#+\s+(.+)$", content, re.MULTILINE):
+            concepts.add(match.group(1).strip().lower())
+        # 提取加粗术语
+        for match in re.finditer(r"\*\*(.+?)\*\*", content):
+            term = match.group(1).strip().lower()
+            if len(term) > 3 and len(term) < 50:
+                concepts.add(term)
+    except Exception:
+        pass
+    return concepts
+
+
+def check_filename_redundancy(files: Sequence[Path], threshold: float) -> list[RedundancyIssue]:
+    """检测文件名冗余"""
+    issues = []
+    for i, f1 in enumerate(files):
+        for f2 in files[i + 1:]:
+            sim = filename_similarity(f1.stem, f2.stem)
+            if sim > threshold:
                 issues.append(RedundancyIssue(
-                    type="duplicate_concept",
-                    files=unique_files,
-                    description=f"概念 '{concept}' 在 {len(unique_files)} 个文档中重复定义",
-                    severity="warning"
+                    severity="warning",
+                    file1=f1,
+                    file2=f2,
+                    reason=f"文件名高度相似（{sim:.1%}）：是否为重复文档？",
+                    similarity=sim
                 ))
-
     return issues
 
 
-def check_duplicate_code_examples(root: Path) -> list[RedundancyIssue]:
-    """检查重复的代码示例"""
-    issues: list[RedundancyIssue] = []
-    code_blocks: dict[str, list[Path]] = defaultdict(list)
+def check_content_redundancy(files: Sequence[Path], threshold: float) -> list[RedundancyIssue]:
+    """检测内容冗余"""
+    issues = []
+    for i, f1 in enumerate(files):
+        for f2 in files[i + 1:]:
+            sim = content_similarity(f1, f2)
+            if sim > threshold:
+                issues.append(RedundancyIssue(
+                    severity="error",
+                    file1=f1,
+                    file2=f2,
+                    reason=f"内容高度重复（{sim:.1%}）：应合并或归档其中一个",
+                    similarity=sim
+                ))
+    return issues
 
-    for doc_path in _find_markdown_files(root):
-        content = doc_path.read_text(encoding="utf-8")
-        for block in _extract_code_blocks(content):
-            # 使用代码块的哈希前 40 字符作为标识
-            block_hash = str(hash(block))[:40]
-            code_blocks[block_hash].append(doc_path)
 
-    # 相同代码块出现在多个文档中
-    for block_hash, files in code_blocks.items():
-        if len(files) >= 2:
+def check_concept_duplication(files: Sequence[Path]) -> list[RedundancyIssue]:
+    """检测概念在多个文档中重复定义"""
+    concept_locations: dict[str, list[Path]] = defaultdict(list)
+    for file in files:
+        concepts = extract_concepts(file)
+        for concept in concepts:
+            concept_locations[concept].append(file)
+
+    issues = []
+    for concept, locations in concept_locations.items():
+        if len(locations) > 2:  # 同一概念出现在 3+ 个文档中
             issues.append(RedundancyIssue(
-                type="duplicate_code",
-                files=list(set(files)),
-                description=f"相同代码示例在 {len(files)} 个文档中重复",
-                severity="warning"
+                severity="warning",
+                file1=locations[0],
+                file2=None,
+                reason=f"概念 '{concept}' 在 {len(locations)} 个文档中重复定义：{', '.join(f.name for f in locations[:3])}",
+                similarity=1.0
             ))
+    return issues
+
+
+def check_outdated_docs(docs_root: Path) -> list[RedundancyIssue]:
+    """检测可能过时但未归档的文档"""
+    issues = []
+    archive_path = docs_root / "archive"
+
+    # 查找包含 "旧"、"废弃"、"已弃用" 等关键词的文档
+    outdated_keywords = ["旧", "废弃", "已弃用", "过时", "old", "deprecated", "obsolete", "legacy"]
+
+    for file in docs_root.rglob("*.md"):
+        if archive_path in file.parents:
+            continue  # 已在归档目录中
+
+        try:
+            content = file.read_text(encoding="utf-8").lower()
+            for keyword in outdated_keywords:
+                if keyword in content or keyword in file.stem.lower():
+                    issues.append(RedundancyIssue(
+                        severity="warning",
+                        file1=file,
+                        file2=None,
+                        reason=f"文档可能过时（包含关键词 '{keyword}'）但未归档",
+                        similarity=0.0
+                    ))
+                    break
+        except Exception:
+            pass
 
     return issues
 
 
-def check_stale_references(root: Path) -> list[RedundancyIssue]:
-    """检查对归档文档的引用（应当尽量避免）"""
-    issues: list[RedundancyIssue] = []
-    archive_dir = root / "docs" / "archive"
-
-    if not archive_dir.exists():
-        return issues
-
-    for doc_path in _find_markdown_files(root):
-        # 跳过归档目录内的文档
-        if archive_dir in doc_path.parents:
-            continue
-
-        content = doc_path.read_text(encoding="utf-8")
-
-        # 查找指向 archive/ 的链接
-        archive_refs = re.findall(r"\[([^\]]+)\]\(([^)]*archive[^)]*)\)", content)
-
-        if archive_refs:
-            issues.append(RedundancyIssue(
-                type="stale_reference",
-                files=[doc_path],
-                description=f"文档引用了 {len(archive_refs)} 个归档文件，建议移除或更新",
-                severity="warning"
-            ))
-
-    return issues
-
-
-def check_readme_vs_docs(root: Path) -> list[RedundancyIssue]:
-    """检查 README.md 与 docs/ 中的重复内容"""
-    issues: list[RedundancyIssue] = []
-    readme = root / "README.md"
-
-    if not readme.exists():
-        return issues
-
-    readme_content = readme.read_text(encoding="utf-8")
-    readme_headings = set(_extract_headings(readme_content))
-
-    docs_dir = root / "docs"
-    if not docs_dir.exists():
-        return issues
-
-    for doc_path in docs_dir.rglob("*.md"):
-        if "archive" in doc_path.parts:
-            continue
-
-        doc_content = doc_path.read_text(encoding="utf-8")
-        doc_headings = set(_extract_headings(doc_content))
-
-        # 标题重叠度 > 50% 可能表示内容重复
-        overlap = readme_headings & doc_headings
-        if len(overlap) > 2 and len(overlap) / len(doc_headings) > 0.5:
-            issues.append(RedundancyIssue(
-                type="duplicate_concept",
-                files=[readme, doc_path],
-                description=f"README 与 {doc_path.name} 有 {len(overlap)} 个相同标题，可能内容重复",
-                severity="warning"
-            ))
-
-    return issues
-
-
-def generate_report(issues: list[RedundancyIssue]) -> None:
-    """生成可读报告"""
-    if not issues:
-        print("未发现文档冗余问题")
-        return
-
-    print("\n" + "=" * 80)
-    print("文档冗余检查报告")
-    print("=" * 80)
-
-    by_type: dict[str, list[RedundancyIssue]] = defaultdict(list)
-    for issue in issues:
-        by_type[issue.type].append(issue)
-
-    type_names = {
-        "duplicate_concept": "重复概念",
-        "duplicate_code": "重复代码示例",
-        "stale_reference": "过期引用",
-    }
-
-    for issue_type, type_issues in by_type.items():
-        print(f"\n【{type_names.get(issue_type, issue_type)}】")
-        for issue in type_issues:
-            print(f"  {issue.severity.upper()}: {issue.description}")
-            for file_path in issue.files:
-                print(f"    - {file_path}")
-
-    print(f"\n总计: {len(issues)} 个潜在冗余问题")
-    print("=" * 80 + "\n")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="检查文档冗余")
-    parser.add_argument("--root", type=Path, default=Path.cwd(), help="仓库根目录")
-    parser.add_argument("--fix-refs", action="store_true", help="自动移除对归档文档的引用（未实现）")
+def main():
+    parser = argparse.ArgumentParser(description="检测文档冗余")
+    parser.add_argument("--threshold", type=float, default=0.6, help="相似度阈值（0-1）")
+    parser.add_argument("--fix", action="store_true", help="自动将疑似过时文档移动到 archive")
     args = parser.parse_args()
 
-    root = args.root.resolve()
+    docs_root = Path("docs")
+    if not docs_root.exists():
+        print("错误: docs/ 目录不存在")
+        return 1
+
+    # 收集所有 Markdown 文档（排除 archive 目录）
+    archive_path = docs_root / "archive"
+    all_docs = [
+        f for f in docs_root.rglob("*.md")
+        if archive_path not in f.parents
+    ]
+
+    print(f"扫描 {len(all_docs)} 个文档...")
 
     issues: list[RedundancyIssue] = []
-    issues.extend(check_duplicate_concepts(root))
-    issues.extend(check_duplicate_code_examples(root))
-    issues.extend(check_stale_references(root))
-    issues.extend(check_readme_vs_docs(root))
 
-    generate_report(issues)
+    # 检测各类冗余
+    issues.extend(check_filename_redundancy(all_docs, threshold=0.8))
+    issues.extend(check_content_redundancy(all_docs, threshold=args.threshold))
+    issues.extend(check_concept_duplication(all_docs))
+    issues.extend(check_outdated_docs(docs_root))
 
-    # 只有 error 级别的问题才导致退出码非零
-    errors = [i for i in issues if i.severity == "error"]
-    return 1 if errors else 0
+    # 按严重程度排序
+    issues.sort(key=lambda x: (x.severity != "error", -x.similarity))
+
+    # 输出结果
+    error_count = sum(1 for i in issues if i.severity == "error")
+    warning_count = sum(1 for i in issues if i.severity == "warning")
+
+    if not issues:
+        print("✓ 未发现文档冗余问题")
+        return 0
+
+    print(f"\n发现 {error_count} 个错误，{warning_count} 个警告：\n")
+
+    for issue in issues:
+        prefix = "ERROR" if issue.severity == "error" else "WARNING"
+        print(f"{prefix}: {issue.file1.relative_to(Path.cwd())}")
+        if issue.file2:
+            print(f"       vs {issue.file2.relative_to(Path.cwd())}")
+        print(f"       {issue.reason}\n")
+
+    # 自动修复（移动到 archive）
+    if args.fix:
+        archive_path.mkdir(parents=True, exist_ok=True)
+        for issue in issues:
+            if "过时" in issue.reason or "obsolete" in issue.reason:
+                target = archive_path / issue.file1.name
+                print(f"移动到归档: {issue.file1} -> {target}")
+                issue.file1.rename(target)
+
+    return 1 if error_count > 0 else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit(main())

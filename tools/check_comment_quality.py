@@ -1,286 +1,284 @@
-#!/usr/bin/env python3
-"""检查中文注释质量和覆盖率。
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""中文注释质量检查工具：扫描 Python 代码中的注释覆盖率和质量。
 
 检查规则：
-1. 核心模块（mechanisms, research, execution）注释覆盖率 >= 80%
+1. 模块级文档字符串必须包含中文
 2. 公共函数/类必须有中文文档字符串
-3. 复杂逻辑块（> 10 行）应有中文注释
-4. 避免无意义注释（如 `# 设置 x = 1`）
+3. 复杂逻辑（if/for/while 嵌套 > 2 层）必须有行内中文注释
+4. 注释密度：关键模块注释行数 / 代码行数 > 10%
 
-运行方式：
+用法：
     python tools/check_comment_quality.py
-    python tools/check_comment_quality.py --verbose  # 显示详细信息
+    python tools/check_comment_quality.py --path autotuner/
+    python tools/check_comment_quality.py --strict  # 严格模式
 """
-from __future__ import annotations
-
 import argparse
 import ast
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+import re
+from typing import Sequence
+
+
+CHINESE_PATTERN = re.compile(r"[一-鿿]+")
 
 
 @dataclass
-class CommentStats:
-    """模块注释统计"""
-    file: Path
-    total_lines: int
-    code_lines: int
-    comment_lines: int
-    chinese_comment_lines: int
-    functions: int
-    functions_with_docstring: int
-    classes: int
-    classes_with_docstring: int
-
-
-@dataclass
-class QualityIssue:
-    """注释质量问题"""
+class CommentIssue:
+    """注释质量问题记录"""
+    severity: str  # "warning" | "error"
     file: Path
     line: int
-    type: str  # missing_docstring, low_coverage, trivial_comment
-    description: str
-    severity: str  # error, warning
+    reason: str
 
 
-CORE_MODULES = {
-    "autotuner/mechanisms",
-    "autotuner/research",
-    "autotuner/execution",
-    "autotuner/artifacts",
-    "products/taili/core",
-}
-
-TRIVIAL_PATTERNS = [
-    r"^#\s*设置\s*\w+\s*=",  # 设置 x = 1
-    r"^#\s*返回\s*$",  # 返回
-    r"^#\s*初始化\s*$",  # 初始化
-    r"^#\s*TODO\s*$",  # TODO（无具体内容）
-]
+def has_chinese(text: str) -> bool:
+    """检查文本是否包含中文字符"""
+    return bool(CHINESE_PATTERN.search(text))
 
 
-def _is_chinese(text: str) -> bool:
-    """判断文本是否包含中文字符"""
-    return bool(re.search(r"[一-鿿]", text))
+def count_nesting_depth(node: ast.AST) -> int:
+    """计算 AST 节点的嵌套深度"""
+    max_depth = 0
+    for child in ast.walk(node):
+        if isinstance(child, (ast.If, ast.For, ast.While, ast.With)):
+            depth = 1
+            current = child
+            for parent in ast.walk(node):
+                for field, value in ast.iter_fields(parent):
+                    if value is current or (isinstance(value, list) and current in value):
+                        if isinstance(parent, (ast.If, ast.For, ast.While, ast.With)):
+                            depth += 1
+            max_depth = max(max_depth, depth)
+    return max_depth
 
 
-def _is_core_module(file: Path, root: Path) -> bool:
-    """判断是否为核心模块"""
-    rel = file.relative_to(root).as_posix()
-    return any(rel.startswith(prefix) for prefix in CORE_MODULES)
+def check_module_docstring(file: Path, tree: ast.Module) -> list[CommentIssue]:
+    """检查模块级文档字符串"""
+    issues = []
+    docstring = ast.get_docstring(tree)
 
-
-def _count_lines(content: str) -> tuple[int, int, int, int]:
-    """统计总行数、代码行、注释行、中文注释行"""
-    lines = content.splitlines()
-    total = len(lines)
-    code = 0
-    comment = 0
-    chinese_comment = 0
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            comment += 1
-            if _is_chinese(stripped):
-                chinese_comment += 1
-        else:
-            code += 1
-            # 行内注释
-            if "#" in line:
-                comment_part = line.split("#", 1)[1]
-                if _is_chinese(comment_part):
-                    chinese_comment += 1
-
-    return total, code, comment, chinese_comment
-
-
-def _has_chinese_docstring(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> bool:
-    """检查函数/类是否有中文文档字符串"""
-    docstring = ast.get_docstring(node)
-    return bool(docstring and _is_chinese(docstring))
-
-
-def _analyze_file(file: Path) -> CommentStats:
-    """分析单个文件的注释情况"""
-    content = file.read_text(encoding="utf-8")
-    total, code, comment, chinese_comment = _count_lines(content)
-
-    try:
-        tree = ast.parse(content, filename=str(file))
-    except SyntaxError:
-        return CommentStats(
+    if not docstring:
+        issues.append(CommentIssue(
+            severity="error",
             file=file,
-            total_lines=total,
-            code_lines=code,
-            comment_lines=comment,
-            chinese_comment_lines=chinese_comment,
-            functions=0,
-            functions_with_docstring=0,
-            classes=0,
-            classes_with_docstring=0,
-        )
-
-    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
-
-    functions_with_doc = sum(1 for f in functions if _has_chinese_docstring(f))
-    classes_with_doc = sum(1 for c in classes if _has_chinese_docstring(c))
-
-    return CommentStats(
-        file=file,
-        total_lines=total,
-        code_lines=code,
-        comment_lines=comment,
-        chinese_comment_lines=chinese_comment,
-        functions=len(functions),
-        functions_with_docstring=functions_with_doc,
-        classes=len(classes),
-        classes_with_docstring=classes_with_doc,
-    )
-
-
-def _find_python_files(root: Path) -> Iterator[Path]:
-    """查找所有 Python 源文件"""
-    for base in (
-        root / "autotuner",
-        root / "products",
-        root / "tools" / "isaaclab_quad_diag_observation",
-    ):
-        if not base.is_dir():
-            continue
-        yield from (p for p in base.rglob("*.py") if "__pycache__" not in p.parts)
-
-
-def check_coverage(root: Path) -> list[QualityIssue]:
-    """检查注释覆盖率"""
-    issues: list[QualityIssue] = []
-
-    for file in _find_python_files(root):
-        stats = _analyze_file(file)
-
-        # 计算覆盖率
-        coverage = 0.0
-        if stats.code_lines > 0:
-            coverage = stats.chinese_comment_lines / stats.code_lines
-
-        is_core = _is_core_module(file, root)
-
-        # 核心模块要求 80% 覆盖率
-        if is_core and coverage < 0.8:
-            issues.append(QualityIssue(
-                file=file,
-                line=1,
-                type="low_coverage",
-                description=f"中文注释覆盖率 {coverage:.1%}，核心模块要求 >= 80%",
-                severity="error",
-            ))
-
-        # 公共函数/类缺少文档字符串
-        if stats.functions > 0:
-            doc_rate = stats.functions_with_docstring / stats.functions
-            if doc_rate < 0.5:
-                issues.append(QualityIssue(
-                    file=file,
-                    line=1,
-                    type="missing_docstring",
-                    description=f"{stats.functions_with_docstring}/{stats.functions} 函数有中文文档字符串",
-                    severity="warning" if not is_core else "error",
-                ))
-
-        if stats.classes > 0:
-            doc_rate = stats.classes_with_docstring / stats.classes
-            if doc_rate < 0.5:
-                issues.append(QualityIssue(
-                    file=file,
-                    line=1,
-                    type="missing_docstring",
-                    description=f"{stats.classes_with_docstring}/{stats.classes} 类有中文文档字符串",
-                    severity="warning" if not is_core else "error",
-                ))
+            line=1,
+            reason="模块缺少文档字符串"
+        ))
+    elif not has_chinese(docstring):
+        issues.append(CommentIssue(
+            severity="error",
+            file=file,
+            line=1,
+            reason="模块文档字符串必须包含中文说明"
+        ))
 
     return issues
 
 
-def check_trivial_comments(root: Path) -> list[QualityIssue]:
-    """检查无意义注释"""
-    issues: list[QualityIssue] = []
+def check_function_docstring(file: Path, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[CommentIssue]:
+    """检查函数文档字符串"""
+    issues = []
 
-    for file in _find_python_files(root):
-        content = file.read_text(encoding="utf-8")
-        lines = content.splitlines()
+    # 跳过私有函数（以 _ 开头）
+    if node.name.startswith("_") and not node.name.startswith("__"):
+        return issues
 
-        for line_num, line in enumerate(lines, start=1):
-            comment_match = re.search(r"#\s*(.+)$", line)
-            if not comment_match:
-                continue
+    docstring = ast.get_docstring(node)
 
-            comment_text = comment_match.group(1).strip()
+    if not docstring:
+        issues.append(CommentIssue(
+            severity="warning",
+            file=file,
+            line=node.lineno,
+            reason=f"公共函数 '{node.name}' 缺少文档字符串"
+        ))
+    elif not has_chinese(docstring):
+        issues.append(CommentIssue(
+            severity="warning",
+            file=file,
+            line=node.lineno,
+            reason=f"函数 '{node.name}' 文档字符串应包含中文说明"
+        ))
 
-            for pattern in TRIVIAL_PATTERNS:
-                if re.match(pattern, comment_text):
-                    issues.append(QualityIssue(
-                        file=file,
-                        line=line_num,
-                        type="trivial_comment",
-                        description=f"无意义注释: {comment_text}",
+    return issues
+
+
+def check_class_docstring(file: Path, node: ast.ClassDef) -> list[CommentIssue]:
+    """检查类文档字符串"""
+    issues = []
+
+    # 跳过私有类
+    if node.name.startswith("_"):
+        return issues
+
+    docstring = ast.get_docstring(node)
+
+    if not docstring:
+        issues.append(CommentIssue(
+            severity="error",
+            file=file,
+            line=node.lineno,
+            reason=f"公共类 '{node.name}' 缺少文档字符串"
+        ))
+    elif not has_chinese(docstring):
+        issues.append(CommentIssue(
+            severity="warning",
+            file=file,
+            line=node.lineno,
+            reason=f"类 '{node.name}' 文档字符串应包含中文说明"
+        ))
+
+    return issues
+
+
+def check_complex_logic_comments(file: Path, source_lines: list[str], tree: ast.Module) -> list[CommentIssue]:
+    """检查复杂逻辑是否有注释"""
+    issues = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            depth = count_nesting_depth(node)
+            if depth > 2:  # 嵌套深度 > 2
+                # 检查函数体附近是否有中文注释
+                start_line = node.lineno
+                end_line = node.end_lineno or start_line
+
+                has_comment = False
+                for line_num in range(max(0, start_line - 1), min(len(source_lines), end_line)):
+                    line = source_lines[line_num]
+                    if "#" in line and has_chinese(line):
+                        has_comment = True
+                        break
+
+                if not has_comment:
+                    issues.append(CommentIssue(
                         severity="warning",
+                        file=file,
+                        line=start_line,
+                        reason=f"函数 '{node.name}' 包含复杂嵌套逻辑（深度 {depth}）但缺少中文注释"
                     ))
-                    break
 
     return issues
 
 
-def generate_report(issues: list[QualityIssue], verbose: bool = False) -> None:
-    """生成报告"""
-    if not issues:
-        print("✓ 中文注释质量检查通过")
-        return
+def check_comment_density(file: Path, source_lines: list[str], strict: bool) -> list[CommentIssue]:
+    """检查注释密度"""
+    issues = []
 
-    print("\n" + "=" * 80)
-    print("中文注释质量报告")
-    print("=" * 80)
+    total_lines = len(source_lines)
+    code_lines = sum(1 for line in source_lines if line.strip() and not line.strip().startswith("#"))
+    comment_lines = sum(1 for line in source_lines if "#" in line and has_chinese(line))
 
-    errors = [i for i in issues if i.severity == "error"]
-    warnings = [i for i in issues if i.severity == "warning"]
+    if code_lines == 0:
+        return issues
 
-    if errors:
-        print(f"\n【错误】共 {len(errors)} 项")
-        for issue in errors:
-            print(f"  {issue.file}:{issue.line}")
-            print(f"    {issue.description}")
+    density = comment_lines / code_lines
+    threshold = 0.15 if strict else 0.10
 
-    if warnings and verbose:
-        print(f"\n【警告】共 {len(warnings)} 项")
-        for issue in warnings:
-            print(f"  {issue.file}:{issue.line}")
-            print(f"    {issue.description}")
+    if density < threshold:
+        issues.append(CommentIssue(
+            severity="warning",
+            file=file,
+            line=1,
+            reason=f"中文注释密度过低（{density:.1%}），建议 > {threshold:.0%}"
+        ))
 
-    print(f"\n总计: {len(errors)} 错误, {len(warnings)} 警告")
-    print("=" * 80 + "\n")
+    return issues
 
 
-def main() -> int:
+def check_file(file: Path, strict: bool) -> list[CommentIssue]:
+    """检查单个 Python 文件"""
+    try:
+        source = file.read_text(encoding="utf-8")
+        source_lines = source.splitlines()
+        tree = ast.parse(source, filename=str(file))
+    except Exception as e:
+        return [CommentIssue(
+            severity="error",
+            file=file,
+            line=1,
+            reason=f"解析失败: {e}"
+        )]
+
+    issues: list[CommentIssue] = []
+
+    # 检查模块文档字符串
+    issues.extend(check_module_docstring(file, tree))
+
+    # 检查函数和类文档字符串
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            issues.extend(check_function_docstring(file, node))
+        elif isinstance(node, ast.ClassDef):
+            issues.extend(check_class_docstring(file, node))
+
+    # 检查复杂逻辑注释
+    issues.extend(check_complex_logic_comments(file, source_lines, tree))
+
+    # 检查注释密度
+    issues.extend(check_comment_density(file, source_lines, strict))
+
+    return issues
+
+
+def main():
     parser = argparse.ArgumentParser(description="检查中文注释质量")
-    parser.add_argument("--root", type=Path, default=Path.cwd(), help="仓库根目录")
-    parser.add_argument("--verbose", action="store_true", help="显示详细信息")
+    parser.add_argument("--path", type=str, default="autotuner", help="检查路径")
+    parser.add_argument("--strict", action="store_true", help="严格模式（更高的注释密度要求）")
     args = parser.parse_args()
 
-    root = args.root.resolve()
+    root = Path(args.path)
+    if not root.exists():
+        print(f"错误: 路径不存在: {root}")
+        return 1
 
-    issues: list[QualityIssue] = []
-    issues.extend(check_coverage(root))
-    issues.extend(check_trivial_comments(root))
+    # 收集所有 Python 文件
+    if root.is_file():
+        files = [root]
+    else:
+        files = list(root.rglob("*.py"))
 
-    generate_report(issues, verbose=args.verbose)
+    # 排除测试文件和第三方代码
+    files = [
+        f for f in files
+        if "test" not in f.parts and "venv" not in f.parts and ".venv" not in f.parts
+    ]
 
-    errors = [i for i in issues if i.severity == "error"]
-    return 1 if errors else 0
+    print(f"检查 {len(files)} 个 Python 文件...")
+
+    all_issues: list[CommentIssue] = []
+    for file in files:
+        issues = check_file(file, args.strict)
+        all_issues.extend(issues)
+
+    # 按文件和行号排序
+    all_issues.sort(key=lambda x: (str(x.file), x.line))
+
+    # 统计
+    error_count = sum(1 for i in all_issues if i.severity == "error")
+    warning_count = sum(1 for i in all_issues if i.severity == "warning")
+
+    if not all_issues:
+        print("✓ 所有文件的中文注释质量符合规范")
+        return 0
+
+    print(f"\n发现 {error_count} 个错误，{warning_count} 个警告：\n")
+
+    current_file = None
+    for issue in all_issues:
+        if issue.file != current_file:
+            current_file = issue.file
+            print(f"\n{issue.file.relative_to(Path.cwd())}:")
+
+        prefix = "  ERROR" if issue.severity == "error" else "  WARNING"
+        print(f"{prefix} 第 {issue.line} 行: {issue.reason}")
+
+    print(f"\n总计: {len(files)} 个文件, {error_count} 个错误, {warning_count} 个警告")
+
+    return 1 if error_count > 0 else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit(main())

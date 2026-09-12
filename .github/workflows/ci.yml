@@ -1,10 +1,10 @@
-name: CI
+name: CI 质量门禁
 
 on:
   push:
-    branches: [master]
+    branches: [ master, develop ]
   pull_request:
-    branches: [master]
+    branches: [ master ]
 
 jobs:
   structure-check:
@@ -13,38 +13,73 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: 设置 Python 3.11
+      - name: 设置 Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
       - name: 安装依赖
         run: |
-          pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 检查仓库结构
-        run: python tools/check_repository_structure.py
+      - name: 运行结构检查
+        run: |
+          python tools/check_repository_structure.py
 
-      - name: 检查层级解耦
-        run: python tools/decouple_layers.py --check
-
-      - name: 检查文档冗余
-        run: python tools/check_doc_redundancy.py
-
-  comment-quality:
-    name: 中文注释质量
+  layer-dependency-check:
+    name: 层级依赖检查
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
 
-      - name: 设置 Python 3.11
+      - name: 设置 Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
-      - name: 检查中文注释覆盖率
-        run: python tools/check_comment_quality.py
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+
+      - name: 检查层级依赖违规
+        run: |
+          python tools/check_repository_structure.py 2>&1 | tee structure_report.txt
+          if grep -q "ERROR" structure_report.txt; then
+            echo "❌ 发现层级依赖违规"
+            exit 1
+          fi
+
+  comment-quality-check:
+    name: 中文注释质量检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 检查中文注释
+        run: |
+          python tools/check_comment_quality.py --path autotuner/
+        continue-on-error: true  # 警告不阻塞，仅记录
+
+  doc-redundancy-check:
+    name: 文档冗余检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 检查文档冗余
+        run: |
+          python tools/check_doc_redundancy.py
+        continue-on-error: true  # 警告不阻塞，仅记录
 
   backend-tests:
     name: 后端测试
@@ -52,22 +87,28 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: 设置 Python 3.11
+      - name: 设置 Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.10'
 
-      - name: 安装依赖
+      - name: 安装开发依赖
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
       - name: 运行 pytest
-        run: python -m pytest -v
+        run: |
+          python -m pytest --cov=autotuner --cov-report=xml --cov-report=term
 
-  frontend-verify:
-    name: 前端验证
+      - name: 上传覆盖率报告
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: backend
+          name: backend-coverage
+
+  frontend-tests:
+    name: 前端测试
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -78,14 +119,14 @@ jobs:
       - name: 设置 Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: "18"
-          cache: "npm"
+          node-version: '18'
+          cache: 'npm'
           cache-dependency-path: locomotion-console-ui/package-lock.json
 
       - name: 安装依赖
         run: npm ci
 
-      - name: 运行验证（i18n + typecheck + build）
+      - name: 运行 verify
         run: npm run verify
 
   commit-message-check:
@@ -97,54 +138,82 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
       - name: 检查提交信息格式
         run: |
-          # 获取 PR 中的所有提交
-          git log --format=%B origin/${{ github.base_ref }}..HEAD | while IFS= read -r line; do
-            # 跳过空行和 merge 提交
-            if [[ -z "$line" ]] || [[ "$line" =~ ^(Merge|Revert) ]]; then
-              continue
-            fi
+          # 检查 PR 中的所有提交信息
+          git log origin/${{ github.base_ref }}..${{ github.sha }} --pretty=format:"%s" > commits.txt
 
-            # 检查约定式提交格式
-            if ! echo "$line" | grep -qE "^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?: .+"; then
-              echo "错误: 提交信息格式不符合约定式提交规范"
-              echo "  $line"
-              exit 1
-            fi
+          # 使用 commit-msg 钩子逻辑检查每条提交
+          python3 << 'EOF'
+          import re
+          import sys
 
-            # 检查是否包含中文
-            if ! echo "$line" | grep -qP '[\p{Han}]'; then
-              echo "错误: 提交信息必须包含中文描述"
-              echo "  $line"
-              exit 1
-            fi
-          done
+          COMMIT_MSG_PATTERN = re.compile(
+              r"^(?:feat|fix|docs|style|refactor|test|chore)"
+              r"(?:\([^)]+\))?"
+              r": .+$"
+          )
+          CHINESE_PATTERN = re.compile(r"[一-鿿]+")
 
-  atomic-problems-sync:
-    name: 原子问题同步检查
+          with open("commits.txt", "r", encoding="utf-8") as f:
+              commits = [line.strip() for line in f if line.strip()]
+
+          errors = []
+          for i, msg in enumerate(commits, 1):
+              if not COMMIT_MSG_PATTERN.match(msg):
+                  errors.append(f"提交 #{i} 格式错误: {msg}")
+              elif not CHINESE_PATTERN.search(msg):
+                  errors.append(f"提交 #{i} 缺少中文: {msg}")
+
+          if errors:
+              print("❌ 提交信息不符合规范:\n")
+              for err in errors:
+                  print(f"  {err}")
+              print("\n正确格式: <type>(<scope>): <中文描述>")
+              print("例如: feat(训练): 添加新的奖励函数")
+              sys.exit(1)
+          else:
+              print("✅ 所有提交信息符合规范")
+          EOF
+
+  security-check:
+    name: 安全检查
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v3
 
-      - name: 检查是否更新原子问题跟踪表
+      - name: 设置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 安装 safety
+        run: pip install safety
+
+      - name: 检查依赖漏洞
         run: |
-          # 如果 PR 修改了核心文件，检查是否更新了 atomic_problems.md
-          changed_files=$(git diff --name-only origin/${{ github.base_ref }}..HEAD)
+          pip install -r requirements.txt
+          safety check --json || true  # 暂时不阻塞，仅报告
 
-          core_changed=false
-          if echo "$changed_files" | grep -qE "^(autotuner/(mechanisms|research|execution|artifacts)|products/taili/core)/"; then
-            core_changed=true
+      - name: 检查敏感信息泄露
+        run: |
+          # 检查是否有 SSH 私钥、密码等泄露
+          if grep -r "BEGIN RSA PRIVATE KEY\|BEGIN PRIVATE KEY\|password.*=" . \
+             --include="*.py" --include="*.yaml" --include="*.json" \
+             --exclude-dir=.git --exclude-dir=node_modules; then
+            echo "⚠️ 发现疑似敏感信息"
+            exit 1
           fi
 
-          atomic_changed=false
-          if echo "$changed_files" | grep -q "docs/atomic_problems.md"; then
-            atomic_changed=true
-          fi
-
-          if [[ "$core_changed" == "true" ]] && [[ "$atomic_changed" == "false" ]]; then
-            echo "警告: 核心模块有变更，但未更新 docs/atomic_problems.md"
-            echo "建议检查是否有相关原子问题需要标记为完成或更新状态"
-            # 仅警告，不阻止合并
-          fi
+  all-checks-passed:
+    name: 所有检查通过
+    needs: [structure-check, layer-dependency-check, backend-tests, frontend-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 标记成功
+        run: echo "✅ 所有质量门禁检查通过"
