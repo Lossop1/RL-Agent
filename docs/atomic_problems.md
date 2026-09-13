@@ -18,15 +18,22 @@
   - autotuner/simulation/simulator_protocol.py (SimulatorBackend协议，191行)
   - autotuner/simulation/isaaclab_adapter.py (IsaacLabAdapter适配器，178行)
   - autotuner/simulation/backend_factory.py (create_backend工厂函数，62行)
+  - tools/verify_isaaclab_adapter_equivalence.py (等价性验证工具，271行)
   - tests/autotuner/simulation/ (38个测试全部通过)
 - **进度**：
   - ✅ 步骤1：定义SimulatorBackend协议（16个测试通过）
   - ✅ 步骤2：实现IsaacLabAdapter（17个测试通过）
   - ✅ 步骤3a：实现create_backend工厂函数（5个测试通过）
-  - 🔄 步骤3b：重构训练入口使用后端抽象（进行中）
-  - ⏳ 步骤4：验证等价性（MAE < 1e-6）
+  - ✅ 步骤3b：重构训练入口使用后端抽象（5个入口已迁移）
+  - ⏳ 步骤4：验证等价性（验证工具已就绪，等待IsaacLab环境）
   - ⏳ 步骤5：实现MuJoCoAdapter
   - ⏳ 步骤6：跨后端验证（< 5%差异）
+- **已迁移训练入口**：
+  - products/taili/blind_locomotion/train_taili.py
+  - products/taili/blind_locomotion/diagnose_taili.py
+  - products/taili/blind_locomotion/physeval_blind.py
+  - products/taili/blind_locomotion/physeval_blind_e.py
+  - products/taili/blind_locomotion/calibrate_taili_gates.py
 
 ### P6.2 奖励函数数学验证
 - **问题**：奖励项的数学正确性和数值稳定性
