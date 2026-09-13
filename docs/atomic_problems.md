@@ -55,8 +55,17 @@
 - **实现位置**：
   - products/taili/core/taili_normalization.py (RunningMeanStd类，157行)
   - tests/products/taili/core/test_taili_normalization.py (14个单元测试+统计测试)
-- **验证结果**：全部测试通过，包括95%置信区间验证、Welford算法稳定性、检查点保存/加载
-- **集成状态**：待集成到terrain_perceiver_policy.py（设计完成）
+  - products/taili/blind_locomotion/terrain_perceiver_policy.py (集成完成，行72-86)
+  - tests/products/taili/blind_locomotion/test_terrain_perceiver_normalization.py (9个集成测试)
+- **验证结果**：
+  - 单元测试：14个测试全部通过（Welford算法、95%置信区间、检查点保存/加载）
+  - 集成测试：9个测试覆盖训练/评估模式、统计量更新、检查点持久化
+  - 集成状态：已集成到TerrainPerceiverPolicy.compute()流程
+- **集成设计**：
+  - 训练模式：每个batch自动更新running statistics
+  - 评估模式：使用冻结统计量进行归一化
+  - 检查点：obs_normalizer状态自动包含在policy state_dict中
+  - 可配置：use_obs_normalization参数支持禁用归一化
 
 ### P6.4 接触力模型校准
 - **问题**：仿真接触力与真实硬件的一致性
@@ -329,12 +338,10 @@
 8. **Taili 机器人产品**：131 个文件，包含完整的奖励/观测/课程实现
 
 ### 需要优先完成的问题
-1. **P3.2 远程执行抽象**：workflow审计发现仅3-4处待迁移（research_remote.py），2-3小时可完成
-2. **P6.3 观测归一化集成**：RunningMeanStd类已完成，待集成到terrain_perceiver_policy.py
-3. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待GPU运行时环境
-4. **P6.4 接触力校准**：需要真实硬件数据
-5. **P4.3 训练恢复**：检查点管理已有，但精确恢复逻辑待验证
-6. **P4.4 超参数搜索**：框架已就位，搜索空间定义待完成
+1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待GPU运行时环境
+2. **P6.4 接触力校准**：需要真实硬件数据
+3. **P4.3 训练恢复**：检查点管理已有，但精确恢复逻辑待验证
+4. **P4.4 超参数搜索**：框架已就位，搜索空间定义待完成
 
 ### 层级解耦评估
 - **Layer 6 → 5**：观测/奖励契约通过 policy_contract.py 隔离，符合设计
