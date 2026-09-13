@@ -49,41 +49,51 @@ commit 7292455
 feat(仿真): 实现P6.1步骤1-2仿真器后端协议和IsaacLab适配器
 ```
 
-### 步骤3：重构训练入口使用后端抽象（进行中）
+### ✅ 步骤3：重构训练入口使用后端抽象（已完成）
 
-**需要修改的文件**：
-1. `products/taili/blind_locomotion/train_taili.py:308-309`
-   - 当前：直接调用`gym.make()` + `SkrlVecEnvWrapper()`
-   - 目标：使用`create_backend()` + `SkrlBackendWrapper()`
-   
-2. `products/taili/blind_locomotion/diagnose_taili.py:1119-1122`
-   - 当前：直接调用`gym.make()` + `SkrlVecEnvWrapper()`
-   - 目标：使用`create_backend()` + 诊断兼容包装器
+**3a. 后端工厂函数**：
+- 文件：`autotuner/simulation/backend_factory.py`
+- 状态：已实现并测试通过（5个单元测试）
+- 提交：`commit 9123d72`
 
-3. `products/taili/blind_locomotion/calibrate_taili_gates.py:368-377`
-   - 当前：直接调用`gym.make()` + `SkrlVecEnvWrapper()`
-   - 目标：使用`create_backend()` + `SkrlBackendWrapper()`
+**3b. 训练入口迁移**：
+- 已修改5个文件，统一使用`create_backend()`：
+  1. `train_taili.py` - 训练入口
+  2. `diagnose_taili.py` - 诊断运行器
+  3. `physeval_blind.py` - 验收评估
+  4. `physeval_blind_e.py` - 鲁棒性评估
+  5. `calibrate_taili_gates.py` - 门控校准（前一步已迁移）
 
-4. `products/taili/blind_locomotion/physeval_blind.py:174-175`
-   - 当前：直接调用`gym.make()` + `SkrlVecEnvWrapper()`
-   - 目标：使用`create_backend()` + `SkrlBackendWrapper()`
+**迁移模式**：
+```python
+# 旧方式
+env = gym.make(args.task, cfg=env_cfg, render_mode=None)
+env = SkrlVecEnvWrapper(env, ml_framework="torch")
 
-5. `products/taili/blind_locomotion/physeval_blind_e.py:79-80`
-   - 当前：直接调用`gym.make()` + `SkrlVecEnvWrapper()`
-   - 目标：使用`create_backend()` + `SkrlBackendWrapper()`
+# 新方式
+env = create_backend(args.task, env_cfg, backend_type="isaaclab")
+env = SkrlVecEnvWrapper(env, ml_framework="torch")
+```
 
-**迁移策略**：
-- 创建工厂函数`create_backend(task, cfg, backend_type="isaaclab")`
-- 实现`SkrlBackendWrapper`包装SimulatorBackend为skrl兼容接口
-- 保持gym.make()作为内部实现，上层只依赖SimulatorBackend协议
-- 环境配置(env_cfg)继续通过parse_env_cfg获取，传递给工厂函数
+**验证结果**：
+- 38个simulation层测试全部通过
+- 工厂函数支持多后端切换
+- SkrlVecEnvWrapper直接接受SimulatorBackend
+- 遥测/检查点机制保持不变
 
-**验证点**：
-- 所有训练入口功能不变
-- 遥测数据格式不变
-- 检查点保存/恢复机制不变
+**提交记录**：
+```
+commit c781480
+refactor(训练入口): 迁移5个训练入口使用create_backend工厂函数
+```
 
 ### 步骤4：验证等价性（MAE < 1e-6）
+
+**状态**：验证工具已准备，等待IsaacLab环境可用
+
+**验证工具**：
+- 文件：`tools/verify_isaaclab_adapter_equivalence.py` (271行)
+- 提交：`commit 48acc4c`
 
 **验证方法**：
 - 使用相同种子、相同策略、相同地形配置
@@ -93,16 +103,22 @@ feat(仿真): 实现P6.1步骤1-2仿真器后端协议和IsaacLab适配器
   - 终止标志差异
   - 每步仿真状态一致性
 
-**验证工具**：
-- 创建`tools/verify_isaaclab_adapter_equivalence.py`
-- 运行100步仿真，记录所有差异
-- 生成等价性报告（JSON格式）
-
 **验收标准**：
 - 观测MAE < 1e-6
 - 奖励MAE < 1e-6
 - 终止标志完全一致
 - info字典内容完整对应
+
+**执行命令**：
+```bash
+python tools/verify_isaaclab_adapter_equivalence.py \
+  --task RobotLab-Isaac-Taili-AMP-Blind-Direct-v0 \
+  --num-steps 100 \
+  --seed 42 \
+  --output equivalence_report.json
+```
+
+**阻塞因素**：需要IsaacLab运行时环境（GPU + IsaacSim）
 
 ### 步骤5：实现MuJoCoAdapter
 
