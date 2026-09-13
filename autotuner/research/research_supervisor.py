@@ -5,6 +5,11 @@ execution classes below add an explicit, leased boundary for experiments:
 candidate files are copied into an isolated directory, the backend is the only
 process launcher, and promotion changes a managed pointer atomically.  No
 checkpoint or payload is deleted as part of rollback.
+
+Extended with parallel execution support: execute_async() for non-blocking starts,
+poll_execution() for status checks, and finalize_execution() for evaluation.
+These methods enable the ResearchScheduler to orchestrate multiple concurrent
+experiments while reusing the core execution logic.
 """
 from __future__ import annotations
 
@@ -284,6 +289,23 @@ class ExperimentExecution:
     protected_results: Mapping[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class AsyncExecutionHandle:
+    """Handle for tracking async experiment execution.
+
+    Returned by execute_async() and used with poll_execution() and finalize_execution().
+    Contains all state needed to poll and finalize an experiment without blocking.
+    """
+    experiment_ref: str
+    workspace: Path
+    candidate: Path
+    backend_handle: BackendHandle
+    lease: ResourceLease
+    plan: ExperimentPlan
+    started_at: float
+    max_seconds: float
+
+
 class ResearchSupervisor:
     """Execute one approved experiment with explicit resource and artifact boundaries."""
 
@@ -426,6 +448,152 @@ class ResearchSupervisor:
             return ExperimentExecution(plan.id, disposition, str(workspace), lease.lease_id, status.state, evaluation=evaluation, protected_results=protected)
         finally:
             self.lease_store.release(lease)
+
+    def execute_async(
+        self,
+        plan: ExperimentPlan,
+        candidate_artifact: str | os.PathLike[str],
+        *,
+        actor: str,
+        environment: Mapping[str, str] | None = None,
+    ) -> AsyncExecutionHandle:
+        """Start experiment without blocking (for parallel scheduler).
+
+        Returns a handle that can be polled with poll_execution() and finalized
+        with finalize_execution(). The lease is acquired and workspace prepared,
+        but the caller must release the lease after finalize_execution().
+
+        Args:
+            plan: Approved experiment plan
+            candidate_artifact: Path to candidate directory or file
+            actor: Experiment owner for lease tracking
+            environment: Environment variable overrides
+
+        Returns:
+            AsyncExecutionHandle containing all state needed for polling/finalization
+
+        Raises:
+            RuntimeError: If plan is not approved
+            FileNotFoundError: If candidate artifact or mechanism bundle is missing
+        """
+        if plan.status not in {"approved", "executing"}:
+            raise RuntimeError(f"experiment is not approved: {plan.status}")
+
+        resources = plan.resource_budget.get("resources", ["gpu:0"])
+        if not isinstance(resources, list):
+            raise ValueError("resource_budget.resources must be a list")
+
+        ttl = float(plan.resource_budget.get("lease_ttl_s", 3600.0))
+        lease = self.lease_store.acquire(resources, owner=actor, ttl_s=ttl)
+
+        try:
+            workspace = self._workspace(plan)
+            workspace.mkdir(parents=True, exist_ok=False)
+            candidate = self._copy_candidate(candidate_artifact, workspace)
+
+            (workspace / "execution.json").write_text(json.dumps({
+                "experiment_ref": plan.id,
+                "candidate_artifact": str(candidate_artifact),
+                "lease_id": lease.lease_id,
+                "actor": actor,
+            }, indent=2) + "\n", encoding="utf-8")
+
+            env = self._environment(environment, plan)
+            env["RL_RESEARCH_EXPERIMENT_REF"] = plan.id
+            env["RL_RESEARCH_CANDIDATE_ROOT"] = str(candidate)
+
+            mechanism_bundle = candidate / "mechanisms.json"
+            if not mechanism_bundle.is_file():
+                raise FileNotFoundError(f"candidate mechanism bundle is missing: {mechanism_bundle}")
+            env["RL_MECHANISM_BUNDLE"] = str(mechanism_bundle)
+
+            backend_handle = self.backend.start(plan, workspace, env)
+            max_seconds = float(plan.training_window.get("max_seconds", plan.resource_budget.get("max_seconds", 3600.0)))
+
+            return AsyncExecutionHandle(
+                experiment_ref=plan.id,
+                workspace=workspace,
+                candidate=candidate,
+                backend_handle=backend_handle,
+                lease=lease,
+                plan=plan,
+                started_at=_now_epoch(),
+                max_seconds=max_seconds,
+            )
+        except Exception:
+            self.lease_store.release(lease)
+            raise
+
+    def poll_execution(
+        self,
+        handle: AsyncExecutionHandle,
+    ) -> tuple[BackendStatus, bool]:
+        """Poll async experiment status without blocking.
+
+        Args:
+            handle: Handle returned by execute_async()
+
+        Returns:
+            (BackendStatus, timeout_exceeded) tuple
+                - BackendStatus with current state
+                - bool indicating if training window timeout was exceeded
+        """
+        status = self.backend.poll(handle.backend_handle)
+        elapsed = _now_epoch() - handle.started_at
+        timeout_exceeded = elapsed >= handle.max_seconds
+
+        if timeout_exceeded and status.state == "running":
+            self.backend.stop(handle.backend_handle, "training_window_timeout")
+            status = BackendStatus("stopped", status.step, "training_window_timeout", status.metrics)
+
+        return status, timeout_exceeded
+
+    def finalize_execution(
+        self,
+        handle: AsyncExecutionHandle,
+        final_status: BackendStatus,
+        stop_reason: str = "",
+    ) -> ExperimentExecution:
+        """Evaluate and finalize experiment after completion.
+
+        Should be called after poll_execution() returns a non-running state.
+        The caller must release handle.lease after this returns.
+
+        Args:
+            handle: Handle returned by execute_async()
+            final_status: Final BackendStatus from poll_execution()
+            stop_reason: Optional reason for early stop
+
+        Returns:
+            ExperimentExecution with evaluation and disposition
+        """
+        if final_status.state in {"failed", "stopped"}:
+            return ExperimentExecution(
+                handle.experiment_ref,
+                "rollback",
+                str(handle.workspace),
+                handle.lease.lease_id,
+                final_status.state,
+                stop_reason or final_status.message
+            )
+
+        evaluation = self.backend.evaluate(handle.plan, handle.workspace)
+        protected = self._protected_results(evaluation, handle.plan)
+        disposition = self._decide(evaluation, protected)
+
+        if disposition == "promote":
+            self._set_active_pointer(handle.candidate, experiment_ref=handle.experiment_ref)
+
+        return ExperimentExecution(
+            handle.experiment_ref,
+            disposition,
+            str(handle.workspace),
+            handle.lease.lease_id,
+            final_status.state,
+            evaluation=evaluation,
+            protected_results=protected
+        )
+
 
 
 LIFECYCLE_TRANSITIONS: dict[str, dict[str, set[str]]] = {

@@ -1,0 +1,383 @@
+{
+  "investigation_scope": "Layer 2 (Task Orchestration & Remote Deployment) and Layer 3 (Research Coordination & Evidence Arbitration)",
+  "timestamp": "2026-09-12",
+  "atomic_problems_analyzed": [15, 16, 17, 18, 19, 20, 21, 22, 23],
+  "findings": [
+    {
+      "problem_id": 19,
+      "name": "Payload 完整性 - 能否将所有训练代码、资产、配置打包并哈希验证",
+      "layer": 2,
+      "status": "已实现",
+      "implementation_status": "complete",
+      "key_files": [
+        "autotuner/execution/payload.py",
+        "autotuner/execution/hashing.py",
+        "autotuner/product/payload.py"
+      ],
+      "implementation_details": {
+        "manifest_schema": "rl-agent.payload-manifest/v1",
+        "features": [
+          "PayloadManifest: immutable manifest with product_id, version, contract/runtime/source digests",
+          "build_payload_manifest: deterministic manifest from staged files with SHA256",
+          "verify_payload: checks missing/extra/hash-mismatched files",
+          "verify_payload_archive: validates tar archive before upload (symlink/traversal rejection)",
+          "Embedded manifest in archive with checksum verification"
+        ],
+        "integrity_guarantees": [
+          "Content-addressed by payload_digest (SHA256 of unsigned manifest)",
+          "Per-file SHA256 + size verification",
+          "Archive verified locally before remote transport",
+          "Rejects absolute paths, .., symlinks, unsafe members"
+        ]
+      },
+      "risks": [],
+      "blocking_level": "低"
+    },
+    {
+      "problem_id": 20,
+      "name": "远程部署原子性 - 能否原子性地激活新 payload，失败时不污染环境",
+      "layer": 2,
+      "status": "已实现",
+      "implementation_status": "complete",
+      "key_files": [
+        "autotuner/execution/deployment.py"
+      ],
+      "implementation_details": {
+        "deployment_schema": "rl-agent.remote-deployment/v1",
+        "features": [
+          "VersionedRemoteDeployer: content-addressed runtime/payload staging",
+          "Immutable artifact directories under /root/gpufree-data/rl-agent/{runtimes,payloads,runs}",
+          "stage_runtime: runtime descriptor uploaded with SHA256 check",
+          "stage_payload: archive extracted to staging dir, then atomic mv -T to final",
+          "activate_run: run manifest atomically linked via active.json pointer",
+          "_atomic_active_pointer: atomic file replace with previous pointer backup",
+          "rollback_active: revert to a known-good immutable run"
+        ],
+        "atomicity_guarantees": [
+          "Staging in .staging-* temp dirs, then atomic rename to immutable identity",
+          "Concurrent deploy races handled: reuse if SHA256 matches",
+          "Failed deploy leaves staging dir, never touches immutable final",
+          "Active pointer updated atomically via temp file + mv -f"
+        ]
+      },
+      "risks": [
+        "Relies on POSIX mv -T atomicity; no distributed lock across multiple deployers",
+        "Staging cleanup is best-effort; orphaned .staging-* dirs accumulate on failures"
+      ],
+      "blocking_level": "低"
+    },
+    {
+      "problem_id": 21,
+      "name": "进程生命周期管理 - 能否启动/暂停/恢复/终止远程训练进程",
+      "layer": 2,
+      "status": "部分实现",
+      "implementation_status": "partial",
+      "key_files": [
+        "autotuner/execution/training.py",
+        "autotuner/infrastructure/remote.py"
+      ],
+      "implementation_details": {
+        "training_start_schema": "rl-agent.training-start/v1",
+        "features_implemented": [
+          "VersionedRemoteTrainingStarter: validated plan launch in tmux",
+          "tmux session lifecycle: create, send command, verify process by pgrep",
+          "RemoteSSH.tmux_reset: kill + create + pipe_pane (single-call pattern)",
+          "RemoteSSH.tmux_send: inject command as if typed",
+          "RemoteSSH.kill_train_procs: SIGKILL by process pattern",
+          "Process pattern validation and 5-attempt pgrep probe after launch"
+        ],
+        "features_missing": [
+          "暂停 (pause): 无 SIGSTOP/SIGCONT 实现",
+          "恢复 (resume from pause): 无暂停态管理",
+          "优雅终止 (graceful shutdown): 仅有 SIGKILL，无 SIGTERM + wait + fallback SIGKILL"
+        ]
+      },
+      "risks": [
+        "SIGKILL 不给进程保存检查点机会，可能丢失最后一次保存后的训练进度",
+        "No pause/resume: 临时暂停需要 kill 整个进程，无法暂停 GPU 计算但保留内存",
+        "tmux pipe-pane 的 -o 标志是 toggle，第二次调用会关闭管道而不是切换路径",
+        "No background job management framework: 进程终止通知依赖轮询"
+      ],
+      "blocking_level": "中"
+    },
+    {
+      "problem_id": 22,
+      "name": "日志与遥测采集 - 能否实时拉取训练日志、tensorboard 指标",
+      "layer": 2,
+      "status": "部分实现",
+      "implementation_status": "partial",
+      "key_files": [
+        "autotuner/locomotion_console/telemetry.py",
+        "autotuner/infrastructure/remote.py"
+      ],
+      "implementation_details": {
+        "features_implemented": [
+          "parse_telemetry_jsonl: 解析 train.telemetry.jsonl 的实时遥测流",
+          "parse_training_log: fallback 解析 [TPREW]/[TPSTAT]/[TPCMD] 语义日志",
+          "RemoteSSH.exec_out: 远程命令执行获取日志尾部",
+          "RemoteSSH.get: SFTP 下载远程文件",
+          "build_run_snapshot: 从遥测构建指标快照、约束、阻塞项",
+          "Telemetry provenance tracking: 追踪 JSONL/log/console/tensorboard/checkpoint 路径",
+          "_gate_thresholds_from_config: 从 effective_config.yaml 读取阈值"
+        ],
+        "features_missing": [
+          "实时 TensorBoard 指标拉取：有路径追踪，无 tfevents 解析器",
+          "流式采集：当前是轮询 + tail，无 inotify/WebSocket 推送",
+          "结构化日志采集 API：散布在 datasource/telemetry，无统一采集入口"
+        ],
+        "data_sources": [
+          "train.telemetry.jsonl (primary)",
+          "train.log ([TP*] semantic lines, fallback)",
+          "console.log (full stdout/stderr)",
+          "effective_config.yaml (thresholds)",
+          "tensorboard tfevents (tracked but not parsed)"
+        ]
+      },
+      "risks": [
+        "Telemetry 依赖 payload 写入 JSONL；旧 payload 只有日志 fallback，指标不完整",
+        "无 tensorboard 实时曲线：acceptance 依赖最终结果，中途曲线分析需手动",
+        "轮询延迟：无推送通知，发现问题可能滞后数个采样周期",
+        "SFTP get 无断点续传，大日志文件拉取失败需要重来"
+      ],
+      "blocking_level": "中"
+    },
+    {
+      "problem_id": 23,
+      "name": "SSH 连接鲁棒性 - 网络抖动时能否自动重连、不丢失状态",
+      "layer": 2,
+      "status": "部分实现",
+      "implementation_status": "partial",
+      "key_files": [
+        "autotuner/infrastructure/remote.py"
+      ],
+      "implementation_details": {
+        "features_implemented": [
+          "RemoteSSH: persistent paramiko client with reconnect",
+          "_ensure_connected: auto-reconnect on EOF/SSHException",
+          "exec with exponential backoff: min(2**attempt, 30) seconds, 5 retries default",
+          "put/get with backoff: 3 retries default",
+          "Host key verification: trust-on-first-use (TOFU) + persist to detect later MITM"
+        ],
+        "reconnect_guarantees": [
+          "EOF/SSHException trigger close + reconnect",
+          "Exponential backoff prevents SSH server overload",
+          "Each exec/put/get call is idempotent at retry boundary"
+        ]
+      },
+      "risks": [
+        "无连接池：每个 RemoteSSH 实例是单连接，并发操作串行化",
+        "无状态恢复：重连后 tmux 会话仍在，但 RemoteSSH._pipe_set 标志丢失（内存态）",
+        "SSH keep-alive 未配置：长时间空闲可能被防火墙断开",
+        "Retry 只在单次调用内生效：上层轮询循环遇到断线会立即失败，无跨调用重连",
+        "No circuit breaker: 持续失败时无熔断，继续重试浪费资源"
+      ],
+      "blocking_level": "中"
+    },
+    {
+      "problem_id": 15,
+      "name": "候选生成 - 能否根据当前瓶颈自动提出奖励/课程调整候选",
+      "layer": 3,
+      "status": "已实现",
+      "implementation_status": "complete",
+      "key_files": [
+        "autotuner/mechanisms/mechanism_synthesis.py",
+        "autotuner/research/research_cycle.py"
+      ],
+      "implementation_details": {
+        "features": [
+          "MechanismSynthesizer.synthesize: 根据 SynthesisRequest (gaps, baseline) 生成候选",
+          "SynthesisCandidate: mechanism patch + predictions + fingerprint",
+          "ResearchCycleManager.propose: 合成、验证、选择最优候选",
+          "Gap-driven synthesis: signal.name, bad/good bounds, desired direction, evidence_refs",
+          "Fingerprint deduplication: no_repeat_fingerprints prevents repeated rejected candidates",
+          "Validation before artifact compilation: 只有 validation.ok 的候选才编译 artifact"
+        ],
+        "selection_criteria": [
+          "1000 * error_count + 10 * warning_count + operation_count + 0.5 * guard_count",
+          "Occam's razor: 更少操作、更少 guard 的有效候选优先"
+        ]
+      },
+      "risks": [
+        "Synthesis logic 不在此次调研文件中，无法确认生成算法完整性",
+        "Gap → Candidate 映射依赖 LLM/规则生成器，black box"
+      ],
+      "blocking_level": "低"
+    },
+    {
+      "problem_id": 16,
+      "name": "实验编排 - 能否并行运行多个候选、管理资源、避免冲突",
+      "layer": 3,
+      "status": "部分实现",
+      "implementation_status": "partial",
+      "key_files": [
+        "autotuner/research/research_supervisor.py"
+      ],
+      "implementation_details": {
+        "features_implemented": [
+          "ResourceLeaseStore: filesystem-based lease for GPU/Isaac experiments",
+          "Lease acquisition with conflict check: requested resources vs active leases",
+          "Lease TTL (default 3600s) with auto-expiry",
+          "ResearchSupervisor.execute: single experiment execution with workspace isolation",
+          "ExperimentBackend protocol: start, poll, stop, evaluate",
+          "CommandExperimentBackend: subprocess-based local/remote command wrapper"
+        ],
+        "features_missing": [
+          "并行编排：无 parallel experiment scheduler，只有单实验 execute",
+          "资源池管理：lease 只是互斥锁，无 GPU pool / priority queue",
+          "实验队列：无 pending queue，无优先级，无 backfill",
+          "分布式 lease：filesystem lock 无法跨机器，多训练机需外部协调"
+        ]
+      },
+      "risks": [
+        "单机串行：当前 ResearchSupervisor 一次只运行一个实验，多候选需人工循环",
+        "Lease store 是本地文件锁：多客户端竞争时有 race condition (120s stale timeout)",
+        "No preemption: 低优先级实验无法被高优先级抢占",
+        "No resource quota: 无法限制单实验/用户的 GPU 时长"
+      ],
+      "blocking_level": "高"
+    },
+    {
+      "problem_id": 17,
+      "name": "证据收集 - 训练指标、物理验收、对比基线的证据是否完整",
+      "layer": 3,
+      "status": "已实现",
+      "implementation_status": "complete",
+      "key_files": [
+        "autotuner/locomotion_console/telemetry.py",
+        "products/taili/ops/acceptance_run.py",
+        "autotuner/locomotion_console/evidence_router.py",
+        "autotuner/research/research_ledger.py"
+      ],
+      "implementation_details": {
+        "evidence_types": [
+          "Training telemetry: RunSnapshot with metrics, blockers, provenance",
+          "Physical acceptance: run_acceptance on remote, aggregate per-terrain scorecards",
+          "Baseline comparison: ResearchLedgerStore tracks BaselineSet, ContractBundle",
+          "Diagnostic reports: physeval_blind/physeval_blind_e with per-gate verdicts",
+          "Evidence routing: EvidenceSource registry (12+ source types)"
+        ],
+        "acceptance_pipeline": [
+          "acceptance_run.py: SSH + physeval_blind runner per terrain",
+          "acceptance_aggregate.py: merge scorecards, compute verdict",
+          "Per-gate detail: A1..F2 with ok/detail, fall_rate secondary sort",
+          "BEST_CHECKPOINT.json: auto-update registry for highest-scoring checkpoint"
+        ],
+        "evidence_provenance": [
+          "DataProvenanceItem: tracks telemetry/log/checkpoint/config paths",
+          "evidence_refs in gaps/decisions: links to source artifacts",
+          "ResearchLedgerStore: immutable append-only event log"
+        ]
+      },
+      "risks": [
+        "Acceptance 依赖远程 physeval 运行：如果训练进程占用 GPU 会 OOM，需 --force 或手动暂停",
+        "Baseline comparison 在 ledger 中是结构化记录，但 diff/comparison tool 不在调研文件中",
+        "Evidence router 是静态映射，无动态证据收集策略（如 A/B test 自动设计）"
+      ],
+      "blocking_level": "低"
+    },
+    {
+      "problem_id": 18,
+      "name": "决策自动化 - 能否根据证据自动选择最佳候选、拒绝劣化候选",
+      "layer": 3,
+      "status": "部分实现",
+      "implementation_status": "partial",
+      "key_files": [
+        "autotuner/research/research_cycle.py",
+        "autotuner/research/outcome_learning.py"
+      ],
+      "implementation_details": {
+        "features_implemented": [
+          "ResearchCycleManager.propose: auto-select best valid candidate by selection_score",
+          "DecisionRecord: logs trigger, evidence_refs, selected/rejected options with reasons",
+          "OutcomeLearner.learn: extract outcome from execution and update research state",
+          "Rejection reasons: validation_failed, higher_occam_score",
+          "State update: pending_interventions, no_repeat_fingerprints, case status"
+        ],
+        "decision_criteria": [
+          "Validation must pass (no errors)",
+          "Lowest selection_score among valid candidates (Occam's razor)",
+          "Execution disposition: promote/rollback/inconclusive"
+        ],
+        "features_missing": [
+          "自动拒绝劣化：无 baseline vs candidate 自动 stat test",
+          "Promotion 策略：disposition 是实验结果，但 auto-promote 逻辑不在调研文件中",
+          "多候选并行对比：串行实验，无 multi-armed bandit / A/B framework"
+        ]
+      },
+      "risks": [
+        "决策主要基于 validation 和 Occam score，execution outcome (promote/rollback) 未自动连接到下一轮",
+        "无统计显著性检验：如果两个候选差异小，选择可能不稳定",
+        "No confidence interval: 单次实验结果无置信度，无法判断是否需要重复"
+      ],
+      "blocking_level": "中"
+    }
+  ],
+  "summary": {
+    "layer_2_status": "部分实现，核心基础设施完备，进程管理和采集有缺陷",
+    "layer_3_status": "部分实现，单实验流程完整，并行编排和自动决策缺失",
+    "critical_gaps": [
+      {
+        "gap": "实验并行编排 (问题16)",
+        "impact": "多候选串行执行，研究周期长，GPU 利用率低",
+        "priority": "高"
+      },
+      {
+        "gap": "进程优雅终止与暂停/恢复 (问题21)",
+        "impact": "SIGKILL 可能丢失检查点，无法临时暂停释放资源",
+        "priority": "中"
+      },
+      {
+        "gap": "TensorBoard 实时采集 (问题22)",
+        "impact": "中途曲线分析需手动，无法自动检测训练异常",
+        "priority": "中"
+      },
+      {
+        "gap": "跨调用 SSH 重连与熔断 (问题23)",
+        "impact": "长时间监控任务遇到网络抖动会失败，无自动恢复",
+        "priority": "中"
+      },
+      {
+        "gap": "自动劣化拒绝与 stat test (问题18)",
+        "impact": "候选优劣判断依赖人工或单次实验，可能选择假阳性",
+        "priority": "中"
+      }
+    ],
+    "blocking_by_severity": {
+      "高": ["问题16: 实验并行编排"],
+      "中": ["问题21: 进程生命周期", "问题22: 日志遥测采集", "问题23: SSH 鲁棒性", "问题18: 决策自动化"],
+      "低": ["问题19: Payload 完整性", "问题20: 部署原子性", "问题15: 候选生成", "问题17: 证据收集"]
+    }
+  },
+  "recommendations": [
+    {
+      "priority": "P0",
+      "problem": 16,
+      "action": "实现 ResearchScheduler: 多候选并行队列、GPU pool、优先级调度",
+      "rationale": "当前串行实验是研究循环的最大瓶颈，阻塞自动调参能力"
+    },
+    {
+      "priority": "P1",
+      "problem": 21,
+      "action": "添加 graceful_stop(SIGTERM + timeout + SIGKILL) 和 pause/resume(SIGSTOP/SIGCONT)",
+      "rationale": "避免 SIGKILL 丢失检查点，支持资源抢占"
+    },
+    {
+      "priority": "P1",
+      "problem": 23,
+      "action": "实现跨调用重连管理器 + circuit breaker + SSH keep-alive 配置",
+      "rationale": "提高长期监控任务稳定性，减少人工干预"
+    },
+    {
+      "priority": "P2",
+      "problem": 22,
+      "action": "添加 tensorboard tfevents 解析器，支持实时曲线采集",
+      "rationale": "中途异常检测（如 reward collapse）依赖曲线，不能只看最终指标"
+    },
+    {
+      "priority": "P2",
+      "problem": 18,
+      "action": "实现 baseline vs candidate 统计检验（t-test/bootstrap CI）+ auto-promote 策略",
+      "rationale": "避免噪声导致的假阳性选择，提高决策置信度"
+    }
+  ]
+}
