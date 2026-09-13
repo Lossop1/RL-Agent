@@ -171,23 +171,27 @@
 
 ### P3.2 远程命令执行抽象
 - **问题**：统一的远程执行接口，支持超时/重试
-- **状态**：接近完成（仅3-4处待迁移）
+- **状态**：已完成
 - **阻塞**：无
 - **负责人**：
 - **验收标准**：核心路径（datasource/research_remote）100%使用RemoteTransport协议
 - **实现位置**：
   - autotuner/execution/deployment.py (RemoteTransport协议)
-  - autotuner/adapter/remote_executors.py (RemoteSSHTransportAdapter适配器)
+  - autotuner/adapter/remote_executors.py (RemoteSSHTransportAdapter适配器，支持exec/put/get)
   - autotuner/locomotion_console/datasource.py (已迁移，1944行使用适配器)
+  - autotuner/locomotion_console/research_remote.py (已迁移，使用RemoteTransport)
 - **审计发现**（2026-09-13 workflow扫描）：
-  - 控制台层69个文件，仅3处创建RemoteSSH实例
-  - 仅4处直接SSH方法调用：config_manager.py:245(测试)、agent.py:276(已通过datasource封装)、research_remote.py:87/167/180
+  - 控制台层69个文件，0处核心路径直接SSH调用
   - 原"88处待迁移"评估为模式匹配误判（.exec()同时匹配SSH方法和字典.get()访问）
-  - datasource.py核心路径已正确使用RemoteSSHTransportAdapter
-- **待完成**（2-3小时工作量）：
-  - 扩展RemoteTransport协议添加get()方法（文件下载）
-  - 迁移research_remote.py的3处SSH调用（exec/put/get）至RemoteTransport
-- **详细报告**：docs/p3_2_ssh_migration_audit.md
+  - datasource.py和research_remote.py核心路径已正确使用RemoteSSHTransportAdapter
+- **已完成迁移**（2026-09-13）：
+  - RemoteTransport协议扩展：添加get()方法支持文件下载
+  - research_remote.py完整迁移：SSHExperimentBackend所有SSH调用使用transport适配器
+  - 测试验证：test_research_remote.py通过，FakeRemote适配新命令包装格式
+- **剩余边缘调用**（非核心路径，低优先级）：
+  - discover.py:57 exec_out() - 只读探测工具，不影响训练/部署
+  - config_manager.py:245 exec_out() - 连接测试工具，不影响训练/部署
+- **详细报告**：docs/p3_2_ssh_migration_audit.md (workflow生成)
 
 ### P3.3 文件传输断点续传
 - **问题**：大文件传输支持断点续传
@@ -302,11 +306,13 @@
 ## 进度统计
 
 - **总计**：27 个原子问题
-- **已完成**：19
-- **接近完成**：1 (P3.2，仅3-4处待迁移)
+- **已完成**：20
 - **进行中**：1 (P4.2)
 - **未开始**：6
-- **阻塞**：6 个问题被其他问题阻塞
+- **阻塞**：5 个问题被其他问题阻塞
+
+**最近完成**（2026-09-13）：
+- P3.2 远程命令执行抽象：控制台层核心路径100%迁移至RemoteTransport协议
 
 ---
 
