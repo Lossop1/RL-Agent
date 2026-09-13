@@ -38,6 +38,10 @@ class RemoteTransport(Protocol):
     def put(self, local: str, remote: str) -> None:
         ...
 
+    def get(self, remote: str, local: str) -> None:
+        """Download file from remote to local."""
+        ...
+
 
 @dataclass(frozen=True)
 class RemoteLayout:

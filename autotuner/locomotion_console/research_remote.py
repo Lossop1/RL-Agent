@@ -79,25 +79,24 @@ class SSHExperimentBackend:
         self.remote_factory = remote_factory
         self._runs: dict[str, _RemoteRun] = {}
         self._workspace_handles: dict[str, str] = {}
+        self._transport_cache: dict[int, Any] = {}
 
-    @staticmethod
-    def _checked(remote: Any, command: str, *, timeout: int = 30) -> tuple[str, str]:
-        marker = f"__RL_RESEARCH_RC_{uuid.uuid4().hex}__"
-        script = f"{command}\nrc=$?\nprintf '\\n{marker}%s\\n' \"$rc\""
-        stdout, stderr = remote.exec("bash -lc " + shlex.quote(script), timeout=timeout)
-        position = stdout.rfind(marker)
-        if position < 0:
-            raise RuntimeError(f"remote command did not return a status marker: {stderr[-1000:]}")
-        status_text = stdout[position + len(marker):].strip().splitlines()[0]
-        try:
-            status = int(status_text)
-        except ValueError as exc:
-            raise RuntimeError("remote command returned an invalid status marker") from exc
-        clean_stdout = stdout[:position].rstrip()
-        if status != 0:
-            detail = (stderr or clean_stdout)[-1500:]
-            raise RuntimeError(f"remote command failed with exit code {status}: {detail}")
-        return clean_stdout, stderr
+    def _get_transport(self, remote: Any) -> Any:
+        """Wrap RemoteSSH in RemoteTransport adapter, cached per remote instance."""
+        remote_id = id(remote)
+        if remote_id not in self._transport_cache:
+            from autotuner.adapter.remote_executors import RemoteSSHTransportAdapter
+            self._transport_cache[remote_id] = RemoteSSHTransportAdapter(remote, legacy_stderr=True)
+        return self._transport_cache[remote_id]
+
+    def _checked(self, remote: Any, command: str, *, timeout: int = 30) -> tuple[str, str]:
+        """Execute command via RemoteTransport adapter, return (stdout, empty_stderr)."""
+        transport = self._get_transport(remote)
+        stdout, exit_code = transport.exec(command, timeout=timeout)
+        if exit_code != 0:
+            detail = stdout[-1500:] if stdout else "(no output)"
+            raise RuntimeError(f"remote command failed with exit code {exit_code}: {detail}")
+        return stdout, ""
 
     @staticmethod
     def _remote_environment(
@@ -154,6 +153,7 @@ class SSHExperimentBackend:
         )
 
     def _upload_tree(self, remote: Any, local_root: Path, remote_root: str) -> None:
+        transport = self._get_transport(remote)
         self._checked(remote, f"mkdir -p {shlex.quote(remote_root)}")
         for source in sorted(local_root.rglob("*")):
             if source.is_symlink():
@@ -164,7 +164,7 @@ class SSHExperimentBackend:
                 self._checked(remote, f"mkdir -p {shlex.quote(destination)}")
                 continue
             self._checked(remote, f"mkdir -p {shlex.quote(str(PurePosixPath(destination).parent))}")
-            remote.put(str(source), destination)
+            transport.put(str(source), destination)
 
     @staticmethod
     def _write_local(path: Path, content: str) -> None:
@@ -174,10 +174,11 @@ class SSHExperimentBackend:
         path.write_bytes(content.encode("utf-8"))
 
     def _sync_file(self, run: _RemoteRun, remote_name: str, local_name: str) -> str:
+        transport = self._get_transport(run.remote)
         local = run.local_workspace / local_name
         remote_path = f"{run.remote_workspace}/{remote_name}"
         try:
-            run.remote.get(remote_path, str(local))
+            transport.get(remote_path, str(local))
             return local.read_text(encoding="utf-8", errors="replace")
         except Exception:
             output, _ = self._checked(
@@ -216,8 +217,9 @@ class SSHExperimentBackend:
                 local_meta / "plan.json",
                 json.dumps(plan.model_dump(mode="json"), indent=2) + "\n",
             )
-            remote.put(str(local_meta / "run.sh"), f"{remote_workspace}/run.sh")
-            remote.put(str(local_meta / "plan.json"), f"{remote_workspace}/plan.json")
+            transport = self._get_transport(remote)
+            transport.put(str(local_meta / "run.sh"), f"{remote_workspace}/run.sh")
+            transport.put(str(local_meta / "plan.json"), f"{remote_workspace}/plan.json")
             launch = (
                 f"cd {shlex.quote(remote_workspace)} && "
                 "rm -f training.exit training.pid && "

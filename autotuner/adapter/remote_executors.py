@@ -77,6 +77,10 @@ class RemoteSSHTransportAdapter:
     def put(self, local: str, remote: str) -> None:
         self.remote.put(local, remote)
 
+    def get(self, remote: str, local: str) -> None:
+        """Download file from remote to local."""
+        self.remote.get(remote, local)
+
 
 class RemoteDeployExecutor:
     """Legacy file-plan deployer kept for existing ConfigSet callers.

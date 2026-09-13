@@ -17,13 +17,28 @@ class FakeRemote:
 
     def exec(self, command, timeout=30):
         self.commands.append(command)
-        marker = re.search(r"__RL_RESEARCH_RC_[0-9a-f]+__", command).group(0)
-        payload = ""
-        if "if test -f training.exit" in command:
-            payload = "EXIT:0\n"
-        elif "cat /remote/research/" in command and "evaluation.exit" in command:
-            payload = "0\n"
-        return f"{payload}\n{marker}0\n", ""
+        # Handle both old marker pattern and new RemoteTransport wrapped commands
+        marker_match = re.search(r"__RL_RESEARCH_RC_[0-9a-f]+__", command)
+        if marker_match:
+            marker = marker_match.group(0)
+            payload = ""
+            if "if test -f training.exit" in command:
+                payload = "EXIT:0\n"
+            elif "cat /remote/research/" in command and "evaluation.exit" in command:
+                payload = "0\n"
+            return f"{payload}\n{marker}0\n", ""
+        else:
+            # New RemoteTransport pattern: wrapped in bash -lc with __RL_AGENT_RC__ marker
+            agent_marker_match = re.search(r"__RL_AGENT_RC__", command)
+            if agent_marker_match:
+                payload = ""
+                if "if test -f training.exit" in command:
+                    payload = "EXIT:0\n"
+                elif "cat /remote/research/" in command and "evaluation.exit" in command:
+                    payload = "0\n"
+                return f"{payload}\n__RL_AGENT_RC__0\n", ""
+            # Fallback for simple commands without markers
+            return "", ""
 
     def put(self, local_path, remote_path):
         self.files[remote_path] = Path(local_path).read_bytes()
