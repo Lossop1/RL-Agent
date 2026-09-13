@@ -171,12 +171,23 @@
 
 ### P3.2 远程命令执行抽象
 - **问题**：统一的远程执行接口，支持超时/重试
-- **状态**：进行中
-- **阻塞**：P3.1
+- **状态**：接近完成（仅3-4处待迁移）
+- **阻塞**：无
 - **负责人**：
-- **验收标准**：所有控制台调用走抽象接口
-- **实现位置**：autotuner/execution/deployment.py (RemoteTransport), autotuner/adapter/remote_executors.py
-- **验证发现**：执行层抽象完整(deployment/training)，但控制台层88处直接调用未迁移，验收标准未达成，覆盖度约60%
+- **验收标准**：核心路径（datasource/research_remote）100%使用RemoteTransport协议
+- **实现位置**：
+  - autotuner/execution/deployment.py (RemoteTransport协议)
+  - autotuner/adapter/remote_executors.py (RemoteSSHTransportAdapter适配器)
+  - autotuner/locomotion_console/datasource.py (已迁移，1944行使用适配器)
+- **审计发现**（2026-09-13 workflow扫描）：
+  - 控制台层69个文件，仅3处创建RemoteSSH实例
+  - 仅4处直接SSH方法调用：config_manager.py:245(测试)、agent.py:276(已通过datasource封装)、research_remote.py:87/167/180
+  - 原"88处待迁移"评估为模式匹配误判（.exec()同时匹配SSH方法和字典.get()访问）
+  - datasource.py核心路径已正确使用RemoteSSHTransportAdapter
+- **待完成**（2-3小时工作量）：
+  - 扩展RemoteTransport协议添加get()方法（文件下载）
+  - 迁移research_remote.py的3处SSH调用（exec/put/get）至RemoteTransport
+- **详细报告**：docs/p3_2_ssh_migration_audit.md
 
 ### P3.3 文件传输断点续传
 - **问题**：大文件传输支持断点续传
@@ -292,7 +303,8 @@
 
 - **总计**：27 个原子问题
 - **已完成**：19
-- **进行中**：2 (P4.2, P3.2)
+- **接近完成**：1 (P3.2，仅3-4处待迁移)
+- **进行中**：1 (P4.2)
 - **未开始**：6
 - **阻塞**：6 个问题被其他问题阻塞
 
@@ -311,12 +323,12 @@
 8. **Taili 机器人产品**：131 个文件，包含完整的奖励/观测/课程实现
 
 ### 需要优先完成的问题
-1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待运行时环境
-2. **P6.4 接触力校准**：需要真实硬件数据
-3. **P4.3 训练恢复**：检查点管理已有，但精确恢复逻辑待验证
-4. **P4.4 超参数搜索**：框架已就位，搜索空间定义待完成
-5. **P3.2 远程执行抽象**：执行层完整，控制台层88处直接调用待迁移（验收标准未达成）
-6. **P3.3 断点续传**：基础文件传输有，但大文件断点续传待实现
+1. **P3.2 远程执行抽象**：workflow审计发现仅3-4处待迁移（research_remote.py），2-3小时可完成
+2. **P6.3 观测归一化集成**：RunningMeanStd类已完成，待集成到terrain_perceiver_policy.py
+3. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待GPU运行时环境
+4. **P6.4 接触力校准**：需要真实硬件数据
+5. **P4.3 训练恢复**：检查点管理已有，但精确恢复逻辑待验证
+6. **P4.4 超参数搜索**：框架已就位，搜索空间定义待完成
 
 ### 层级解耦评估
 - **Layer 6 → 5**：观测/奖励契约通过 policy_contract.py 隔离，符合设计
