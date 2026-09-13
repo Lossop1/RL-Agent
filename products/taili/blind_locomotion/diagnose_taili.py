@@ -1011,10 +1011,10 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
     import copy
     import numpy as np
     import torch
-    import gymnasium as gym
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
     from isaaclab_tasks.utils import parse_env_cfg
     from skrl.utils.runner.torch import Runner
+    from autotuner.simulation.backend_factory import create_backend
 
     import taili_blind_runtime  # noqa: F401 - register task and skrl policy component
 
@@ -1116,7 +1116,7 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
             if hasattr(env_cfg, "reset_strategy"):
                 env_cfg.reset_strategy = "start"
             _progress(out_dir, stage="gym_make", rows_written=rows_written, active_terrain=terrain_requested)
-            env = gym.make(args.task, cfg=env_cfg, render_mode=None)
+            env = create_backend(args.task, env_cfg, backend_type="isaaclab")
             try:
                 _progress(out_dir, stage="skrl_wrapper", rows_written=rows_written, active_terrain=terrain_requested)
                 env = SkrlVecEnvWrapper(env, ml_framework="torch")

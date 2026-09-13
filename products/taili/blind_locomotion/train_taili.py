@@ -265,7 +265,6 @@ def main(argv: list[str] | None = None) -> None:
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
-    import gymnasium as gym
     import skrl
     import torch  # noqa: F401  # imported before Runner to match IsaacLab skrl examples
     from packaging import version
@@ -273,6 +272,7 @@ def main(argv: list[str] | None = None) -> None:
 
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
     from isaaclab_tasks.utils import parse_env_cfg
+    from autotuner.simulation.backend_factory import create_backend
 
     import taili_blind_runtime  # noqa: F401  # registers task + skrl policy components
 
@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         write_manifest(runtime_path, runtime)
 
-    env = gym.make(args.task, cfg=env_cfg, render_mode=None)
+    env = create_backend(args.task, env_cfg, backend_type="isaaclab")
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
 
     experiment_cfg.setdefault("trainer", {})["close_environment_at_exit"] = False

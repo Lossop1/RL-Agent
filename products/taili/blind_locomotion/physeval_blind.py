@@ -68,10 +68,10 @@ simulation_app = app_launcher.app
 import os
 import numpy as np
 import torch
-import gymnasium as gym
 import yaml
 from skrl.utils.runner.torch import Runner
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
+from autotuner.simulation.backend_factory import create_backend
 
 try:
     import taili_blind_runtime as taili_runtime  # noqa: F401
@@ -171,7 +171,7 @@ def main():
         cfg.terrain.terrain_generator.curriculum = True
     cfg.terrain.max_init_terrain_level = max(0, args.terrain_level)
 
-    env = gym.make(args.task, cfg=cfg, render_mode=None)
+    env = create_backend(args.task, cfg, backend_type="isaaclab")
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
     if args.agent_yaml:
         ac = yaml.safe_load(open(args.agent_yaml, encoding="utf-8"))
