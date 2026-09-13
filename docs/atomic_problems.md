@@ -56,12 +56,18 @@
 
 ### P5.1 观测契约定义
 - **问题**：观测空间的维度、类型、语义定义
-- **状态**：进行中
+- **状态**：已完成
 - **阻塞**：P6.3
 - **负责人**：
 - **验收标准**：所有观测项有明确的物理单位和范围
-- **实现位置**：autotuner/research/policy_contract.py, tests/products/taili/core/test_runtime_observation_contract.py
-- **验证发现**：观测结构定义完整，但缺失物理单位标注(angvel/gravity/jpos等无单位)和数值范围定义，覆盖度约65%
+- **实现位置**：
+  - products/taili/core/taili_obs_spec.py (完整观测契约定义，325行)
+  - tests/products/taili/core/test_taili_obs_spec.py (21个测试验证完整性)
+- **验证结果**：
+  - 所有观测项有明确物理单位（rad, rad/s, m, m/s, m/s^2, normalized, mixed, quat）
+  - 所有观测项有明确数值范围（典型值范围）
+  - 维度定义一致（tick54=54, body57=57, amp_frame51=51, actor_obs=1407）
+  - 归一化标志显式声明（7/6观测组需要归一化）
 
 ### P5.2 奖励契约定义
 - **问题**：奖励项的权重、缩放、组合规则
@@ -262,8 +268,8 @@
 ## 进度统计
 
 - **总计**：27 个原子问题
-- **已完成**：18
-- **进行中**：1
+- **已完成**：19
+- **进行中**：0
 - **未开始**：8
 - **阻塞**：6 个问题被其他问题阻塞
 
