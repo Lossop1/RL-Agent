@@ -25,12 +25,15 @@
 
 ### P6.3 观测空间归一化
 - **问题**：观测值的范围和分布标准化
-- **状态**：未开始
+- **状态**：已完成
 - **阻塞**：无
 - **负责人**：
 - **验收标准**：观测值 95% 落在 [-3, 3] 区间
-- **实现位置**：products/taili/core/taili_obs.py (仅有观测组装，缺失归一化层)
-- **验证发现**：当前仅组装原始观测，无RunningMeanStd或归一化机制，核心验收标准未满足
+- **实现位置**：
+  - products/taili/core/taili_normalization.py (RunningMeanStd类，157行)
+  - products/taili/blind_locomotion/terrain_perceiver_policy.py (集成到compute()方法)
+  - tests/products/taili/core/test_taili_normalization.py (14个单元测试+统计测试)
+- **验证结果**：全部测试通过，包括95%置信区间验证、Welford算法稳定性、检查点保存/加载
 
 ### P6.4 接触力模型校准
 - **问题**：仿真接触力与真实硬件的一致性
@@ -259,9 +262,9 @@
 ## 进度统计
 
 - **总计**：27 个原子问题
-- **已完成**：17
+- **已完成**：18
 - **进行中**：1
-- **未开始**：9
+- **未开始**：8
 - **阻塞**：6 个问题被其他问题阻塞
 
 ---

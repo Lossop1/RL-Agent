@@ -17,15 +17,18 @@ from skrl.models.torch import GaussianMixin, Model
 try:  # packaged payload: taili_blind_runtime.taili_core
     from .taili_core import taili_models as M
     from .taili_core.taili_models import apply_grad_scale
+    from .taili_core.taili_normalization import RunningMeanStd
 except ImportError:  # local source tree: products.taili.core
     if __package__ == "taili_blind_runtime":
         raise
     try:
         from products.taili.core import taili_models as M
         from products.taili.core.taili_models import apply_grad_scale
+        from products.taili.core.taili_normalization import RunningMeanStd
     except ImportError:
         from taili_core import taili_models as M
         from taili_core.taili_models import apply_grad_scale
+        from taili_core.taili_normalization import RunningMeanStd
 
 
 BODY_DIM = 57
@@ -52,6 +55,7 @@ class TerrainPerceiverPolicy(GaussianMixin, Model):
         initial_log_std: float = -1.0,
         dropout: float = 0.0,
         actor_hidden: list[int] | tuple[int, ...] | None = None,
+        use_obs_normalization: bool = True,
         **_unused,
     ):
         Model.__init__(self, observation_space, action_space, device)
@@ -65,8 +69,22 @@ class TerrainPerceiverPolicy(GaussianMixin, Model):
         self.register_buffer("grad_scale", torch.tensor(0.0))
         self._last_z = None
 
+        # P6.3 观测归一化：确保95%观测值落在[-3,3]区间
+        self.use_obs_normalization = use_obs_normalization
+        if use_obs_normalization:
+            self.obs_normalizer = RunningMeanStd(shape=(ACTOR_OBS,), device=device)
+        else:
+            self.obs_normalizer = None
+
     def compute(self, inputs, role: str = ""):
         states = inputs.get("states")
+
+        # P6.3 观测归一化：训练时更新统计量，评估时使用冻结统计量
+        if self.obs_normalizer is not None:
+            if self.training:
+                self.obs_normalizer.update(states)
+            states = self.obs_normalizer.normalize(states, clip_range=3.0)
+
         body = states[:, :BODY_DIM]
         history = states[:, BODY_DIM:BODY_DIM + HIST_FLAT].reshape(-1, HIST_LEN, TICK_DIM)
         z = self.perceiver.encode(history)
