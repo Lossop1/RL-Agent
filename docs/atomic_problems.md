@@ -10,10 +10,23 @@
 
 ### P6.1 仿真器后端抽象
 - **问题**：支持 IsaacLab/MuJoCo 多后端切换
-- **状态**：未开始
+- **状态**：进行中
 - **阻塞**：无
 - **负责人**：
 - **验收标准**：相同策略在两个后端的误差 < 5%
+- **实现位置**：
+  - autotuner/simulation/simulator_protocol.py (SimulatorBackend协议，191行)
+  - autotuner/simulation/isaaclab_adapter.py (IsaacLabAdapter适配器，178行)
+  - autotuner/simulation/backend_factory.py (create_backend工厂函数，62行)
+  - tests/autotuner/simulation/ (38个测试全部通过)
+- **进度**：
+  - ✅ 步骤1：定义SimulatorBackend协议（16个测试通过）
+  - ✅ 步骤2：实现IsaacLabAdapter（17个测试通过）
+  - ✅ 步骤3a：实现create_backend工厂函数（5个测试通过）
+  - 🔄 步骤3b：重构训练入口使用后端抽象（进行中）
+  - ⏳ 步骤4：验证等价性（MAE < 1e-6）
+  - ⏳ 步骤5：实现MuJoCoAdapter
+  - ⏳ 步骤6：跨后端验证（< 5%差异）
 
 ### P6.2 奖励函数数学验证
 - **问题**：奖励项的数学正确性和数值稳定性
@@ -269,8 +282,8 @@
 
 - **总计**：27 个原子问题
 - **已完成**：19
-- **进行中**：0
-- **未开始**：8
+- **进行中**：1
+- **未开始**：7
 - **阻塞**：6 个问题被其他问题阻塞
 
 ---
