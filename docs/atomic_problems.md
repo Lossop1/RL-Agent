@@ -10,8 +10,8 @@
 
 ### P6.1 仿真器后端抽象
 - **问题**：支持 IsaacLab/MuJoCo 多后端切换
-- **状态**：进行中
-- **阻塞**：无
+- **状态**：部分完成（步骤1-3完成，步骤4-6待运行时环境）
+- **阻塞**：步骤4需要GPU+IsaacSim环境，步骤5-6需要MuJoCo环境
 - **负责人**：
 - **验收标准**：相同策略在两个后端的误差 < 5%
 - **实现位置**：
@@ -20,20 +20,23 @@
   - autotuner/simulation/backend_factory.py (create_backend工厂函数，62行)
   - tools/verify_isaaclab_adapter_equivalence.py (等价性验证工具，271行)
   - tests/autotuner/simulation/ (38个测试全部通过)
+  - docs/p6_1_implementation_summary.md (完整实现总结，466行)
 - **进度**：
-  - ✅ 步骤1：定义SimulatorBackend协议（16个测试通过）
-  - ✅ 步骤2：实现IsaacLabAdapter（17个测试通过）
-  - ✅ 步骤3a：实现create_backend工厂函数（5个测试通过）
-  - ✅ 步骤3b：重构训练入口使用后端抽象（5个入口已迁移）
+  - ✅ 步骤1：定义SimulatorBackend协议（16个测试通过，commit a0f135f）
+  - ✅ 步骤2：实现IsaacLabAdapter（17个测试通过，commit 7292455）
+  - ✅ 步骤3a：实现create_backend工厂函数（5个测试通过，commit 9123d72）
+  - ✅ 步骤3b：重构训练入口使用后端抽象（5个入口已迁移，commit c781480）
   - ⏳ 步骤4：验证等价性（验证工具已就绪，等待IsaacLab环境）
-  - ⏳ 步骤5：实现MuJoCoAdapter
-  - ⏳ 步骤6：跨后端验证（< 5%差异）
+  - ⏳ 步骤5：实现MuJoCoAdapter（待MuJoCo环境和Taili MJCF模型）
+  - ⏳ 步骤6：跨后端验证（< 5%差异，依赖步骤4-5完成）
 - **已迁移训练入口**：
   - products/taili/blind_locomotion/train_taili.py
   - products/taili/blind_locomotion/diagnose_taili.py
   - products/taili/blind_locomotion/physeval_blind.py
   - products/taili/blind_locomotion/physeval_blind_e.py
   - products/taili/blind_locomotion/calibrate_taili_gates.py
+- **设计原则**：零侵入、薄包装、完全等价、可扩展
+- **架构影响**：Layer 5通过SimulatorBackend协议消费仿真器，Layer 6通过适配器实现协议，上层无需感知底层仿真器
 
 ### P6.2 奖励函数数学验证
 - **问题**：奖励项的数学正确性和数值稳定性
@@ -289,8 +292,8 @@
 
 - **总计**：27 个原子问题
 - **已完成**：19
-- **进行中**：1
-- **未开始**：7
+- **进行中**：2 (P4.2, P3.2)
+- **未开始**：6
 - **阻塞**：6 个问题被其他问题阻塞
 
 ---
@@ -308,11 +311,11 @@
 8. **Taili 机器人产品**：131 个文件，包含完整的奖励/观测/课程实现
 
 ### 需要优先完成的问题
-1. **P6.1 多后端抽象**：目前强绑定 IsaacLab，需要抽象层支持 MuJoCo
+1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待运行时环境
 2. **P6.4 接触力校准**：需要真实硬件数据
 3. **P4.3 训练恢复**：检查点管理已有，但精确恢复逻辑待验证
 4. **P4.4 超参数搜索**：框架已就位，搜索空间定义待完成
-5. **P3.1 SSH 会话池**：remote_executors.py 有基础实现，但连接复用优化待完善
+5. **P3.2 远程执行抽象**：执行层完整，控制台层88处直接调用待迁移（验收标准未达成）
 6. **P3.3 断点续传**：基础文件传输有，但大文件断点续传待实现
 
 ### 层级解耦评估
@@ -328,3 +331,4 @@
 
 - 2026-09-11：初始化原子问题跟踪表
 - 2026-09-13：完成代码库实际进度评估，更新 17 个已完成问题状态
+- 2026-09-13：完成P6.1步骤1-3实现和文档（commit 7e106d6），更新进度统计和优先级列表
