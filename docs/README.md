@@ -15,6 +15,7 @@
 
 ## 专题资料
 
+- P4.4 研究层审查判定与处置：[`P4.4_review_record.md`](P4.4_review_record.md)
 - Taili 环境边界：[`taili_env_boundary.md`](taili_env_boundary.md)
 - 奖励所有权：[`taili_reward_ownership.md`](taili_reward_ownership.md)
 - 遥测契约：[`taili_telemetry_contract.md`](taili_telemetry_contract.md)
@@ -25,3 +26,7 @@
 
 设计提案、长篇交接、调参日志和旧基线只用于追溯，不作为当前配置或验收依据。
 它们统一放在 [`archive/`](archive/README.md)；当前活状态仍以运行台账和明确的 live handoff 为准。
+
+2026-09-11 ~ 09-14 的 18 个多智能体调查/审查工作流归档在
+[`archive/workflows/`](archive/workflows/README.md)：原始返回文本在本机会话目录里会被清理，
+该目录保存摘录与筛出的有效结论，**同时保存不可采信清单**——引用前先读它的 §4。
