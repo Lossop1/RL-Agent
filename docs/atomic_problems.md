@@ -189,7 +189,7 @@
 
 ### P4.4 超参数搜索空间
 - **问题**：定义可搜索的超参数及其范围
-- **状态**：进行中（拆分为 7 个原子任务，第 1、2 个完成）
+- **状态**：进行中（拆分为 7 个原子任务，第 1、2、3 个完成）
 - **阻塞**：无（P5.2 已完成）
 - **负责人**：
 - **验收标准**：搜索空间覆盖学习率、熵系数、折扣因子
@@ -202,7 +202,7 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 | --- | --- | --- | --- |
 | 1 | 搜索空间 schema 与产品搜索空间数据 | 已完成 | autotuner/research/hyperparameter_space.py, products/taili/blind_locomotion/hyperparameter_space.yaml, tests/autotuner/research/test_hyperparameter_space.py |
 | 2 | 超参数采样器（网格/随机，含去重与重放） | 已完成 | autotuner/research/hyperparameter_sampler.py, tests/autotuner/research/test_hyperparameter_sampler.py |
-| 3 | 配置注入到训练流程 | 未开始 | - |
+| 3 | 配置注入到训练流程 | 已完成 | autotuner/research/config_injection.py, tests/autotuner/research/test_config_injection.py |
 | 4 | 搜索试验跟踪 | 未开始 | - |
 | 5 | 早停与剪枝策略 | 未开始 | - |
 | 6 | 搜索结果分析与最优配置导出 | 未开始 | - |
@@ -218,9 +218,15 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 对未声明 grid_points 的参数**报错而非猜测**，因此 entropy_loss_scale 与 kl_threshold
 这类无网格的连续参数只能用随机采样——这是上面"已知遗留"的处置结果，不是遗留项。
 
-任务 1-2 未覆盖（不属于夸大范围）：注入、试验跟踪、剪枝、结果分析、贝叶斯采样。
+任务 3 的实际范围：把采样器产出的 assignment 写进训练配置。作业形式是**嵌套**结构
+（`{"skrl": {"agent": {...}}}`），与 `default_assignment()` 一致；扁平点分键输入会被
+明确拒绝并指出形状。这一点曾被端到端探针查出不一致（采样器产出嵌套、注入器只认扁平，
+且对扁平输入调用的校验是空操作），修复记录见 `P4.4_review_record.md` 的 I-1。
+它**不**证明训练进程读取了注入值：`--dry-run` 只到 `agent.skrl.yaml` 为止。
 
-两任务的实现依据（多智能体审查的发现与判定）见 `docs/P4.4_review_record.md`。
+任务 1-3 未覆盖（不属于夸大范围）：试验跟踪、剪枝、结果分析、贝叶斯采样。
+
+三个任务的实现依据（多智能体审查的发现与判定）见 `docs/P4.4_review_record.md`。
 该记录列出已修复的 S-1..S-10、I-1、F-OPEN-1，以及**被反驳不予采纳**的 R-1..R-5，
 便于逐条复核。
 
