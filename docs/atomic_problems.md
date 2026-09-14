@@ -2,7 +2,7 @@
 
 **最终目标**：端到端自动完成强化学习的 agent，提交优秀的结果
 
-**更新日期**：2026-09-11
+**更新日期**：2026-09-14
 
 ---
 
@@ -137,11 +137,23 @@
 
 ### P4.2 训练检查点管理
 - **问题**：定期保存、按性能筛选、自动清理
-- **状态**：进行中
+- **状态**：已完成
 - **阻塞**：无
 - **负责人**：
 - **验收标准**：磁盘占用 < 100GB，最优检查点保留
-- **实现位置**：autotuner/research/research_ledger.py (CapabilityProfile, BaselineSet), tools/inspect_taili_checkpoint_delta.py
+- **实现位置**：
+  - autotuner/product/checkpoint_curator.py (CheckpointRegistry/Selector/Curator/CapabilityPromotionService, 850行, commit cc6c97d)
+  - products/taili/blind_locomotion/checkpoint_integration.py (统一接口, 280行)
+  - products/taili/blind_locomotion/checkpoint_hook.py (训练流程钩子, 130行)
+  - products/taili/blind_locomotion/checkpoint_curator_cli.py (CLI工具, 290行)
+  - tests/autotuner/product/ (43个单元测试: registry 10 + selector 12 + curator 13 + promotion 8)
+  - tests/products/taili/blind_locomotion/test_checkpoint_integration.py (7个集成测试)
+- **验证结果**：50个测试全部通过
+- **核心功能**：
+  - CheckpointRegistry: 性能快照映射 (0.5×reward + 0.3×stability + 0.1×episode + 0.1×recency)
+  - CheckpointSelector: 多维度评分选择
+  - CheckpointCurator: 分层保留策略 (top-10 + recent-5 + milestones)
+  - CapabilityPromotionService: 能力特征提取
 
 ### P4.3 训练中断恢复
 - **问题**：从检查点精确恢复训练状态
@@ -149,6 +161,7 @@
 - **阻塞**：需要GPU环境执行集成验证
 - **负责人**：
 - **验收标准**：恢复后曲线连续，无性能跳变
+- **验证环境**：远程GPU服务器 (RTX 4090 24GB, 183.147.142.40:31376)
 - **实现位置**：
   - autotuner/execution/compatibility.py (兼容性检查，348行)
   - products/taili/blind_locomotion/runtime_manifest.py (状态捕获，446行)
@@ -172,6 +185,7 @@
   7. amp - 对抗性运动先验判别器
   8. curriculum - 地形课程阶段/级别
   9. rng - Python/NumPy/PyTorch/CUDA随机数状态
+- **注**：P4.2检查点管理系统的GPU环境部署验证作为独立验证任务记录在 docs/P4.3_gpu_deployment_summary.md 和 docs/P4.3_remote_testing_instructions.md，不与本训练恢复功能混淆
 
 ### P4.4 超参数搜索空间
 - **问题**：定义可搜索的超参数及其范围
@@ -337,16 +351,17 @@
 
 ## 进度统计
 
-- **总计**：27 个原子问题
-- **已完成**：20
-- **进行中**：2 (P4.2, P4.3)
-- **未开始**：5
+- **总计**：30 个原子问题
+- **已完成**：22
+- **进行中**：1 (P4.3)
+- **未开始**：7
 - **阻塞**：5 个问题被其他问题阻塞
 
-**最近完成**（2026-09-13）：
+**最近完成**（2026-09-14）：
+- P4.2 训练检查点管理：850行核心代码，50个测试全部通过（commit cc6c97d）
 - P3.2 远程命令执行抽象：控制台层核心路径100%迁移至RemoteTransport协议
 - P6.3 观测空间归一化：已完整集成到terrain_perceiver_policy.py，9个集成测试通过
-- P4.3 训练中断恢复：单元测试完成（32个测试），待GPU验证
+- P6.1 仿真器后端抽象：步骤3b完成，5个训练入口已迁移（commit c781480）
 
 ---
 
@@ -365,9 +380,8 @@
 ### 需要优先完成的问题
 1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待GPU运行时环境
 2. **P4.3 训练恢复**：单元测试已完成（32个测试），核心逻辑已实现，待GPU环境执行集成验证
-3. **P4.2 检查点管理**：基础schema就绪，需实现选择/过滤/清理逻辑（预估3-4天）
-4. **P4.4 超参数搜索**：框架已就位，需集成Optuna/Ray Tune并定义搜索空间（预估4+天）
-5. **P6.4 接触力校准**：需要真实硬件数据
+3. **P4.4 超参数搜索**：可复用research_scheduler.py作为试验执行后端，但搜索空间schema、采样器、参数注入、早停剪枝四者皆需从零实现（预估4-5天）
+4. **P6.4 接触力校准**：需要真实硬件数据
 
 ### 层级解耦评估
 - **Layer 6 → 5**：观测/奖励契约通过 policy_contract.py 隔离，符合设计
