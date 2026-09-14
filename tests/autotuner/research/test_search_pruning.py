@@ -17,16 +17,36 @@ Each group below pins one way of being quietly wrong:
   readable line says another".
 * **The ledger layout** -- the single most expensive mistake available here.  A record written
   before the run header does not inconvenience one reader, it makes the root permanently
-  unreadable to every later ``SearchLedger`` call (``hyperparameter_search.py:585-594``).  The
-  first test in group D demonstrates the hazard actually happening and then shows the guard
-  refusing it.
+  unreadable to every later ``SearchLedger`` call (``hyperparameter_search.py:574-622``, raising
+  at ``:587``/``:592``/``:597``/``:609``).  The first test in group D demonstrates the hazard
+  actually happening and then shows the guard refusing it.
 * **Idempotence** -- a watcher asked twice must not decide twice, and a curve recorded twice must
   not become a curve whose steps go 1, 2, 1, 2.
+* **The second audit (group G)** -- every group above was green, and 22 mutations had already been
+  killed, when a later pass found seven ways the audit layer could be *confident and wrong*: a
+  correct record reported as broken, a forged record reported as verified, a curve silently
+  emptied, a documented capability that did not exist.  None of them is a crash, which is exactly
+  why a green suite did not catch them -- the module was never red, it was just wrong.  Group G
+  pins each one, and each test in it was checked by re-applying the defect and confirming it goes
+  red.
+* **The guards that were promised and never written (group H)** -- the design named five checks
+  that were load-bearing for its own arguments (the emitter still writes the sections the parser
+  reads, the module stays inside its layer, a decision re-derives in a fresh interpreter, a pruned
+  trial still counts against the sampler's budget), and the first four of them did not exist in
+  any form.  Their absence was invisible to every other test here, because nothing tested the
+  *design*, only the code.  Group H writes them and pins them the same way: each was checked by
+  breaking the thing it guards and confirming the test goes red.
 """
 from __future__ import annotations
 
+import ast
 import json
 import math
+import os
+import subprocess
+import sys
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -36,7 +56,7 @@ import yaml
 from pydantic import ValidationError
 
 from autotuner.research.config_injection import load_config_file
-from autotuner.research.hyperparameter_sampler import SearchPlan
+from autotuner.research.hyperparameter_sampler import SamplerStats, SearchPlan
 from autotuner.research.hyperparameter_search import (
     SearchError,
     SearchLedger,
@@ -56,11 +76,13 @@ from autotuner.research.search_pruning import (
     PruneDecisionRecord,
     PrunePolicyRecord,
     PruningPolicy,
+    PruningTrialRunner,
     PruningWatcher,
     StallRule,
     TrackerPruningSink,
     TrialWorkspaceTelemetry,
     canonical_metric,
+    canonical_metrics,
     format_stop_reason,
     is_nonfinite,
     metric_value,
@@ -70,6 +92,7 @@ from autotuner.research.search_pruning import (
     policy_record,
     prune_summary,
     read_prune_stop_reason,
+    reading_is_nulled,
     store_policy_record,
     verify_decision,
 )
@@ -323,6 +346,14 @@ def test_a_stall_rule_does_not_fire_while_the_metric_is_still_moving():
     assert policy.decide(curve) is None
 
 
+def test_a_stall_rule_fires_only_when_the_span_exceeds_the_allowance():
+    """The boundary is strict.  ``span == min_delta`` is still a stall; ``span > min_delta`` is
+    movement.  Without this the comparison could drift either way and no test would notice."""
+    policy = PruningPolicy(rules=(StallRule(metric="m", at_step=0, min_delta=1.0, window=2),))
+    assert policy.decide([obs(1, {"m": 5.0}), obs(2, {"m": 6.0})]) is not None, "span == min_delta"
+    assert policy.decide([obs(1, {"m": 5.0}), obs(2, {"m": 6.5})]) is None, "span > min_delta"
+
+
 def test_a_stall_rules_window_slides_rather_than_accumulating():
     """The plateau is the *trailing* window: an early flat patch followed by a rise is not a stall."""
     policy = PruningPolicy(rules=(StallRule(metric="reward.total", at_step=0, min_delta=0.01, window=2),))
@@ -378,6 +409,17 @@ def test_a_fraction_gate_reads_the_runs_own_length():
     assert verdict is not None and verdict.step == 500
 
 
+def test_a_fraction_gate_rounds_the_first_eligible_step_upward():
+    """With a length that does not divide evenly, rounding down would let the rule fire one step
+    before the fraction it was asked for.  A length that divides evenly (1000) cannot tell the two
+    apart, which is why this uses 999."""
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_total_fraction=0.5, threshold=100.0),)
+    )
+    assert policy.decide([reward(499, 0.1, total_steps=999)]) is None, "ceil(499.5) is 500"
+    assert policy.decide([reward(500, 0.1, total_steps=999)]) is not None
+
+
 def test_a_fraction_gate_stays_silent_when_the_run_has_no_stated_length():
     """Measured: the shipped telemetry carries ``total_steps: null`` on every one of its 4583
     lines when the run was not told its length.  Inventing a denominator would fire the rule at
@@ -386,6 +428,13 @@ def test_a_fraction_gate_stays_silent_when_the_run_has_no_stated_length():
         rules=(FloorRule(metric="reward.total", at_total_fraction=0.5, threshold=100.0),)
     )
     assert policy.decide([reward(1, 0.1)]) is None, "no total_steps at all"
+    # A fraction small enough that an INVENTED denominator would put the gate at step 1: without
+    # this, "return None when there is no length" and "assume a length" behave identically here.
+    tiny = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_total_fraction=0.001, threshold=100.0),)
+    )
+    assert tiny.decide([reward(1, 0.1)]) is None
+    assert tiny.decide([reward(1, 0.1, total_steps=None)]) is None
     assert policy.decide([reward(1, 0.1, total_steps=None)]) is None, "null total_steps, as shipped"
     assert policy.decide([reward(1, 0.1, total_steps=0)]) is None, "a zero denominator"
     assert policy.decide([reward(1, 0.1, total_steps=-10)]) is None
@@ -470,7 +519,13 @@ def test_min_step_holds_the_policy_back_even_when_a_rule_would_fire():
         rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),),
     )
     assert policy.decide([reward(9, 0.1)]) is None
-    assert policy.decide([reward(9, 0.1), reward(10, 0.1)]) is not None
+    verdict = policy.decide([reward(9, 0.1), reward(10, 0.1)])
+    # The step matters, not just the fact that something fired.  Asserting only ``is not None`` is
+    # what let this test stay green while the rule was reading the observation from step 9 -- the
+    # verdict it produced cited a step the policy was configured not to speak before.
+    assert verdict is not None
+    assert verdict.step == 10
+    assert verdict.matched_steps == (10,)
 
 
 def test_a_curve_that_steps_backwards_is_refused_rather_than_averaged_over():
@@ -623,17 +678,30 @@ def test_a_stored_policy_reads_back_byte_for_byte(tmp_path):
     assert policy_for(store, policy.fingerprint) == policy
 
 
+def _event_count(store: TrialLedgerStore) -> int:
+    """Appended events, counted raw.  ``records()`` folds by ``record_id``, so counting *that*
+    cannot see a duplicate append of the same id -- it overwrites the same key."""
+    return sum(
+        1 for line in store.events_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    )
+
+
 def test_storing_the_same_policy_twice_appends_nothing_the_second_time(tmp_path):
-    """The id is content-addressed, so a resumed search does not grow a duplicate."""
+    """The id is content-addressed, so a resumed search does not grow a duplicate.
+
+    Counted in events, not in ``records()``.  The first version of this test counted folded
+    records, which is vacuously true when a second append of the same id lands on the same key --
+    mutation M16 removed the idempotence check entirely and the test still passed.
+    """
     store = TrialLedgerStore(tmp_path / "ledger")
     tracker = _tracker(tmp_path, store=store)
     tracker.open_run()
     policy = PruningPolicy(rules=(NaNRule(metric="m", at_step=0),))
     first = store_policy_record(store, policy, precondition=tracker._require_open)
-    before = len(store.records())
+    after_first = _event_count(store)
     second = store_policy_record(store, policy, precondition=tracker._require_open)
     assert first.id == second.id
-    assert len(store.records()) == before
+    assert _event_count(store) == after_first, "the second store appended an event"
 
 
 def test_a_policy_record_refuses_to_carry_a_policy_it_does_not_hash_to():
@@ -733,8 +801,16 @@ def test_verify_decision_is_loud_when_the_record_contradicts_its_own_curve():
         metric="reward.total",
         stop_reason=format_stop_reason("metric_stall", 2, "claimed a plateau"),
     )
-    with pytest.raises(PruneAuditError, match="re-derives"):
+    with pytest.raises(PruneAuditError) as raised:
         verify_decision(decision, curve, policy)
+    # The message must name every field that disagrees, not just say "it disagrees": the record
+    # claims a stall with no reading and no matched steps, and the curve really holds a floor
+    # breach at 0.4 over steps 1 and 2.  A reader has to be able to see which claim is wrong.
+    message = str(raised.value)
+    assert "reason: recorded 'metric_stall', re-derived 'metric_floor'" in message
+    assert "observed: recorded None, re-derived 0.4" in message
+    assert "matched_steps: recorded (), re-derived (1, 2)" in message
+    assert "threshold: recorded None, re-derived 1.0" in message
 
 
 def test_verify_decision_reports_the_one_case_it_cannot_check_rather_than_inventing_a_verdict():
@@ -757,6 +833,29 @@ def test_verify_decision_reports_the_one_case_it_cannot_check_rather_than_invent
     )
     assert policy.decide(curve) is None, "the reading is gone, so the rule cannot fire again"
     assert verify_decision(decision, curve, policy) == "unverifiable"
+
+
+def test_verify_decision_raises_when_no_rule_matches_and_nothing_was_lost():
+    """Only a *lost* non-finite reading earns "unverifiable".  A curve that simply holds no
+    matching reading is a record contradicting its own evidence, and calling that unverifiable
+    would make the audit blind to exactly the case it exists to catch."""
+    policy = PruningPolicy(rules=(NaNRule(metric="health.terminal_rate", at_step=0),))
+    curve = (obs(1, {"health": {"terminal_rate": 0.25}}),)  # a finite reading: nothing was lost
+    decision = PruneDecisionRecord(
+        id="prune-decision:t1",
+        trial_id="t1",
+        policy_fingerprint=policy.fingerprint,
+        reason="nan_metric",
+        step=1,
+        through_step=1,
+        curve_len=1,
+        metric="health.terminal_rate",
+        observed=0.25,
+        stop_reason=format_stop_reason("nan_metric", 1, "claimed a non-finite reading"),
+    )
+    assert policy.decide(curve) is None
+    with pytest.raises(PruneAuditError, match="matches no rule"):
+        verify_decision(decision, curve, policy)
 
 
 # --- Group E: the watcher and the sink --------------------------------------------------------
@@ -1258,3 +1357,731 @@ def test_the_workspace_locator_can_tell_the_relayed_log_from_the_trainers_own_lo
 def test_the_workspace_locator_returns_nothing_for_a_trial_it_does_not_know(tmp_path):
     store = TrialLedgerStore(tmp_path / "ledger")
     assert TrialWorkspaceTelemetry(SearchLedger(store))("no-such-trial") is None
+
+
+# --- Group G: the defects a second audit pass found -------------------------------------------
+#
+# Every test here fails on the version of the module that already passed the first 89 cases, and
+# they are grouped because they share a shape: each is a way the audit layer could be *confident
+# and wrong*.  A correct record reported as broken, a forged record reported as verified, a curve
+# silently emptied, a documented capability that did not exist.  None of these is a crash, which is
+# exactly why the first pass missed them -- the module was never red, it was just wrong.
+
+
+class _InnerRunner:
+    """An inner ``TrialRunner`` whose duration and failure a runner test controls."""
+
+    def __init__(self, *, delay: float = 0.0, error: BaseException | None = None) -> None:
+        self.delay = delay
+        self.error = error
+        self.runs = 0
+
+    def preflight(self, request: Any) -> None:
+        pass
+
+    def run(self, request: Any) -> TrialOutcome:
+        self.runs += 1
+        if self.delay:
+            time.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        return TrialOutcome(status="succeeded", objective=2.0)
+
+
+class _Request:
+    def __init__(self, trial_id: str) -> None:
+        self.trial_id = trial_id
+
+
+def _watcher_over(sink: Any, curve: tuple[TrialObservation, ...]) -> PruningWatcher:
+    return PruningWatcher(
+        policy=PruningPolicy(
+            rules=(FloorRule(metric="reward.total", at_step=0, threshold=5.0, patience=1),)
+        ),
+        source=ListSource(curve),
+        sink=sink,
+    )
+
+
+def _prune_one_trial(tmp_path: Path, *, reading: Any, policy: PruningPolicy, name: str) -> tuple[TrialLedgerStore, SearchLedger, SearchTracker, Any]:
+    """Drive the documented pipeline -- tracker, watcher, sink -- until one trial is pruned."""
+    store = TrialLedgerStore(tmp_path / name)
+    ledger = SearchLedger(store)
+    tracker = _tracker(tmp_path, store=store, runner=FakeRunner())
+    source = ListSource((reward(1, reading),))
+    sink = TrackerPruningSink(tracker=tracker, store=store, ledger=ledger, policy=policy)
+    seen: dict[str, Any] = {}
+
+    def on_run(request: Any) -> None:
+        seen["trial"] = request.trial_id
+        PruningWatcher(policy=policy, source=source, sink=sink).review(request.trial_id)
+
+    tracker.runner.on_run = on_run
+    tracker.run()
+    return store, ledger, tracker, ledger.trial(seen["trial"])
+
+
+# --- G1: the writer must not be the one producing un-auditable records ---------------------
+
+
+def test_canonical_metrics_rewrites_only_the_readings_the_ledger_cannot_keep():
+    metrics = {
+        "nan": float("nan"),
+        "inf": float("inf"),
+        "neg": float("-inf"),
+        "finite": 1.5,
+        "count": 3,
+        "gate": True,
+        "text": "nan",
+        "nothing": None,
+        "nested": {"deep": float("nan"), "kept": 2.0},
+        "series": [float("nan"), 4.0],
+    }
+    assert canonical_metrics(metrics) == {
+        "nan": "nan",
+        "inf": "inf",
+        "neg": "-inf",
+        "finite": 1.5,
+        "count": 3,
+        "gate": True,
+        "text": "nan",
+        "nothing": None,
+        "nested": {"deep": "nan", "kept": 2.0},
+        "series": ["nan", 4.0],
+    }
+    # The string "nan" is left alone, so this is not idempotent-by-accident: re-canonicalising the
+    # output changes nothing, and a reading that was already text is not rewritten into anything.
+    assert canonical_metrics(canonical_metrics(metrics)) == canonical_metrics(metrics)
+
+
+def test_the_reference_sink_stores_a_non_finite_reading_as_text_rather_than_as_null(tmp_path):
+    """The module's own writer is the last place that may produce an unauditable record.
+
+    ``model_dump(mode="json")`` turns ``float('nan')`` into ``None``, and a reading lost that way
+    can never be re-derived -- so the audit has to call the decision "unverifiable", the outcome
+    its docstring reserves for a writer *outside* this module having bypassed the guard.  Measured
+    before the fix: the ledger held ``{'reward': {'total': None}}`` and the summary reported
+    ``verified=() unverifiable=(1,)`` for a decision the module itself had made.
+    """
+    policy = PruningPolicy(rules=(NaNRule(metric="reward.total", at_step=0),))
+    store, ledger, _, trial = _prune_one_trial(
+        tmp_path, reading=float("nan"), policy=policy, name="ledger"
+    )
+    assert trial.status == "pruned"
+    assert [observation.metrics for observation in trial.observations] == [
+        {"reward": {"total": "nan"}}
+    ]
+    summary = prune_summary(ledger, store=store)
+    assert summary.verified == (trial.index,)
+    assert summary.unverifiable == ()
+    assert summary.contradicted == ()
+
+
+# --- G2: "the ledger dropped it" and "it was never there" are different facts --------------
+
+
+def test_a_record_citing_a_metric_the_curve_never_held_is_a_contradiction(tmp_path):
+    """Both cases make ``metric_value`` return ``None``, so only the *key* tells them apart.
+
+    A metric that is present-but-null is a reading the ledger could not keep.  A metric that has no
+    key at all is a record citing evidence the ledger does not contain.  Reading them as one case
+    files a forged record in the benign bucket.
+    """
+    policy = PruningPolicy(rules=(NaNRule(metric="reward.total", at_step=0),))
+    curve = (obs(1, {"health": {"terminal_rate": 0.1}}),)
+    decision = PruneDecisionRecord(
+        id="prune-decision:t1",
+        trial_id="t1",
+        policy_fingerprint=policy.fingerprint,
+        reason="nan_metric",
+        step=1,
+        through_step=1,
+        curve_len=1,
+        metric="reward.total",
+        observed="nan",
+        stop_reason=format_stop_reason("nan_metric", 1, "invented"),
+    )
+    assert metric_value(curve[0].metrics, "reward.total") is None
+    assert reading_is_nulled(curve[0].metrics, "reward.total") is False
+    assert policy.decide(curve) is None
+    with pytest.raises(PruneAuditError, match="matches no rule"):
+        verify_decision(decision, curve, policy)
+
+
+def test_a_reading_the_ledger_really_nulled_is_reported_rather_than_raised():
+    """The same decision text against a curve where the key *is* there and holds ``None``."""
+    policy = PruningPolicy(rules=(NaNRule(metric="reward.total", at_step=0),))
+    curve = (obs(1, {"reward": {"total": None}}),)
+    decision = PruneDecisionRecord(
+        id="prune-decision:t1",
+        trial_id="t1",
+        policy_fingerprint=policy.fingerprint,
+        reason="nan_metric",
+        step=1,
+        through_step=1,
+        curve_len=1,
+        metric="reward.total",
+        observed="nan",
+        stop_reason=format_stop_reason("nan_metric", 1, "recovered"),
+    )
+    assert reading_is_nulled(curve[0].metrics, "reward.total") is True
+    assert verify_decision(decision, curve, policy) == "unverifiable"
+
+
+# --- G3: re-derivation runs over the prefix the decision saw, not the finished curve --------
+
+
+def _decision_for(curve: tuple[TrialObservation, ...], policy: PruningPolicy) -> PruneDecisionRecord:
+    verdict = policy.decide(curve)
+    assert verdict is not None
+    return PruneDecisionRecord(
+        id="prune-decision:t1",
+        trial_id="t1",
+        policy_fingerprint=policy.fingerprint,
+        reason=verdict.reason,
+        step=verdict.step,
+        through_step=verdict.step,
+        curve_len=len(curve),
+        matched_steps=verdict.matched_steps,
+        metric=verdict.metric,
+        observed=verdict.observed,
+        threshold=verdict.threshold,
+        stop_reason=verdict.stop_reason,
+    )
+
+
+def test_a_correct_decision_stays_verified_after_the_record_grows_past_it():
+    """A pruned trial's record keeps growing: task 4 appends the reading collected on the way out.
+
+    That later point is evidence about the trial and none at all about the decision.  A trailing
+    window rule answers differently over it, so re-deriving against the finished curve reports a
+    correct record as a contradiction -- and the record is the only thing on disk that says why the
+    trial was killed.
+    """
+    policy = PruningPolicy(
+        rules=(StallRule(metric="reward.total", at_step=0, min_delta=0.01, window=2),)
+    )
+    seen = (reward(1, 5.0), reward(2, 5.0))
+    decision = _decision_for(seen, policy)
+    assert decision.curve_len == 2
+    assert verify_decision(decision, seen, policy) == "verified"
+
+    grown = seen + (reward(3, 50.0),)
+    assert verify_decision(decision, grown, policy) == "verified"
+
+
+def test_a_record_claiming_more_observations_than_the_ledger_keeps_is_a_contradiction():
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),)
+    )
+    curve = (reward(1, 0.5), reward(2, 0.4))
+    decision = _decision_for(curve, policy)
+    overclaimed = PruneDecisionRecord.model_validate(
+        {**decision.model_dump(mode="json"), "curve_len": 5}
+    )
+    with pytest.raises(PruneAuditError, match="not on disk"):
+        verify_decision(overclaimed, curve, policy)
+
+
+def test_a_record_whose_last_seen_step_the_curve_contradicts_is_caught():
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),)
+    )
+    curve = (reward(1, 0.5), reward(2, 0.4))
+    decision = _decision_for(curve, policy)
+    wrong = PruneDecisionRecord.model_validate(
+        {**decision.model_dump(mode="json"), "through_step": 9, "curve_len": 2}
+    )
+    with pytest.raises(PruneAuditError, match="saw up to step 9"):
+        verify_decision(wrong, curve, policy)
+
+
+def test_prune_summary_names_a_contradicting_record_rather_than_raising_out_of_the_ranking(tmp_path):
+    """One bad record must not cost every other trial its verdict, and must not be hidden either."""
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),)
+    )
+    store = TrialLedgerStore(tmp_path / "ledger")
+    ledger = SearchLedger(store)
+    tracker = _tracker(tmp_path, store=store, runner=FakeRunner())
+    source = ListSource((reward(1, 0.25),))
+    sink = TrackerPruningSink(tracker=tracker, store=store, ledger=ledger, policy=policy)
+    seen: dict[str, Any] = {}
+
+    def on_run(request: Any) -> None:
+        trial_id = request.trial_id
+        seen["trial"] = trial_id
+        PruningWatcher(policy=policy, source=source, sink=sink).review(trial_id)
+
+        real = store.latest(DECISION_RECORD_TYPE, f"prune-decision:{trial_id}")
+        assert real is not None
+        # The record the module wrote is auditable: re-deriving it from the curve agrees.
+        assert (
+            verify_decision(
+                PruneDecisionRecord.model_validate(real),
+                ledger.trial(trial_id).observations,
+                policy,
+            )
+            == "verified"
+        )
+        # Supersede it with one field changed.  This has to happen while the search is open --
+        # a finished search refuses every trial write, which is the guard working, not an
+        # obstacle to work around.
+        store.append(
+            DECISION_RECORD_TYPE,
+            PruneDecisionRecord.model_validate({**real, "observed": 0.99}),
+            actor="test",
+            event_type="supersede",
+            precondition=tracker._require_open,
+        )
+
+    tracker.runner.on_run = on_run
+    tracker.run()
+    trial = ledger.trial(seen["trial"])
+    assert trial.status == "pruned"
+
+    summary = prune_summary(ledger, store=store)
+    assert summary.contradicted == (trial.index,)
+    assert summary.verified == ()
+    assert summary.unverifiable == ()
+    assert f"trial {trial.index}" in summary.contradiction_detail
+    assert "observed" in summary.contradiction_detail
+
+
+# --- G4: every field of the verdict is compared, not just the rule and the step --------------
+
+
+@pytest.mark.parametrize(
+    ("field", "forgery"),
+    [
+        ("metric", "health.terminal_rate"),
+        ("observed", 999.0),
+        ("threshold", 0.0),
+        ("matched_steps", (2,)),
+        ("stop_reason", format_stop_reason("metric_floor", 2, "a story the curve never tells")),
+    ],
+)
+def test_a_forged_verdict_field_is_caught_even_when_the_rule_and_the_step_agree(field, forgery):
+    """A record whose reading and threshold no rule could produce must not pass as audited."""
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=2),)
+    )
+    curve = (reward(1, 0.5), reward(2, 0.4))
+    decision = _decision_for(curve, policy)
+    assert verify_decision(decision, curve, policy) == "verified"
+    forged = PruneDecisionRecord.model_validate({**decision.model_dump(mode="json"), field: forgery})
+    with pytest.raises(PruneAuditError, match=field):
+        verify_decision(forged, curve, policy)
+
+
+def test_the_forgery_message_names_the_recorded_and_the_re_derived_value():
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=2),)
+    )
+    curve = (reward(1, 0.5), reward(2, 0.4))
+    decision = _decision_for(curve, policy)
+    forged = PruneDecisionRecord.model_validate(
+        {**decision.model_dump(mode="json"), "observed": 999.0}
+    )
+    with pytest.raises(PruneAuditError) as raised:
+        verify_decision(forged, curve, policy)
+    assert "observed: recorded 999.0, re-derived 0.4" in str(raised.value)
+
+
+# --- G5: a rotation the size test cannot see must not read as an empty curve -----------------
+
+
+def _write_ticks(path: Path, steps: list[tuple[int, float]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for step, value in steps:
+            handle.write(
+                json.dumps({"type": "train_tick", "step": step, "reward": {"total": value}}) + "\n"
+            )
+
+
+def test_a_rotation_to_a_same_or_larger_file_is_noticed_rather_than_read_as_empty(tmp_path):
+    """The size test alone misses the destructive case: a rewrite that is not smaller.
+
+    The stale byte offset then lands mid-line, the fragment does not start with ``{``, so the whole
+    JSONL is re-read through the text-log parser -- which understands none of it.  The curve comes
+    back empty, the points already read are discarded, and the cursor parks at the new file's end,
+    so the loss is permanent.  Measured before the guard: ``[1, 2, 3]`` -> ``[]`` -> ``[200]``.
+    """
+    telemetry = tmp_path / "t.telemetry.jsonl"
+    source = JsonlTelemetryCurveSource(locate=lambda trial_id: telemetry)
+
+    _write_ticks(telemetry, [(1, 2.0), (2, 2.0), (3, 2.0)])
+    assert [observation.step for observation in source.curve("t1")] == [1, 2, 3]
+
+    _write_ticks(telemetry, [(100 + index, 1.0) for index in range(10)])
+    assert [observation.step for observation in source.curve("t1")] == [
+        100 + index for index in range(10)
+    ]
+
+    with telemetry.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "train_tick", "step": 200, "reward": {"total": 1.0}}) + "\n")
+    assert [observation.step for observation in source.curve("t1")] == [
+        *[100 + index for index in range(10)],
+        200,
+    ]
+
+
+def test_the_curve_source_leaves_a_torn_line_and_stops_exactly_where_it_parsed(tmp_path):
+    """The cursor must stop where the parsed bytes end; the steps alone cannot show that.
+
+    This test was originally named for the incremental read and asserted only the step list, which
+    is not the same claim: a mutant that consumes the torn trailing line returns the *identical*
+    curve while moving the cursor to ``size + 1``.  That overshoot invalidates the rotation
+    fingerprint, so the next poll starts from zero and re-reads the whole file -- correct output,
+    and the entire point of the class gone.  The cursor assertions are the ones that pin it.
+    """
+    telemetry = tmp_path / "t.telemetry.jsonl"
+    source = JsonlTelemetryCurveSource(locate=lambda trial_id: telemetry)
+    fragment = '{"type": "train_tick", "step": 4, "rew'
+
+    _write_ticks(telemetry, [(1, 1.0), (2, 1.0)])
+    assert [observation.step for observation in source.curve("t1")] == [1, 2]
+    # The file ends on a newline, so nothing is left over: the cursor sits exactly at EOF.
+    assert source._cursors["t1"][1] == telemetry.stat().st_size
+
+    with telemetry.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"type": "train_tick", "step": 3, "reward": {"total": 1.0}}) + "\n")
+        handle.write(fragment)
+    assert [observation.step for observation in source.curve("t1")] == [1, 2, 3]
+    assert source._cursors["t1"][1] == telemetry.stat().st_size - len(fragment)
+
+    with telemetry.open("a", encoding="utf-8") as handle:
+        handle.write('ard": {"total": 1.0}}\n')
+    assert [observation.step for observation in source.curve("t1")] == [1, 2, 3, 4]
+    assert source._cursors["t1"][1] == telemetry.stat().st_size
+
+
+def test_the_watcher_keeps_forwarding_after_the_source_starts_over():
+    """Forwarding by count goes permanently silent after a reset; forwarding by step does not."""
+    source = ListSource((reward(1, 1.0), reward(2, 1.0), reward(3, 1.0)))
+    sink = RecordingSink()
+    watcher = PruningWatcher(policy=PruningPolicy(), source=source, sink=sink)
+    assert watcher.review("t1") is None
+    assert sink.curves == [("t1", (reward(1, 1.0), reward(2, 1.0), reward(3, 1.0)))]
+
+    # The file was rotated: the source now reports a shorter curve of different steps.  A count-based
+    # cursor would ask for ``curve[3:]`` on a two-point curve and forward nothing, forever.
+    source.curve_value = (reward(9, 1.0), reward(10, 1.0))
+    assert watcher.review("t1") is None
+    assert sink.curves[-1] == ("t1", (reward(9, 1.0), reward(10, 1.0)))
+
+    # A step already forwarded is not forwarded twice, which is what keeps ``observe`` from
+    # building the curve 1, 2, 1, 2 that this module's own validator refuses.
+    source.curve_value = (reward(9, 1.0), reward(10, 1.0), reward(11, 1.0))
+    assert watcher.review("t1") is None
+    assert sink.curves[-1] == ("t1", (reward(11, 1.0),))
+
+
+# --- G6: the pruning runner, which had no test at all ----------------------------------------
+
+
+def test_the_pruning_runner_returns_the_inner_outcome_when_the_inner_runner_cooperates():
+    inner = _InnerRunner()
+    runner = PruningTrialRunner(
+        runner=inner, watcher=_watcher_over(RecordingSink(), (reward(1, 9.0),)), interval_seconds=0.01
+    )
+    outcome = runner.run(_Request("t1"))
+    assert outcome.status == "succeeded"
+    assert outcome.objective == 2.0
+    assert inner.runs == 1
+
+
+def test_the_pruning_runner_reraises_when_the_inner_runner_dies():
+    runner = PruningTrialRunner(
+        runner=_InnerRunner(error=ValueError("training crashed")),
+        watcher=_watcher_over(RecordingSink(), (reward(1, 9.0),)),
+        interval_seconds=0.01,
+    )
+    with pytest.raises(ValueError, match="training crashed"):
+        runner.run(_Request("t1"))
+    assert [t for t in threading.enumerate() if t.name.startswith("prune-")] == []
+
+
+def test_a_failing_poller_neither_abandons_the_worker_nor_swallows_its_failure():
+    """``review`` raising is the ordinary failure mode, and the old code lost the training crash.
+
+    Letting the poller's exception escape the loop meant ``thread.join()`` was never reached: the
+    worker kept running unmanaged, and the inner runner's own exception was stored in a frame
+    nobody returned to -- no traceback, and no ``threading.excepthook`` call either.
+    """
+
+    class PollerBreaks(RecordingSink):
+        """A sink that fails the way the ledger does when the trial ended underneath it."""
+
+        def apply_verdict(self, trial_id: str, verdict: Any) -> bool:
+            raise SearchError("the trial finished underneath the poller")
+
+    inner = _InnerRunner(delay=0.2, error=ValueError("training crashed"))
+    runner = PruningTrialRunner(
+        runner=inner,
+        watcher=_watcher_over(PollerBreaks(), (reward(1, 0.1),)),
+        interval_seconds=0.02,
+    )
+    with pytest.raises(SearchError, match="underneath the poller") as raised:
+        runner.run(_Request("t1"))
+
+    assert [t for t in threading.enumerate() if t.name.startswith("prune-")] == []
+    notes = getattr(raised.value, "__notes__", [])
+    assert any("training crashed" in note for note in notes), notes
+    assert inner.runs == 1
+
+
+def test_terminate_does_not_read_a_missing_process_handle_as_a_clean_stop():
+    """``True`` means "observed to have ended"; a handle that was never given proves nothing."""
+    runner = PruningTrialRunner(
+        runner=_InnerRunner(),
+        watcher=_watcher_over(RecordingSink(), (reward(1, 9.0),)),
+        interval_seconds=1.0,
+    )
+    assert runner.terminate("t1", "prune:nan_metric@1") is False
+
+
+def test_terminate_reports_true_only_for_a_process_it_observed_ended():
+    class Exited:
+        """A process handle that reports itself finished -- what ``terminate`` must count as ended."""
+
+        def poll(self) -> int:
+            return 0
+
+        def kill(self) -> None:  # pragma: no cover - must never be reached
+            raise AssertionError("an exited process must not be killed")
+
+    runner = PruningTrialRunner(
+        runner=_InnerRunner(),
+        watcher=_watcher_over(RecordingSink(), (reward(1, 9.0),)),
+        interval_seconds=1.0,
+        sleep=lambda seconds: None,
+    )
+    assert runner.terminate("t1", "prune:nan_metric@1", Exited()) is True
+
+
+def test_the_module_no_longer_carries_a_sentinel_it_never_writes():
+    """A constant nothing produces is a promise nothing keeps; it was removed rather than left."""
+    import autotuner.research.search_pruning as module
+
+    assert not hasattr(module, "_SENTINEL")
+
+
+# --- G7: min_step is a floor on the evidence, not a counter ---------------------------------
+
+
+def test_min_step_excludes_the_evidence_a_rule_would_otherwise_fire_on():
+    """A rule with ``at_step=0`` must not reach back past the policy's own floor.
+
+    Measured before the fix: ``min_step=500`` still produced ``metric_floor at step 1``, so the
+    trial was killed by exactly the early noise the floor was configured to exclude.
+    """
+    policy = PruningPolicy(
+        min_step=500,
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),),
+    )
+    curve = (reward(1, 0.1),) + tuple(reward(step, 0.1) for step in (500, 501, 502))
+    verdict = policy.decide(curve)
+    assert verdict is not None
+    assert verdict.step == 500
+    assert verdict.matched_steps == (500,)
+    assert all(step >= policy.min_step for step in verdict.matched_steps)
+
+
+def test_min_step_can_hold_back_a_rule_entirely_when_nothing_clears_it():
+    policy = PruningPolicy(
+        min_step=500,
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),),
+    )
+    assert policy.decide((reward(1, 0.1), reward(2, 0.1))) is None
+
+
+# --- Group H: the guards the design named and then never wrote -------------------------------
+#
+# Section 4 of the design document lists these among its test cases, and §9 reconciled only line
+# and case *counts* -- so for a while the document presented five anti-drift guards as landed when
+# none of them existed.  They are the load-bearing ones, which is why they are here now rather than
+# deleted from the document: each pins a claim that is otherwise maintained by hand.
+
+EMITTER = Path("products") / "taili" / "blind_locomotion" / "telemetry_emit.py"
+CAPTURED_PAYLOAD = Path("output") / "current_balanced_telemetry.jsonl"
+
+#: What the parser is allowed to reach for.  R-10 of the design: the research layer may import
+#: ``.hyperparameter_search``, ``.trial_ledger`` and (for ``content_hash``) ``.research_ledger``,
+#: and must never reach up into the console, the product tree, training or the adapter layer.
+ALLOWED_RELATIVE_IMPORTS = {".hyperparameter_search", ".trial_ledger", ".research_ledger"}
+FORBIDDEN_PREFIXES = (
+    "autotuner.locomotion_console",
+    "autotuner.training",
+    "autotuner.adapter",
+    "products",
+)
+
+
+def test_the_parser_still_names_the_sections_the_emitter_writes():
+    """A rename in the emitter would empty the curve silently; only this reads both sides."""
+    source = EMITTER.read_text(encoding="utf-8")
+    assert '"type": "train_tick"' in source, (
+        "the emitter no longer stamps train_tick, which is the parser's only discriminator"
+    )
+    for section in ("reward", "curriculum", "health", "command", "counters"):
+        assert f'"{section}":' in source, f"the emitter no longer writes a {section!r} section"
+    for key in ("step", "total_steps"):
+        assert f'"{key}":' in source, f"the emitter no longer writes a {key!r} key"
+    # The other direction: what the parser would produce from a line in that shape.
+    parsed = parse_telemetry_payload(
+        {
+            "type": "train_tick",
+            "step": 4,
+            "total_steps": None,
+            "reward": {"total": 1.5},
+            "health": {"terminal_rate": 0.0},
+            "curriculum": {"terrain_mean": 3.0},
+            "command": {"cmd_vx": 0.4},
+            "counters": {"falls": 0},
+        }
+    )
+    assert parsed is not None
+    assert metric_value(parsed.metrics, "reward.total") == 1.5
+    assert metric_value(parsed.metrics, "health.terminal_rate") == 0.0
+    assert metric_value(parsed.metrics, "curriculum.terrain_mean") == 3.0
+    assert metric_value(parsed.metrics, "command.cmd_vx") == 0.4
+    assert metric_value(parsed.metrics, "counters.falls") == 0
+
+
+def test_the_parser_reads_the_keys_the_human_line_emitter_writes():
+    """The fallback path reads ``step=``/``total=``; those are spelled in a second place."""
+    source = EMITTER.read_text(encoding="utf-8")
+    for marker in ("[TPSTAT]", "[TPREW]"):
+        start = source.index(f'"{marker} "')
+        block = source[start : source.index("]))", start)]
+        assert '("step",' in block, f"{marker} no longer writes step=, so the parser drops every line"
+        assert '("total",' in block, f"{marker} no longer writes total="
+    parsed = parse_telemetry_lines(
+        "[TPSTAT] step=100 total=1000 pct=50.00 fps=1.00\n"
+        "[TPREW] step=100 total=2.5 tracking_lin=0.4\n"
+    )
+    assert [observation.step for observation in parsed] == [100]
+    assert parsed[0].metrics["total_steps"] == 1000
+    assert metric_value(parsed[0].metrics, "reward.total") == 2.5
+
+
+def test_the_captured_payload_the_design_measured_still_reads_the_same_way():
+    """Measured against a real capture rather than a hand-written dict -- when one is present.
+
+    The file is the product's own output and is gitignored, so this skips rather than fails on a
+    tree that never ran training.  What it pins cannot be pinned by a fixture: the shipped payload
+    carries ``total_steps: null`` on every line, which is the reason a fraction gate must stay
+    silent instead of inventing a denominator.
+    """
+    if not CAPTURED_PAYLOAD.exists():
+        pytest.skip(f"{CAPTURED_PAYLOAD} is not on this tree (it is a product output, not a fixture)")
+    with CAPTURED_PAYLOAD.open(encoding="utf-8") as handle:
+        line = handle.readline()
+    payload = json.loads(line)
+    parsed = parse_telemetry_payload(payload)
+    assert parsed is not None
+    assert parsed.metrics["total_steps"] is None
+    for path, expected in (
+        ("reward.total", payload["reward"]["total"]),
+        ("curriculum.terrain_mean", payload["curriculum"]["terrain_mean"]),
+        ("health.terminal_rate", payload["health"]["terminal_rate"]),
+        ("health.fall_rate", payload["health"]["fall_rate"]),
+        ("reward.tracking_lin", payload["reward"]["tracking_lin"]),
+    ):
+        assert metric_value(parsed.metrics, path) == expected, path
+        assert is_nonfinite(metric_value(parsed.metrics, path)) is False, path
+    # ``total_steps`` is null on every line of the capture, so a fraction gate on a curve built
+    # from it must not fire at all -- the behaviour the ``null`` exists to produce.
+    gate = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_total_fraction=0.5, threshold=1e9, patience=1),)
+    )
+    assert gate.decide((parsed,)) is None
+
+
+def test_the_module_imports_only_the_layers_it_is_allowed_to():
+    """R-10, as an AST walk rather than a grep -- a grep cannot tell an import from a string."""
+    source = Path("autotuner/research/search_pruning.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    relative: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith(FORBIDDEN_PREFIXES), alias.name
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                name = "." * node.level + (node.module or "")
+                relative.add(name)
+                assert name in ALLOWED_RELATIVE_IMPORTS, f"{name} is outside the research layer"
+            else:
+                assert not (node.module or "").startswith(FORBIDDEN_PREFIXES), node.module
+    assert relative == ALLOWED_RELATIVE_IMPORTS
+
+
+def test_a_decision_re_derives_identically_in_a_fresh_interpreter():
+    """``verify_decision`` must not lean on anything process-local.
+
+    The design's claim is that a third party can recompute a decision *from the ledger alone*.  A
+    same-process test cannot see that: a module-level cache, a memoised rule or an iteration-order
+    dependence would all survive it.  This rebuilds the policy from its stored form in a new
+    interpreter and compares every field.
+    """
+    policy = PruningPolicy(
+        rules=(
+            FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=2),
+            NaNRule(metric="health.terminal_rate", at_step=0),
+        ),
+        min_observations=2,
+    )
+    curve = (reward(1, 0.5), reward(2, 0.4))
+    verdict = policy.decide(curve)
+    assert verdict is not None
+    script = (
+        "import json,sys;"
+        "from autotuner.research.search_pruning import PruningPolicy,TrialObservation;"
+        "policy=PruningPolicy.model_validate(json.loads(sys.argv[1]));"
+        "curve=tuple(TrialObservation.model_validate(o) for o in json.loads(sys.argv[2]));"
+        "v=policy.decide(curve);"
+        "print(json.dumps(v.model_dump(mode='json') if v else None, sort_keys=True))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, policy.model_dump_json(), json.dumps(
+            [observation.model_dump(mode="json") for observation in curve]
+        )],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == verdict.model_dump(mode="json")
+
+
+def test_a_pruned_trial_still_counts_against_the_sampler_proposals(tmp_path):
+    """§1's budget invariant: pruning must not make a search look like it skipped a proposal.
+
+    ``close_run`` refuses when ``trial_count != stats["proposals"]`` -- a pruned trial has to stay
+    counted, or an honest search becomes unclosable and a dishonest one becomes closable.
+    """
+    policy = PruningPolicy(
+        rules=(FloorRule(metric="reward.total", at_step=0, threshold=1.0, patience=1),)
+    )
+    store = TrialLedgerStore(tmp_path / "ledger")
+    ledger = SearchLedger(store)
+    tracker = _tracker(tmp_path, store=store, runner=FakeRunner())
+    source = ListSource((reward(1, 0.25),))
+    sink = TrackerPruningSink(tracker=tracker, store=store, ledger=ledger, policy=policy)
+
+    def on_run(request: Any) -> None:
+        PruningWatcher(policy=policy, source=source, sink=sink).review(request.trial_id)
+
+    tracker.runner.on_run = on_run
+    tracker.run()
+    assert [record.status for record in ledger.trials()] == ["pruned"]
+
+    closed = tracker.close_run(SamplerStats(proposals=1, attempts=1, exhausted=True))
+    # The pruned trial is still a landed trial, so the counts agree and the close is allowed.
+    # (The refusal when they disagree is task 4's own case, in test_hyperparameter_search.py.)
+    assert len(ledger.trials()) == closed.stats["proposals"] == 1
+    assert prune_summary(ledger, store=store).pruned_indices == (1,)

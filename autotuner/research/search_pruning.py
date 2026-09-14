@@ -117,12 +117,37 @@ def is_nonfinite(value: float | None) -> bool:
     return value is not None and not math.isfinite(value)
 
 
+def reading_is_nulled(metrics: Mapping[str, Any], path: str) -> bool:
+    """Is there a key at ``path`` whose value is ``None``?
+
+    This is the fingerprint of the ledger's JSON dump: the key survives, the value does not.  It is
+    deliberately **not** the same question as :func:`metric_value` returning ``None``, which is also
+    what happens when the metric was never in the payload at all.  The audit needs the difference --
+    "the reading was dropped on the way to disk" explains a missing verdict, "the reading was never
+    there" contradicts it -- and it is only recoverable by asking whether the key exists.
+    """
+    parts = path.split(".")
+    current: Any = metrics
+    for part in parts[:-1]:
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        current = current[part]
+    if not isinstance(current, Mapping):
+        return False
+    return parts[-1] in current and current[parts[-1]] is None
+
+
 def canonical_metric(value: float | None) -> float | str | None:
     """The form a reading must be stored in: a finite float, or the text ``"nan"``/``"inf"``/``"-inf"``.
 
-    Everything that writes a curve into the ledger goes through this, because the ledger's
-    ``model_dump(mode="json")`` silently turns a non-finite float into ``null`` and the rule that
-    would have fired on it never fires again.
+    The ledger's ``model_dump(mode="json")`` silently turns a non-finite float into ``null``, and a
+    reading lost that way cannot be re-derived, so the rule that would have fired on it never fires
+    again.  This is the scalar half of the guard; :func:`canonical_metrics` is the half that walks a
+    payload, and :meth:`TrackerPruningSink.record_curve` is the call site that puts both of them in
+    front of the ledger.
+
+    The read side is :func:`metric_value`, which maps this function's output back to the float, so a
+    curve makes the round trip and is still judged by the rule that produced it.
     """
     if value is None:
         return None
@@ -131,6 +156,44 @@ def canonical_metric(value: float | None) -> float | str | None:
     if math.isnan(value):
         return "nan"
     return "inf" if value > 0 else "-inf"
+
+
+def canonical_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """A curve point's whole payload, with every nested non-finite reading canonicalised.
+
+    Only non-finite floats are rewritten.  A finite float, an ``int``, a ``bool``, a string and a
+    ``None`` all pass through untouched, so a payload that could already survive the ledger's JSON
+    dump comes back equal to what went in -- this cannot be the thing that changes a reading, and
+    it cannot turn a gate (a bool) into a metric.
+    """
+    return {key: _canonical_value(value) for key, value in metrics.items()}
+
+
+def _canonical_value(value: Any) -> Any:
+    """One payload value, canonicalised.  Mappings and sequences are walked; scalars are judged."""
+    if isinstance(value, Mapping):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        # Walked rather than passed through.  A non-finite float nested in a list is written to the
+        # ledger as ``null`` just the same, so leaving one behind would make this function's promise
+        # false for a shape nobody happened to check.  A tuple becomes a list, which is what the
+        # ledger's JSON dump stores either way.
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return canonical_metric(value)
+    return value
+
+
+def _canonical_observation(observation: TrialObservation) -> TrialObservation:
+    """The observation in the form the ledger can keep: non-finite readings written as their text.
+
+    Rebuilt rather than mutated, because ``TrialObservation`` is frozen -- and that is the point:
+    the value handed to ``observe`` is a new one, so a caller holding the original cannot be
+    surprised by a reading that changed under it.
+    """
+    return TrialObservation(
+        step=observation.step, metrics=canonical_metrics(observation.metrics)
+    )
 
 
 # --- The rules ------------------------------------------------------------------------------
@@ -492,7 +555,14 @@ class PruningPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    #: No rule may act on evidence from before this step.  A floor on what the policy is willing to
+    #: believe, not a hint: :meth:`decide` drops observations below it before any rule sees them, so
+    #: a rule with ``at_step=0`` cannot fire on the warm-up noise this exists to exclude.  Until it
+    #: was measured, ``decide`` only *counted* observations at or after this step and then handed
+    #: the whole curve to the rules, so a policy with ``min_step=500`` could kill a trial at step 1.
     min_step: int = 0
+    #: The policy stays silent until it holds at least this many observations at or after
+    #: ``min_step``.
     min_observations: int = 1
     rules: tuple[PruningRule, ...] = ()
 
@@ -549,21 +619,25 @@ class PruningPolicy(BaseModel):
         The whole curve is re-read on every call rather than a delta kept in memory: the rules are
         stateless, so the same curve produces the same verdict however many times it is asked,
         which is what makes a decision re-derivable from the ledger alone.
+
+        ``min_step`` is applied **before** the rules, not alongside them: observations before it are
+        dropped, so no rule can cite a step below the floor the operator set.  A rule's own gate
+        (``at_step``/``at_total_fraction``) is a second, independent floor; whichever is higher wins,
+        which is what "the earliest evidence this policy accepts" should mean.
         """
         checked = _validated_curve(curve)
         if len(checked) < self.min_observations:
             return None
         eligible = tuple(
-            observation
-            for observation in checked
-            # The gate is judged per rule as well; this one only says the policy as a whole is not
-            # to speak before it has seen enough of the run.
-            if observation.step >= self.min_step
+            observation for observation in checked if observation.step >= self.min_step
         )
         if len(eligible) < self.min_observations:
             return None
         for rule in self.rules:
-            match = rule._evaluate(checked)
+            # ``eligible``, not ``checked``.  Handing the unfiltered curve to the rules made
+            # ``min_step`` appear in no verdict at all -- it counted observations and changed
+            # nothing, so the early noise it was configured to exclude was exactly what fired.
+            match = rule._evaluate(eligible)
             if match is not None:
                 return PruneVerdict(
                     reason=rule.kind,  # type: ignore[arg-type]
@@ -627,10 +701,11 @@ def store_policy_record(
 
     **Measured, not inferred** (this is the one thing in this module that a test found rather than
     a reading): writing any record into an empty search ledger makes that ledger permanently
-    unreadable.  ``_validate_layout`` (``hyperparameter_search.py:585-594``) raises
-    ``unknown_layout`` for *any* non-empty ledger whose first event is not the ``search_run``
-    append, so a policy stored before the run header does not inconvenience one reader -- every
-    later ``SearchLedger`` call on that root, including ``open_run`` itself, fails for good.
+    unreadable.  ``_validate_layout`` (``hyperparameter_search.py:574-622``; ``unknown_layout``
+    is raised at ``:587``/``:592``/``:597``/``:609``) rejects *any* non-empty ledger whose first
+    event is not the ``search_run`` append, so a policy stored before the run header does not
+    inconvenience one reader -- every later ``SearchLedger`` call on that root, including
+    ``open_run`` itself, fails for good.
 
     ``precondition`` is the same hook task 4 uses (``hyperparameter_search.py:1577`` passes
     ``self._require_open``), and a write that fails it never reaches the file.  The parameter is
@@ -721,17 +796,64 @@ class PruneAuditError(Exception):
     """
 
 
+def _stored_observed(verdict: PruneVerdict) -> float | str | None:
+    """The reading as the record keeps it: the verdict's value, with the NaN case named not blank.
+
+    ``NaNRule``'s verdict carries ``observed=None`` -- "unreadable" is not a number -- but ``None``
+    in the record would be indistinguishable from "no reading was recorded", so the canonical text
+    is stored instead.  Both the writer and the auditor call *this*, because the two rules drifting
+    apart is precisely how a correct record starts looking like a contradiction.
+    """
+    if verdict.observed is None and verdict.reason == "nan_metric":
+        return "nan"
+    return verdict.observed
+
+
 def _lost_to_normalisation(
     decision: PruneDecisionRecord, curve: Sequence[TrialObservation]
 ) -> bool:
-    """Was the reading this decision acted on turned into ``None`` by the ledger's JSON dump?"""
+    """Was the reading this decision acted on turned into ``None`` by the ledger's JSON dump?
+
+    Narrow on purpose: the metric must be **present but null**.  A metric that is simply absent
+    from the curve is not an explanation for a missing verdict, it is a contradiction with it --
+    the record cites evidence the ledger does not contain.  Reading both cases as "the writer lost
+    it" would file a forged record in the benign bucket.
+    """
     if not isinstance(decision.observed, str) or decision.observed not in _CANONICAL_TEXT.values():
         return False
     for observation in curve:
         if observation.step != decision.step:
             continue
-        return metric_value(observation.metrics, decision.metric) is None
+        return reading_is_nulled(observation.metrics, decision.metric)
     return False
+
+
+def _decision_prefix(
+    decision: PruneDecisionRecord, curve: Sequence[TrialObservation]
+) -> tuple[TrialObservation, ...]:
+    """The part of the curve the decision was actually made on, which is what re-derivation needs.
+
+    A pruned trial's record keeps growing after the decision: task 4 deliberately appends the
+    observation the runner collected on its way out (``hyperparameter_search.py:1219-1224``).  Those
+    later points are real evidence about the trial and no evidence at all about the decision, so
+    re-running the rules over the final curve asks a question the decision never answered -- and a
+    trailing-window rule like ``StallRule`` answers it differently, which turns a correct record
+    into a reported contradiction.  The length is the decision's own ``curve_len``, so this is the
+    prefix it saw rather than a guess at one.
+    """
+    if decision.curve_len > len(curve):
+        raise PruneAuditError(
+            f"the decision records a curve of {decision.curve_len} observations, but the ledger "
+            f"keeps only {len(curve)} for trial {decision.trial_id}: the evidence it cites is not "
+            f"on disk"
+        )
+    prefix = tuple(curve[: decision.curve_len])
+    if prefix and prefix[-1].step != decision.through_step:
+        raise PruneAuditError(
+            f"the decision says it saw up to step {decision.through_step}, but the "
+            f"{len(prefix)}th observation of the recorded curve is step {prefix[-1].step}"
+        )
+    return prefix
 
 
 def verify_decision(
@@ -739,37 +861,69 @@ def verify_decision(
     curve: Sequence[TrialObservation],
     policy: PruningPolicy,
 ) -> Literal["verified", "unverifiable"]:
-    """Re-derive a decision from the ledger's own contents and compare.
+    """Re-derive a decision from the ledger's own contents and compare, field by field.
 
-    Returns ``"verified"`` when the curve and the policy produce the recorded verdict again, and
-    ``"unverifiable"`` in one specific case: the reading the rule fired on was a non-finite float
-    written straight to the ledger without :func:`canonical_metric`, so it came back as ``None``
-    and the rule cannot fire a second time.  That is a caller having bypassed the writer, not a
-    false record, so it is reported rather than raised.
+    Re-derivation runs over the curve **prefix the decision saw** (its ``curve_len``), not the final
+    curve, because a pruned trial's record keeps growing afterwards -- see :func:`_decision_prefix`
+    for why re-running a trailing-window rule over the grown curve asks a question the decision
+    never answered.  A record is ``"verified"`` only when that prefix and the policy reproduce
+    **every** field of the verdict: the rule, the step, the metric, the reading, the threshold, the
+    observations it matched, and the stop reason written into the trial.  Comparing a subset would
+    let a record whose reading and threshold no rule could produce pass as audited -- and this
+    record is the only thing on disk that says why a trial was killed.
 
-    Anything else that disagrees raises :class:`PruneAuditError` with the re-derived values.
+    Returns ``"unverifiable"`` in one case, and it is narrow on purpose: the reading the rule fired
+    on is a non-finite float that was **present in the payload** and was written to the ledger
+    without the guard in :meth:`TrackerPruningSink.record_curve`, so it came back as ``None`` and the
+    rule cannot fire a second time.  A writer outside this module bypassed the guard; the record is
+    not false.  A metric that is simply absent from the curve is *not* this case -- it is a record
+    citing evidence the ledger does not hold, which raises.
 
-    A curve whose steps go backwards raises ``ValueError`` out of the policy's own validator
-    rather than being reported as a mismatch: such a curve cannot be re-derived against at all,
-    and calling that "the record disagrees with itself" would name the wrong defect.
+    Anything else that disagrees raises :class:`PruneAuditError`: a different verdict, a spelling of
+    the reading no rule produced, a prefix the ledger does not have, or a last-seen step the curve
+    contradicts.
+
+    A curve whose steps go backwards raises ``ValueError`` out of the policy's own validator rather
+    than being reported as a mismatch: such a curve cannot be re-derived against at all, and calling
+    that "the record disagrees with itself" would name the wrong defect.
     """
-    recomputed = policy.decide(curve)
+    prefix = _decision_prefix(decision, curve)
+    recomputed = policy.decide(prefix)
     if recomputed is None:
-        if _lost_to_normalisation(decision, curve):
+        if _lost_to_normalisation(decision, prefix):
             return "unverifiable"
         raise PruneAuditError(
             f"the decision says {decision.reason} fired at step {decision.step}, but re-running "
-            f"{decision.policy_fingerprint[:12]} over the recorded curve matches no rule"
+            f"{decision.policy_fingerprint[:12]} over the {len(prefix)} recorded observations it "
+            f"saw matches no rule"
         )
-    if (recomputed.reason, recomputed.step, recomputed.matched_steps) != (
+    fields = ("reason", "step", "metric", "observed", "threshold", "matched_steps", "stop_reason")
+    expected = (
+        recomputed.reason,
+        recomputed.step,
+        recomputed.metric,
+        _stored_observed(recomputed),
+        recomputed.threshold,
+        recomputed.matched_steps,
+        recomputed.stop_reason,
+    )
+    recorded = (
         decision.reason,
         decision.step,
+        decision.metric,
+        decision.observed,
+        decision.threshold,
         decision.matched_steps,
-    ):
+        decision.stop_reason,
+    )
+    if expected != recorded:
+        differing = [
+            f"{name}: recorded {was!r}, re-derived {now!r}"
+            for name, was, now in zip(fields, recorded, expected)
+            if was != now
+        ]
         raise PruneAuditError(
-            f"the decision says {decision.reason} at step {decision.step} on "
-            f"{list(decision.matched_steps)}, but the recorded curve re-derives "
-            f"{recomputed.reason} at step {recomputed.step} on {list(recomputed.matched_steps)}"
+            "the decision and the curve it cites disagree on " + "; ".join(differing)
         )
     return "verified"
 
@@ -781,6 +935,13 @@ class PruneSummary(BaseModel):
     different facts about a configuration, and a ranking that averages them together is wrong in a
     way no one can see.  ``error`` exists because "never raises" must not mean "says nothing" --
     ``trial_ledger.summary()`` reports a broken chain rather than hiding it, and so does this.
+
+    ``contradicted`` is the fourth outcome for a pruned trial, and it is separate from
+    ``unverifiable`` because it calls for different action: the record cites evidence the ledger
+    contradicts, which is a defect in the record rather than a reading the ledger could not keep.
+    It is a field rather than an exception so that one bad record does not make the whole search
+    unreadable -- but it is a *named* field, so it is never quietly counted as checked either.
+    ``contradiction_detail`` carries the reasons, one per entry, prefixed with the trial index.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -792,6 +953,8 @@ class PruneSummary(BaseModel):
     verified: tuple[int, ...] = ()
     unverifiable: tuple[int, ...] = ()
     unexplained: tuple[int, ...] = ()
+    contradicted: tuple[int, ...] = ()
+    contradiction_detail: str = ""
     error: str = ""
 
 
@@ -803,19 +966,23 @@ def prune_summary(
     Three outcomes for a pruned trial, and they are kept apart because they call for different
     action:
 
-    * ``verified`` -- the recorded curve and the recorded policy re-derive the recorded verdict.
-    * ``unverifiable`` -- the reading the rule fired on was a non-finite float that reached the
-      ledger without :func:`canonical_metric`, so it came back as ``None`` and the rule cannot fire
-      again.  A writer bypassed the guard; the record is not false.
+    * ``verified`` -- the curve prefix the decision saw and the recorded policy re-derive every
+      field of the recorded verdict.
+    * ``unverifiable`` -- the reading the rule fired on was a non-finite float that was present in
+      the payload and reached the ledger without :meth:`TrackerPruningSink.record_curve`'s guard, so
+      it came back as ``None`` and the rule cannot fire again.  A writer bypassed the guard; the
+      record is not false.
     * ``unexplained`` -- no decision record, or the policy it cites was never stored.  The trial
       stopped early and nothing on disk says why.
+    * ``contradicted`` -- the record and the ledger disagree: a different verdict, a metric the
+      curve never held, a prefix the ledger does not have, or a last-seen step the curve
+      contradicts.  The reasons are in ``contradiction_detail``.
 
-    On a ledger that cannot be read at all, ``error`` is set and nothing raises: a search whose
-    results are still legible one field at a time is worth more than one that can only be read
-    while healthy.  A ``PruneAuditError`` is **not** caught -- a decision record contradicting its
-    own curve is a defect, and a summary that quietly left it out would be the exact failure this
-    layer exists to prevent.  Task 6 ranks on these numbers; it should not have to wonder whether
-    the ones it was handed were checked.
+    **Nothing raises**, and the first four buckets are why that is acceptable rather than quiet:
+    a search whose results are still legible one field at a time is worth more than one that can
+    only be read while healthy, and ``contradicted`` is a named outcome that task 6 cannot mistake
+    for a checked one.  The alternative -- raising out of the middle of the ranking -- loses every
+    other trial's verdict to report one record's defect.
     """
     try:
         trials: tuple[TrialRecord, ...] = (
@@ -831,6 +998,8 @@ def prune_summary(
     verified: list[int] = []
     unverifiable: list[int] = []
     unexplained: list[int] = []
+    contradicted: list[int] = []
+    contradiction_detail: list[str] = []
     for record in trials:
         if record.status == "pruned":
             pruned.append(record.index)
@@ -853,7 +1022,17 @@ def prune_summary(
         if policy is None:
             unexplained.append(record.index)
             continue
-        if verify_decision(decision, record.observations, policy) == "verified":
+        try:
+            outcome = verify_decision(decision, record.observations, policy)
+        except PruneAuditError as error:
+            # Caught per trial, not around the loop: one record contradicting its own curve must not
+            # cost every other trial its verdict.  The reason is kept verbatim -- "not raised" must
+            # not become "not reported", or this layer would be hiding the exact defect it exists
+            # to find.
+            contradicted.append(record.index)
+            contradiction_detail.append(f"trial {record.index}: {error}")
+            continue
+        if outcome == "verified":
             verified.append(record.index)
         else:
             unverifiable.append(record.index)
@@ -866,6 +1045,8 @@ def prune_summary(
         verified=tuple(sorted(verified)),
         unverifiable=tuple(sorted(unverifiable)),
         unexplained=tuple(sorted(unexplained)),
+        contradicted=tuple(sorted(contradicted)),
+        contradiction_detail="; ".join(contradiction_detail),
     )
 
 
@@ -913,7 +1094,7 @@ class PruningWatcher:
         self._sink = sink
         self._verdicts: dict[str, PruneVerdict] = {}
         self._declined: set[str] = set()
-        self._recorded: dict[str, int] = {}
+        self._forwarded: dict[str, set[int]] = {}
 
     @property
     def verdicts(self) -> tuple[PruneVerdict, ...]:
@@ -936,14 +1117,22 @@ class PruningWatcher:
         if trial_id in self._declined:
             return None
         curve = tuple(self._source.curve(trial_id))
-        already = self._recorded.get(trial_id, 0)
-        fresh = curve[already:]
+        # Forwarded **by step, not by count**.  A count is only meaningful while the curve can
+        # lengthen in one direction: when the source's file is truncated or rotated it starts over
+        # from a shorter curve, the old count is larger than the new length, and ``curve[already:]``
+        # is empty forever -- new observations are silently never forwarded again.  A set of steps
+        # survives a reset, and matches what the sink already does with them (it drops a step it has
+        # seen, because a curve that goes 1, 2, 1, 2 is refused by this module's own validator).
+        forwarded = self._forwarded.setdefault(trial_id, set())
+        fresh = tuple(
+            observation for observation in curve if observation.step not in forwarded
+        )
         if fresh:
             # Only the new part is forwarded.  ``SearchTracker.observe`` appends blindly
             # (``hyperparameter_search.py:1110``), so sending the whole curve again on every look
             # would multiply the record's observations by the number of polls.
             self._sink.record_curve(trial_id, fresh)
-            self._recorded[trial_id] = len(curve)
+            forwarded.update(observation.step for observation in fresh)
         verdict = self._policy.decide(curve)
         if verdict is None:
             return None
@@ -1099,24 +1288,40 @@ class JsonlTelemetryCurveSource:
     otherwise would mean a second, subtly different parser of the same grammar.
     """
 
+    #: How many bytes before the cursor are re-read to confirm it still points into the same file.
+    #: Enough to notice a rotation, and cheap enough to do on every poll.
+    _FINGERPRINT_BYTES = 64
+
     def __init__(self, *, locate: Callable[[str], Path | None]) -> None:
         self._locate = locate
-        self._cursors: dict[str, tuple[Path, int, tuple[TrialObservation, ...]]] = {}
+        self._cursors: dict[str, tuple[Path, int, tuple[TrialObservation, ...], bytes]] = {}
 
     def curve(self, trial_id: str) -> tuple[TrialObservation, ...]:
         path = self._locate(trial_id)
         if path is None:
             return ()
         known = self._cursors.get(trial_id)
-        offset, observations = (known[1], known[2]) if known is not None and known[0] == path else (0, ())
+        if known is not None and known[0] == path:
+            offset, observations, fingerprint = known[1], known[2], known[3]
+        else:
+            offset, observations, fingerprint = 0, (), b""
         try:
             size = path.stat().st_size
         except OSError:
             return observations
-        if size < offset:
-            # The file was truncated or rotated.  Starting over is the only reading that does not
+        if size < offset or not self._fingerprint_holds(path, offset, fingerprint):
+            # Truncated **or rewritten in place**.  Starting over is the only reading that does not
             # invent steps: the bytes before the cut are no longer evidence of anything.
-            offset, observations = 0, ()
+            #
+            # The size test alone is not enough, and the case it misses is the destructive one.  A
+            # rotation to a same-or-larger file leaves ``size >= offset``, so the stale offset is
+            # trusted, lands mid-line in the new file, and the fragment it finds does not start with
+            # ``{`` -- so the whole JSONL is re-read through the text-log parser, which understands
+            # none of it and returns nothing.  The curve silently comes back empty, the points
+            # already read are discarded, and the cursor parks at the new file's end so the loss is
+            # permanent.  Measured before this guard existed: ``[1, 2, 3]`` -> ``[]`` -> ``[200]``.
+            # Re-reading the bytes that end at the cursor costs one small read and closes it.
+            offset, observations, fingerprint = 0, (), b""
         if size == offset:
             return observations
         data = self._read_from(path, offset)
@@ -1124,19 +1329,36 @@ class JsonlTelemetryCurveSource:
             return observations
         head = self._first_content(data)
         if head is None:
-            self._cursors[trial_id] = (path, size, observations)
+            self._cursors[trial_id] = (path, size, observations, self._tail_bytes(path, size) or b"")
             return observations
         if head.lstrip().startswith(b"{"):
             consumed, added = self._read_json_lines(data)
             merged = observations + added
-            self._cursors[trial_id] = (path, offset + consumed, merged)
+            end = offset + consumed
+            self._cursors[trial_id] = (path, end, merged, self._tail_bytes(path, end) or b"")
             return merged
         text = self._read_text(path)
         if text is None:
             return observations
         parsed = parse_telemetry_lines(text)
-        self._cursors[trial_id] = (path, size, parsed)
+        self._cursors[trial_id] = (path, size, parsed, self._tail_bytes(path, size) or b"")
         return parsed
+
+    def _fingerprint_holds(self, path: Path, offset: int, fingerprint: bytes) -> bool:
+        """Do the bytes ending at ``offset`` still read the way they did when the cursor was set?"""
+        if offset == 0:
+            return True
+        return self._tail_bytes(path, offset) == fingerprint
+
+    def _tail_bytes(self, path: Path, offset: int) -> bytes | None:
+        """Up to ``_FINGERPRINT_BYTES`` bytes ending at ``offset``; ``None`` if they cannot be read."""
+        start = max(0, offset - self._FINGERPRINT_BYTES)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                return handle.read(offset - start)
+        except OSError:
+            return None
 
     @staticmethod
     def _read_from(path: Path, offset: int) -> bytes | None:
@@ -1255,6 +1477,16 @@ class TrackerPruningSink:
 
         ``observe`` also refuses an empty payload and refuses a trial that is not running; both
         refusals are right, so this returns quietly instead of making a caller expect an error.
+
+        **This is also where a non-finite reading is stopped from becoming a ``null``.**  The ledger
+        persists with ``model_dump(mode="json")``, which turns ``float('nan')`` into ``None`` without
+        saying so; a reading lost that way can never be re-derived, so the decision that acted on it
+        is permanently unauditable and :func:`verify_decision` has to file it as "unverifiable" --
+        the outcome its own docstring reserves for "a caller bypassed the writer".  Letting the
+        module's *own* reference writer produce that state would make the audit's excuse for the
+        writer's mistake.  So every observation is canonicalised here, one line before the ledger
+        sees it.  Measured: without this, driving the documented pipeline with a raw ``nan`` yields
+        ``{'reward': {'total': None}}`` on disk and ``unverifiable`` from the audit.
         """
         if not observations:
             return
@@ -1267,7 +1499,7 @@ class TrackerPruningSink:
             if observation.step in known:
                 continue
             known.add(observation.step)
-            fresh.append(observation)
+            fresh.append(_canonical_observation(observation))
         if not fresh:
             return
         self._tracker.observe(trial_id, TrialOutcome(status="running", observations=tuple(fresh)))
@@ -1307,12 +1539,11 @@ class TrackerPruningSink:
     ) -> PruneDecisionRecord:
         curve_len = len(record.observations)
         through_step = record.observations[-1].step if record.observations else 0
-        observed: float | str | None = verdict.observed
-        if observed is None and verdict.reason == "nan_metric":
-            # The one rule whose reading cannot be carried as a number.  Storing the canonical text
-            # is what lets a reader tell "this decision acted on a NaN" from "this decision recorded
-            # no reading", which are different claims.
-            observed = "nan"
+        # The one rule whose reading cannot be carried as a number: the canonical text is stored so
+        # a reader can tell "this decision acted on a NaN" from "this decision recorded no reading".
+        # Shared with the auditor rather than re-derived here, because these two rules drifting
+        # apart is exactly how a correct record starts looking like a contradiction.
+        observed = _stored_observed(verdict)
         return PruneDecisionRecord(
             id=f"prune-decision:{trial_id}",
             trial_id=trial_id,
@@ -1329,9 +1560,6 @@ class TrackerPruningSink:
         )
 
 
-_SENTINEL = "TAILI_RUN_FINISHED"
-
-
 class PruningTrialRunner:
     """A reference :class:`TrialRunner` that watches the trial it is running.  **Not validated
     against real training**: the thread, the cadence, and the cancellation below have only ever
@@ -1341,10 +1569,25 @@ class PruningTrialRunner:
     synchronous by contract (``hyperparameter_search.py:233``) and a pruner that waited for the
     run to end before deciding would be deciding nothing.
 
-    Termination is proven rather than assumed: the worker's end sentinel is the inner runner
-    returning, so if the deadline passes without it the process is killed **and the sentinel's
-    absence from the captured log is the evidence that it really was still running**.  That check
-    is offline and reproducible; "we asked it to stop" is not evidence of anything.
+    The only termination evidence here is **in-process**: the worker sets an event in a ``finally``,
+    so the event means "the worker returned" -- not "the worker succeeded", and not anything about a
+    subprocess.  It is enough to know when to stop polling and it is not a proof that a run ended.
+
+    **What is deliberately not implemented**, listed because a reader would otherwise assume it from
+    the parameters:
+
+    * ``run()`` has **no deadline**.  It polls until the worker returns, however long that takes;
+      no code path here kills a run for running too long.
+    * **Nothing writes a process-level end sentinel.**  An earlier version of this docstring claimed
+      that "the sentinel's absence from the captured log" proved a run was still going.  No module
+      in this repository ever wrote that line, so the claim could not be evaluated at all -- it was
+      removed rather than left standing.  Proving a real subprocess ended needs the training layer
+      to emit something, which is a different task.
+    * ``terminate()`` is best-effort and has **no caller in this repository**; it needs a process
+      handle this module never holds.
+
+    What *is* enforced is that a failing poller never abandons the worker: if ``review`` raises, the
+    worker is still joined and its own failure is reported rather than swallowed.  See :meth:`run`.
     """
 
     def __init__(
@@ -1370,9 +1613,24 @@ class PruningTrialRunner:
         self._runner.preflight(request)
 
     def run(self, request: Any) -> TrialOutcome:
+        """Run the inner runner in a worker while polling, and never abandon the worker.
+
+        ``review`` raising is the ordinary way this goes wrong -- R-7 names a ``SearchError`` thrown
+        into the poller when the trial finished underneath it.  Letting that exception escape the
+        loop leaves the worker running with nothing watching it, and leaves the inner runner's own
+        failure sitting in a frame nobody ever returns to: a training crash would then be swallowed
+        with no traceback and no ``threading.excepthook`` call, which is the worst possible outcome
+        for a process that may still be training.  So the loop's failure is held, the worker is
+        joined either way, and neither failure is dropped.
+
+        When both failed, the poller's exception is raised with the inner failure attached as a
+        note, rather than one being chosen over the other: which one matters depends on the caller,
+        and a message that names both is the only version that does not hide one of them.
+        """
         outcome: dict[str, Any] = {}
         failure: dict[str, BaseException] = {}
         finished = threading.Event()
+        polled: dict[str, BaseException] = {}
 
         def worker() -> None:
             try:
@@ -1380,29 +1638,49 @@ class PruningTrialRunner:
             except BaseException as error:  # noqa: BLE001 - re-raised in the caller's thread
                 failure["value"] = error
             finally:
-                # The sentinel: set in ``finally`` so it means "the worker is done", not "the
-                # worker succeeded".  A poller that read success into it would stop watching a
-                # run that had already died with an exception.
+                # Set in ``finally`` so it means "the worker is done", not "the worker succeeded".
+                # A poller that read success into it would stop watching a run that had already
+                # died with an exception.
                 finished.set()
 
         thread = threading.Thread(target=worker, name=f"prune-{request.trial_id}", daemon=True)
         thread.start()
-        while not finished.wait(self._interval):
-            self._watcher.review(request.trial_id)
-        thread.join()
-        if "value" in failure:
-            raise failure["value"]
+        try:
+            while not finished.wait(self._interval):
+                self._watcher.review(request.trial_id)
+        except BaseException as error:  # noqa: BLE001 - joined below, then re-raised
+            polled["value"] = error
+        finally:
+            # Unconditional, and unbounded on purpose: waiting here is the difference between "the
+            # poller stopped watching" and "a training process was left running with no one
+            # responsible for it".
+            thread.join()
+        inner = failure.get("value")
+        if "value" in polled:
+            error = polled["value"]
+            if inner is not None:
+                error.add_note(f"the inner runner also failed and was not re-raised: {inner!r}")
+            raise error
+        if inner is not None:
+            raise inner
         return outcome["value"]
 
     def terminate(self, trial_id: str, reason: str, process: Any | None = None) -> bool:
-        """Best-effort stop of an inner run that has not ended by its deadline.
+        """Best-effort stop of an inner run, given a process handle.  **No caller in this repo.**
 
-        Returns whether the sentinel was observed.  ``True`` means the inner run ended.  ``False``
-        means the deadline passed and whatever ``process`` was given had to be killed -- which the
-        caller should treat as "unknown how far it got", not as a clean stop.
+        Returns whether the process was **observed to have ended**.  ``True`` means it exited within
+        ``terminate_timeout_s``, or was killed and then observed gone.  ``False`` means it could not
+        be confirmed ended -- either the kill did not take effect, or no handle was given at all, in
+        which case there is nothing here that could have stopped anything.  ``False`` is therefore
+        "unknown how far it got", never "it stopped cleanly".
+
+        ``trial_id`` and ``reason`` are for a caller that wants to log what it asked for; nothing in
+        this method reads them.
         """
         if process is None:
-            return True
+            # Not "it ended" -- "this call cannot know".  Returning True here was the previous
+            # behaviour, and it read a missing handle as evidence of a clean stop.
+            return False
         deadline = time.monotonic() + self._terminate_timeout_s
         while time.monotonic() < deadline:
             if process.poll() is not None:
