@@ -35,9 +35,25 @@ def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _choice_key(value: Any) -> str:
-    """Stable identity for a categorical choice, including unhashable ones."""
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+def json_form(value: Any) -> str | None:
+    """Canonical JSON form of a value, or ``None`` when it has none.
+
+    This is the identity a config file writes and reads back: ``8`` and ``8.0``
+    compare equal in Python but are different scalars in YAML, so a search that
+    recorded one must not accept the other.  ``None`` means the value has no JSON
+    form -- a set, a tuple of mixed types, an arbitrary object.  Serializing those
+    would need a fallback to ``repr``, and ``repr`` of a set of strings changes
+    with the process's hash seed: three runs produce two different strings.
+    Everything derived from this form (uniqueness, membership, the content
+    fingerprint, a config value read back from disk) would then disagree between
+    processes, and a search recorded in one process could not be replayed in
+    another.  Such a value must be writable into a YAML config anyway, so it is
+    rejected where it is declared rather than here.
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
 
 
 _TOLERANCE = 1.0e-9
@@ -45,15 +61,21 @@ _MAX_INTEGRALITY_SLACK = 1.0e-6
 _MAX_ENUMERABLE_POINTS = 1_000_000
 
 
-def _nearly_integral(value: float, *, tolerance: float = _TOLERANCE) -> bool:
+def _nearly_integral(value: float, *, scale: float = 1.0) -> bool:
     """Whether ``value`` is a whole number, allowing for float error.
 
-    The slack widens with magnitude so that a large step count still compares, but
-    it is capped.  An uncapped relative slack admits the midpoint between two
-    neighbouring grid points as "integral" once a domain holds a billion of them,
-    which would let ``contains`` accept a value that is not on the grid at all.
+    ``scale`` is how large the numbers were that ``value`` was computed from.  A
+    ratio formed from two numbers near ten million carries about a hundred million
+    times the absolute error of one formed near 1, so a slack that only follows
+    ``value`` itself rejects a grid point of a domain that starts far from zero --
+    the offset of that point is near 1 while its error is not.
+
+    The slack is capped all the same.  Uncapped, a domain holding a billion points
+    would eventually admit the midpoint between two neighbours as "on the grid".
     """
-    return abs(value - round(value)) <= min(tolerance * max(1.0, abs(value)), _MAX_INTEGRALITY_SLACK)
+    return abs(value - round(value)) <= min(
+        _TOLERANCE * max(1.0, abs(value), abs(scale)), _MAX_INTEGRALITY_SLACK
+    )
 
 
 def _within_bounds(number: float, low: float, high: float, *, tolerance: float = _TOLERANCE) -> bool:
@@ -158,6 +180,11 @@ class ParameterCondition(BaseModel):
     ``kl_threshold`` only affects training while the KL-adaptive scheduler is
     selected; sampling it unconditionally would produce configurations whose
     recorded value never reached the optimizer.
+
+    Whether the condition holds is decided by the guard's own membership test,
+    which only the schema can run -- see :meth:`SearchSpaceSchema.is_active`.
+    A condition cannot answer for itself, because the answer depends on the guard
+    spec's domain and not on the condition alone.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -174,17 +201,13 @@ class ParameterCondition(BaseModel):
             runaway = _find_non_finite(value)
             if runaway is not None:
                 raise ValueError(f"condition values must be finite, got {runaway!r}")
-        keys = [_choice_key(value) for value in self.values]
+            if json_form(value) is None:
+                raise ValueError(f"condition values must have a JSON form, got {value!r}")
+        keys = [json_form(value) for value in self.values]
         if len(set(keys)) != len(keys):
             raise ValueError("condition values must be unique")
         return self
 
-    def applies_to(self, assignment: Mapping[str, Any]) -> bool:
-        """Return whether the guarded parameter is active for this assignment."""
-        found, value = get_parameter(assignment, self.parameter)
-        if not found:
-            return False
-        return _choice_key(value) in {_choice_key(item) for item in self.values}
 
 
 class ParameterConstraint(BaseModel):
@@ -313,8 +336,19 @@ class HyperparameterSpec(BaseModel):
             raise ValueError(f"{self.name}: discrete parameters cannot declare choices")
         if self.grid_points is not None:
             raise ValueError(f"{self.name}: discrete parameters are already enumerable")
+        spacing = math.ulp(max(abs(float(self.low)), abs(float(self.high))))
+        if float(self.step) < spacing:
+            # Below one unit in the last place the domain cannot hold the points it
+            # claims: ``low + step`` rounds back to ``low`` at this magnitude, so
+            # neighbouring points are literally the same number and a grid would
+            # report a duplicate that the walk never produced.
+            raise ValueError(
+                f"{self.name}: step {self.step} is finer than the {spacing} a value near "
+                f"{max(abs(float(self.low)), abs(float(self.high)))} can express, so the "
+                f"domain's neighbouring points are the same number"
+            )
         span = (float(self.high) - float(self.low)) / float(self.step)
-        if not _nearly_integral(span):
+        if not _nearly_integral(span, scale=self._step_scale()):
             raise ValueError(f"{self.name}: the range is not divisible by step")
 
     def _validate_categorical(self) -> None:
@@ -327,9 +361,15 @@ class HyperparameterSpec(BaseModel):
             runaway = _find_non_finite(choice)
             if runaway is not None:
                 raise ValueError(f"{self.name}: a choice must be finite, got {runaway!r}")
-        keys = [_choice_key(choice) for choice in self.choices]
+            if json_form(choice) is None:
+                # Written into a YAML config eventually, so it has to have a JSON
+                # form; see ``json_form`` for why a fallback to ``repr`` would
+                # make the fingerprint depend on the process's hash seed.
+                raise ValueError(f"{self.name}: a choice must have a JSON form, got {choice!r}")
+        keys = [json_form(choice) for choice in self.choices]
         if len(set(keys)) != len(keys):
             raise ValueError(f"{self.name}: choices must be unique")
+        self._validate_no_indistinguishable_choices()
         for bound in (self.low, self.high, self.step):
             if bound is not None:
                 raise ValueError(f"{self.name}: categorical parameters cannot declare numeric bounds")
@@ -337,6 +377,24 @@ class HyperparameterSpec(BaseModel):
             raise ValueError(f"{self.name}: categorical parameters cannot be log-scaled")
         if self.grid_points is not None:
             raise ValueError(f"{self.name}: categorical parameters are already enumerable")
+
+    def _validate_no_indistinguishable_choices(self) -> None:
+        """Reject two choices a reader of the config cannot tell apart.
+
+        ``8`` and ``8.0`` have different JSON forms, so the uniqueness check above
+        lets both through, but every equality test reads them as one number: a
+        search would spend a trial on a value it had already tried, and report two
+        results for one setting.  Bools are exempt -- ``True`` and ``1`` compare
+        equal in Python, but they are different scalars in the YAML a trainer reads.
+        """
+        numbers = [float(choice) for choice in self.choices if _is_number(choice)]
+        for position, left in enumerate(numbers):
+            for right in numbers[position + 1:]:
+                if left == right:
+                    raise ValueError(
+                        f"{self.name}: choices {list(self.choices)!r} hold two values that "
+                        f"compare equal, so a search would try one setting twice"
+                    )
 
     def _has_whole_valued_points(self) -> bool:
         """Whether every grid point is a whole number.
@@ -346,10 +404,37 @@ class HyperparameterSpec(BaseModel):
         """
         return all(float(value).is_integer() for value in (self.low, self.high, self.step))
 
+    def discrete_count(self) -> int:
+        """Number of points in a discrete domain, both bounds included."""
+        if self.kind != "discrete":
+            raise ValueError(f"{self.name}: only a discrete domain is countable")
+        return int(round((float(self.high) - float(self.low)) / float(self.step))) + 1
+
+    def discrete_value(self, index: int) -> Any:
+        """The ``index``-th point of a discrete domain, bounds included.
+
+        The endpoints are pinned to the declared bounds instead of recomputed from
+        ``low + index * step``: the arithmetic absorbs float error, and a point
+        just outside the domain would fail ``contains`` on a sampler's own output.
+        An integer-valued domain yields Python ints, so a config that declares
+        ``mini_batches: 16`` is never overwritten with ``16.0``.
+        """
+        if self.kind != "discrete":
+            raise ValueError(f"{self.name}: only a discrete domain is indexable")
+        if not 0 <= index < self.discrete_count():
+            raise ValueError(f"{self.name}: grid index {index} is outside 0..{self.discrete_count() - 1}")
+        if index == 0:
+            value = float(self.low)
+        elif index == self.discrete_count() - 1:
+            value = float(self.high)
+        else:
+            value = float(self.low) + index * float(self.step)
+        return int(round(value)) if self._has_whole_valued_points() else value
+
     def contains(self, value: Any) -> bool:
         """Return whether ``value`` lies inside the declared domain."""
         if self.kind == "categorical":
-            return _choice_key(value) in {_choice_key(choice) for choice in self.choices}
+            return json_form(value) in {json_form(choice) for choice in self.choices}
         if not _is_number(value):
             return False
         number = float(value)
@@ -359,8 +444,42 @@ class HyperparameterSpec(BaseModel):
             return False
         if self.kind == "continuous":
             return True
-        offset = (number - float(self.low)) / float(self.step)
-        return _nearly_integral(offset)
+        return _nearly_integral(self._discrete_offset(number), scale=self._step_scale())
+
+    def _discrete_offset(self, value: float) -> float:
+        """How many steps ``value`` sits above the low bound."""
+        return (float(value) - float(self.low)) / float(self.step)
+
+    def _step_scale(self) -> float:
+        """How large the numbers are that a step ratio is computed from.
+
+        The error in ``(value - low) / step`` follows the magnitude of the operands,
+        not of the result: the offset of the second point is near 1 whether the domain
+        starts at 0 or at ten million, while the error in it differs by seven orders
+        of magnitude.
+        """
+        return max(abs(float(self.low)), abs(float(self.high))) / float(self.step)
+
+    def identifies(self, left: Any, right: Any) -> bool:
+        """Whether this domain treats two values as the same point.
+
+        Narrower than "both are in the domain": ``0`` and ``0.0`` are different
+        values that name one point of a discrete grid, and a condition written as
+        ``0`` must still match a guard holding ``0.0``.  A value outside the domain
+        identifies with nothing, so the answer is total.
+
+        A condition uses this test, and so does the space when it checks that a
+        condition can ever hold -- one notion of "the same point" for both, because
+        two notions that disagree would accept a condition at load time and then
+        never let it fire.
+        """
+        if not (self.contains(left) and self.contains(right)):
+            return False
+        if self.kind == "categorical":
+            return json_form(left) == json_form(right)
+        if self.kind == "discrete":
+            return round(self._discrete_offset(left)) == round(self._discrete_offset(right))
+        return float(left) == float(right)
 
     def validate_value(self, value: Any) -> None:
         """Raise ``ValueError`` unless ``value`` lies inside the declared domain."""
@@ -390,26 +509,26 @@ class HyperparameterSpec(BaseModel):
         if self.kind == "continuous":
             if self.grid_points is None:
                 return None
-            return self._continuous_grid()
-        low, high, step = float(self.low), float(self.high), float(self.step)
-        count = int(round((high - low) / step)) + 1
-        if count > _MAX_ENUMERABLE_POINTS:
-            # Materializing the list first would allocate gigabytes and look like a
-            # hang; the caller wants a clear refusal it can fall back from.
+            values = self._continuous_grid()
+        else:
+            count = self.discrete_count()
+            if count > _MAX_ENUMERABLE_POINTS:
+                # Materializing the list first would allocate gigabytes and look like a
+                # hang; the caller wants a clear refusal it can fall back from.
+                raise ValueError(
+                    f"{self.name}: enumerating {count} points exceeds the "
+                    f"{_MAX_ENUMERABLE_POINTS} a grid may materialize; widen step or sample randomly"
+                )
+            values = tuple(self.discrete_value(index) for index in range(count))
+        if len(set(values)) != len(values):
+            # Checked rather than argued: a grid whose points collapse still reads as
+            # a complete enumeration, and the duplicate it produces surfaces in the
+            # sampler as "the walk is wrong" -- an accusation aimed at the wrong code.
             raise ValueError(
-                f"{self.name}: enumerating {count} points exceeds the "
-                f"{_MAX_ENUMERABLE_POINTS} a grid may materialize; widen step or sample randomly"
+                f"{self.name}: {len(values)} declared points collapse to "
+                f"{len(set(values))} distinct numbers at this magnitude"
             )
-        values = [low + index * step for index in range(count)]
-        # Validation already proved the range is divisible by step, so the last
-        # grid point is high by construction.  Pinning it to the declared bound
-        # rather than the float coercion removes the accumulated error that would
-        # otherwise put it just outside the domain, and keeps an integer domain
-        # yielding ints.
-        values[-1] = self.high
-        if self._has_whole_valued_points():
-            return tuple(int(round(value)) for value in values)
-        return tuple(values)
+        return values
 
     def _continuous_grid(self) -> tuple[float, ...]:
         """Place ``grid_points`` values across the domain, endpoints included."""
@@ -426,14 +545,6 @@ class HyperparameterSpec(BaseModel):
         values[0], values[-1] = low, high
         return tuple(values)
 
-    def condition_holds(self, assignment: Mapping[str, Any]) -> bool:
-        """Return whether this parameter's own condition holds for the assignment.
-
-        This is only the local check.  A parameter whose guard is itself inactive
-        must not count as active, which is why callers go through
-        :meth:`SearchSpaceSchema.is_active` rather than asking a lone spec.
-        """
-        return self.condition is None or self.condition.applies_to(assignment)
 
 
 class SearchSpaceSchema(BaseModel):
@@ -465,6 +576,7 @@ class SearchSpaceSchema(BaseModel):
             guard = spec.condition.parameter
             if guard not in known:
                 raise ValueError(f"{spec.name} is conditional on unknown parameter {guard!r}")
+            self._validate_condition_guard_kind(spec, by_name[guard])
             self._validate_condition_reaches_its_guard(spec, by_name[guard])
             edges[spec.name] = guard
         cycle = _find_dependency_cycle(edges)
@@ -488,6 +600,27 @@ class SearchSpaceSchema(BaseModel):
                         f"{name} is a prefix of {longer}: one would have to hold a value "
                         f"and the other a mapping"
                     )
+
+    def _validate_condition_guard_kind(
+        self,
+        spec: HyperparameterSpec,
+        guard: HyperparameterSpec,
+    ) -> None:
+        """Reject a condition whose guard has no values to be equal to.
+
+        A condition means "the guard holds one of these values".  A continuous
+        guard is drawn from an interval, so a drawn value equals a named one only
+        by accident -- the condition would fire almost never, and the parameter
+        would be dead in practice while looking alive on paper.  An inequality
+        would be a relation between parameters, which is what
+        :class:`ParameterConstraint` is for, so nothing expressible is lost here.
+        """
+        if guard.kind == "continuous":
+            raise ValueError(
+                f"{spec.name} is conditioned on {guard.name}, which is continuous: "
+                f"a condition names values the guard must equal, and a value drawn "
+                f"from {guard.describe_domain()} would match only by coincidence"
+            )
 
     def _validate_condition_reaches_its_guard(
         self,
@@ -536,6 +669,14 @@ class SearchSpaceSchema(BaseModel):
         depends on is itself active.  Without that, switching a scheduler off would
         leave its dependent tuning knob "active" and a sampler would draw a value
         that can never reach the optimizer.
+
+        The condition is tested with the guard's own
+        :meth:`~HyperparameterSpec.identifies`, which is the point-equality the
+        space also applies when it checks that a condition can ever hold.
+        Comparing serialized values instead would let the two disagree: a discrete
+        guard holding ``0.0`` does hold the point a condition names as ``0``, but
+        their JSON forms differ, so the parameter would be accepted at load time
+        and then never activate.
         """
         by_name = {spec.name: spec for spec in self.specs}
 
@@ -543,7 +684,11 @@ class SearchSpaceSchema(BaseModel):
             spec = by_name[name]
             if spec.condition is None:
                 return True
-            if not spec.condition.applies_to(assignment):
+            guard = by_name[spec.condition.parameter]
+            found, value = get_parameter(assignment, spec.condition.parameter)
+            if not found:
+                return False
+            if not any(guard.identifies(value, item) for item in spec.condition.values):
                 return False
             return resolve(spec.condition.parameter)
 
@@ -706,9 +851,16 @@ class SearchSpaceSchema(BaseModel):
             {
                 "schema_version": self.schema_version,
                 "specs": [spec.model_dump(mode="json", exclude_none=True) for spec in ordered],
+                # Sorted by every field, not only the kind and the parameter.  Two
+                # constraints on one parameter -- ``c`` a multiple of both ``a`` and
+                # ``b`` -- tie on a shorter key, and a stable sort then leaves them in
+                # declaration order, which is the order this method promises not to
+                # depend on.
                 "constraints": [
                     constraint.model_dump(mode="json")
-                    for constraint in sorted(self.constraints, key=lambda item: (item.kind, item.parameter))
+                    for constraint in sorted(
+                        self.constraints, key=lambda item: (item.kind, item.parameter, item.of)
+                    )
                 ],
             }
         )

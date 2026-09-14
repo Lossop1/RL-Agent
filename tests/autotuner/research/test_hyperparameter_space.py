@@ -7,6 +7,7 @@ instead of passing against a hand-copied fixture that drifted with it.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -25,7 +26,8 @@ from autotuner.research.hyperparameter_space import (
     split_parameter,
 )
 
-_PRODUCT_DIR = Path(__file__).resolve().parents[3] / "products" / "taili" / "blind_locomotion"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+_PRODUCT_DIR = REPO_ROOT / "products" / "taili" / "blind_locomotion"
 SPACE_PATH = _PRODUCT_DIR / "hyperparameter_space.yaml"
 CONFIG_PATH = _PRODUCT_DIR / "taili_blind_config.yaml"
 
@@ -564,6 +566,63 @@ def test_a_fractional_domain_grid_enumerates_floats():
     assert all(spec.contains(value) for value in values)
 
 
+def test_a_discrete_domain_is_countable_and_indexable():
+    """The interface an indexed draw needs, without re-deriving the grid arithmetic."""
+    spec = _discrete("a", 4, 16, 4, 8)
+    assert spec.discrete_count() == 4
+    assert [spec.discrete_value(index) for index in range(spec.discrete_count())] == list(
+        spec.grid_values()
+    )
+    assert spec.discrete_value(0) == spec.low
+    assert spec.discrete_value(spec.discrete_count() - 1) == spec.high
+
+
+def test_a_discrete_index_stays_inside_the_domain_at_both_ends():
+    """An indexed draw can hit either end, and both must satisfy ``contains``.
+
+    The last point is pinned to ``high`` rather than recomputed: ``0.1 + 3 * 0.2``
+    is not ``0.7`` in binary floating point, and a grid point that missed its own
+    boundary would fail ``contains`` on a sampler's own output.
+    """
+    spec = HyperparameterSpec(name="a", kind="discrete", low=0.1, high=0.7, step=0.2, default=0.3)
+    assert 0.1 + 3 * 0.2 != 0.7
+    values = spec.grid_values()
+    assert values[0] == 0.1
+    assert values[-1] == 0.7
+    assert spec.discrete_value(spec.discrete_count() - 1) == 0.7
+    assert all(spec.contains(value) for value in values)
+
+
+def test_a_discrete_index_outside_the_domain_is_rejected():
+    spec = _discrete("a", 4, 16, 4, 8)
+    with pytest.raises(ValueError, match="outside 0..3"):
+        spec.discrete_value(4)
+    with pytest.raises(ValueError, match="outside 0..3"):
+        spec.discrete_value(-1)
+
+
+def test_only_a_discrete_domain_is_countable_or_indexable():
+    continuous = _continuous("a", 0.0, 1.0, 0.5)
+    with pytest.raises(ValueError, match="only a discrete domain is countable"):
+        continuous.discrete_count()
+    with pytest.raises(ValueError, match="only a discrete domain is indexable"):
+        continuous.discrete_value(0)
+    categorical = _categorical("a", ("on", "off"), "on")
+    with pytest.raises(ValueError, match="only a discrete domain"):
+        categorical.discrete_count()
+
+
+def test_the_product_space_discrete_domains_are_indexable_end_to_end():
+    """Every sampled index must land on the shipped domain, ints included."""
+    space = _taili_space()
+    for name in ("skrl.agent.mini_batches", "skrl.agent.rollouts"):
+        spec = space.spec(name)
+        values = [spec.discrete_value(index) for index in range(spec.discrete_count())]
+        assert values == list(spec.grid_values())
+        assert all(isinstance(value, int) for value in values)
+        assert all(spec.contains(value) for value in values)
+
+
 def test_the_product_space_declares_the_rollouts_multiple_constraint():
     constraints = _taili_space().constraints
     assert len(constraints) == 1
@@ -761,6 +820,88 @@ def test_a_name_may_share_a_prefix_without_being_a_path_prefix_of_it():
     assert schema.sampling_order() == schema.names()
 
 
+def test_a_discrete_domain_folds_numeric_representations_of_one_point():
+    """The step is not whole, so the domain's points are floats."""
+    spec = HyperparameterSpec(name="g", kind="discrete", low=0.0, high=1.0, step=0.1, default=0.0)
+    first = spec.discrete_value(0)
+    assert isinstance(first, float)
+    assert spec.identifies(first, 0)
+    assert spec.identifies(0, first)
+    assert not spec.identifies(first, spec.discrete_value(1))
+
+
+def test_a_categorical_domain_identifies_only_its_declared_scalars():
+    """A choice is 8, not 8.0: the config has to write one of the declared scalars."""
+    spec = _categorical("c", (8, "other"), 8)
+    assert spec.identifies(8, 8)
+    assert not spec.identifies(8, 8.0)
+    assert not spec.identifies(8, "8")
+
+
+def test_two_choices_that_compare_equal_are_rejected():
+    """Different JSON forms, but a search would try one setting twice."""
+    with pytest.raises(ValueError, match="compare equal"):
+        _categorical("c", (8, 8.0), 8)
+    with pytest.raises(ValueError, match="compare equal"):
+        _categorical("c", (1, 1.0), 1)
+    # A bool is not a number here even though ``1 == True``: the YAML writes
+    # ``true``, so a reader can tell the two choices apart.
+    assert _categorical("c", (1, True), 1).identifies(True, True)
+
+
+def test_a_boolean_and_a_number_are_not_folded_together():
+    """``True == 1`` in Python, but they are different scalars in the YAML."""
+    spec = _categorical("c", (True, 2), True)
+    assert spec.identifies(True, True)
+    assert not spec.identifies(True, 1)
+
+
+def test_identifies_is_false_for_a_value_outside_the_domain():
+    spec = _discrete("a", 4, 16, 4, 8)
+    assert not spec.identifies(5, 8)
+    assert not spec.identifies(8, 5)
+    assert not spec.identifies(8, None)
+
+
+def test_a_condition_on_a_continuous_guard_is_rejected():
+    """Equality against an interval fires only by accident, so it is refused."""
+    with pytest.raises(ValueError, match="which is continuous"):
+        SearchSpaceSchema(specs=(
+            _continuous("lr", 1.0e-4, 1.0e-2, 1.0e-3),
+            HyperparameterSpec(
+                name="kw",
+                kind="discrete",
+                low=1,
+                high=2,
+                step=1,
+                default=1,
+                condition=ParameterCondition(parameter="lr", values=(1.0e-3,)),
+            ),
+        ))
+
+
+def test_a_condition_matches_a_guard_point_however_the_condition_writes_it():
+    """The load-time check and the run-time check must agree on "the same point"."""
+    guard = HyperparameterSpec(name="g", kind="discrete", low=0.0, high=1.0, step=0.1, default=0.0)
+    space = SearchSpaceSchema(specs=(
+        guard,
+        HyperparameterSpec(
+            name="tuned",
+            kind="discrete",
+            low=1,
+            high=2,
+            step=1,
+            default=1,
+            condition=ParameterCondition(parameter="g", values=(0,)),
+        ),
+    ))
+    # The shipped value is a float 0.0; the condition wrote an int 0.
+    on_the_point = {"g": guard.discrete_value(0)}
+    assert isinstance(on_the_point["g"], float)
+    assert space.is_active("tuned", on_the_point)
+    assert not space.is_active("tuned", {"g": guard.discrete_value(1)})
+
+
 def test_an_overlong_name_is_rejected_when_the_spec_is_built():
     """Rejected at construction, not later at the first name lookup."""
     with pytest.raises(ValueError, match="invalid parameter name"):
@@ -778,6 +919,40 @@ def test_a_non_finite_choice_is_rejected():
 def test_a_non_finite_condition_value_is_rejected():
     with pytest.raises(ValueError, match="must be finite"):
         ParameterCondition(parameter="a", values=(float("inf"),))
+
+
+def test_a_choice_without_a_json_form_is_rejected():
+    """``repr`` of a set changes with the process hash seed, so no stable key exists."""
+    with pytest.raises(ValueError, match="must have a JSON form"):
+        _categorical("a", (frozenset({"x", "y"}), "other"), "other")
+
+
+def test_a_condition_value_without_a_json_form_is_rejected():
+    with pytest.raises(ValueError, match="must have a JSON form"):
+        ParameterCondition(parameter="a", values=(frozenset({"x"}),))
+
+
+def test_the_fingerprint_is_the_same_in_another_process():
+    """A fingerprint that varies with PYTHONHASHSEED addresses nothing."""
+    import subprocess
+    import sys
+
+    script = (
+        "import yaml, sys;"
+        "from pathlib import Path;"
+        "from autotuner.research.hyperparameter_space import load_search_space;"
+        f"data = yaml.safe_load(Path({str(SPACE_PATH)!r}).read_text(encoding='utf-8'));"
+        "print(load_search_space(data).fingerprint())"
+    )
+    digests = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, check=True, cwd=str(REPO_ROOT),
+            env={**os.environ, "PYTHONHASHSEED": seed},
+        ).stdout.strip()
+        for seed in ("0", "1", "2", "12345")
+    }
+    assert digests == {_taili_space().fingerprint()}
 
 
 def test_a_grid_too_large_to_materialize_is_refused_rather_than_hung():
