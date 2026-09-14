@@ -189,7 +189,7 @@
 
 ### P4.4 超参数搜索空间
 - **问题**：定义可搜索的超参数及其范围
-- **状态**：进行中（拆分为 7 个原子任务，第 1、2、3 个完成）
+- **状态**：进行中（拆分为 7 个原子任务，第 1、2、3、4 个完成）
 - **阻塞**：无（P5.2 已完成）
 - **负责人**：
 - **验收标准**：搜索空间覆盖学习率、熵系数、折扣因子
@@ -203,10 +203,10 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 | 1 | 搜索空间 schema 与产品搜索空间数据 | 已完成 | autotuner/research/hyperparameter_space.py, products/taili/blind_locomotion/hyperparameter_space.yaml, tests/autotuner/research/test_hyperparameter_space.py |
 | 2 | 超参数采样器（网格/随机，含去重与重放） | 已完成 | autotuner/research/hyperparameter_sampler.py, tests/autotuner/research/test_hyperparameter_sampler.py |
 | 3 | 配置注入到训练流程 | 已完成 | autotuner/research/config_injection.py, tests/autotuner/research/test_config_injection.py |
-| 4 | 搜索试验跟踪 | 未开始 | - |
+| 4 | 搜索试验跟踪 | 已完成 | autotuner/research/trial_ledger.py, autotuner/research/hyperparameter_search.py, tests/autotuner/research/test_trial_ledger.py, tests/autotuner/research/test_hyperparameter_search.py |
 | 5 | 早停与剪枝策略 | 未开始 | - |
 | 6 | 搜索结果分析与最优配置导出 | 未开始 | - |
-| 7 | 贝叶斯采样器 | 阻塞：依赖任务 4 的观测反馈接口 | - |
+| 7 | 贝叶斯采样器 | 阻塞解除：任务 4 的观测反馈接口 `TrialObservationSource` 已落地，可开始 | - |
 
 任务 1 的实际范围：schema 定义域（continuous/discrete/categorical）、条件参数
 （含环路与前缀冲突检测）、参数间约束（multiple）、内容指纹、产品搜索空间 YAML 与
@@ -224,11 +224,26 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 且对扁平输入调用的校验是空操作），修复记录见 `P4.4_review_record.md` 的 I-1。
 它**不**证明训练进程读取了注入值：`--dry-run` 只到 `agent.skrl.yaml` 为止。
 
-任务 1-3 未覆盖（不属于夸大范围）：试验跟踪、剪枝、结果分析、贝叶斯采样。
+任务 4 的实际范围：通用 JSONL 台账引擎（`trial_ledger.py`：O(1) 追加、跨进程记录锁、
+撕裂尾行自愈、哈希链校验）+ 搜索语义与读写视图（`hyperparameter_search.py`：`TrialRecord` /
+`SearchRunRecord`、写入门面 `SearchTracker`、读侧 `SearchLedger`、给任务 7 的观测协议
+`TrialObservationSource`）。写入侧的守卫是 `append` 的 precondition、在锁内执行；`close_run`
+先跑一遍读侧检查再写，第二遍在锁内。它不跑训练、不决定停止、不排序——那是任务 5、6。
+两点如实说明：设计文档 §11.3 的五个待定默认值（规范目录、是否保留跨进程锁、是否镜像进
+`research_ledger`、`max_seconds` 默认层、`retry_interrupted` 默认值）**仍未定**，属策略选择
+而非缺失功能；未做真实 GPU 训练验证（`TrialRunner` 在测试里是替身）。
 
-三个任务的实现依据（多智能体审查的发现与判定）见 `docs/P4.4_review_record.md`。
+任务 1-4 未覆盖（不属于夸大范围）：剪枝、结果分析、贝叶斯采样。
+
+设计稿 `docs/P4.4_task4_design.md` 原先在开头写着「本文是设计提案，**尚未实现**」。该句已随
+实现更正，并订正了 7 处状态或计数（规模估计实测 763/1612 行、`mechanisms.json` 实测 13 个、
+`content_hash` 实测 27 处、A12 的判据由「grep 无输出」改为 AST 遍历、验收编号撞号改标 A42 等）；
+每条订正都附可复核命令，见 `docs/P4.4_review_record.md` §4.4.1。
+
+任务 1-3 的实现依据（多智能体审查的发现与判定）见 `docs/P4.4_review_record.md`。
 该记录列出已修复的 S-1..S-10、I-1、F-OPEN-1，以及**被反驳不予采纳**的 R-1..R-5，
-便于逐条复核。
+便于逐条复核。任务 4 的审查与**变异测试实测结果**（14 条变异，13 条被杀死、1 条存活并已
+补用例）见该文件 §四，含明确未验证事项。
 
 ### P4.5 训练遥测上报
 - **问题**：实时上报 loss/reward/episode 指标
@@ -416,7 +431,7 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 ### 需要优先完成的问题
 1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、5个训练入口迁移），步骤4-6待GPU运行时环境
 2. **P4.3 训练恢复**：单元测试已完成（32个测试），核心逻辑已实现，待GPU环境执行集成验证
-3. **P4.4 超参数搜索**：已拆为 7 个原子任务，任务 1-3（搜索空间、采样器、配置注入）完成；试验跟踪、早停剪枝、结果分析未开始，贝叶斯采样器阻塞于试验跟踪。可复用research_scheduler.py作为试验执行后端
+3. **P4.4 超参数搜索**：已拆为 7 个原子任务，任务 1-4（搜索空间、采样器、配置注入、试验跟踪）完成；早停剪枝、结果分析未开始，贝叶斯采样器（任务 7）的阻塞已随任务 4 的观测反馈接口解除。可复用research_scheduler.py作为试验执行后端
 4. **P6.4 接触力校准**：需要真实硬件数据
 
 ### 层级解耦评估
@@ -452,3 +467,6 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 - 2026-09-14：P4.4拆分为6个原子任务，完成第1个（搜索空间schema + 产品搜索空间数据 + 103个测试），其余5个未开始
 - 2026-09-14：P4.4完成第2、3个原子任务（采样器、配置注入），贝叶斯采样器拆为任务7并阻塞于任务4，合计7个原子任务；研究层测试241个通过。审查发现与判定见 docs/P4.4_review_record.md
 - 2026-09-14：新增"已知的文档与实现不一致（未修复）"一节，记录注释语言偏离与 P4.3 文档引用问题；归档 18 个工作流到 docs/archive/workflows/（commit c437c16）
+- 2026-09-14：P4.4 完成第 4 个原子任务（搜索试验跟踪）：trial_ledger.py（JSONL 台账引擎，跨进程记录锁、撕裂尾行自愈、哈希链）+ hyperparameter_search.py（记录模型、写入门面、读侧视图、给任务 7 的观测协议）；研究层测试 338 个通过。该轮审查含 14 条变异测试（13 条被杀死、1 条存活并据此补了一条用例，两轮变异测试中作废的一轮也如实记录），见 docs/P4.4_review_record.md §四
+- 2026-09-14：P4.4 任务 7（贝叶斯采样器）的阻塞解除：任务 4 已提供观测反馈接口 `TrialObservationSource`
+- 2026-09-14：P4.4 任务 4 的文档收尾。设计稿 `P4.4_task4_design.md` 从「尚未实现」改为「已按本文实现并验收」，并逐条订正 7 处状态或计数（规模估计实测 763/1612 行、`mechanisms.json` 实测 13 个且 0 个入库、`content_hash` 实测 27 处、A12 判据由「grep 无输出」改为 AST 遍历并说明 grep 为何不可能满足、验收编号 A33 撞号改标 A42、附录的「不声明任何代码已存在」）。收尾后重跑：研究层 338 passed、`check_repository_structure.py` 末行 errors=0、§10.4 的三条一次性命令均符合预期。每条订正的可复核命令见 docs/P4.4_review_record.md §4.4.1
