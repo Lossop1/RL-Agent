@@ -17,7 +17,7 @@
 
 - P4.4 研究层审查判定与处置：[`P4.4_review_record.md`](P4.4_review_record.md)
 - P4.4 任务 4 搜索试验跟踪设计稿（设计提案；**已按本文实现并验收**，见开头第 2 条）：[`P4.4_task4_design.md`](P4.4_task4_design.md)
-- P4.4 任务 5 早停与剪枝设计稿（**已实现**，实现位置 `autotuner/research/search_pruning.py`，89 用例；第 9 节区分实测与仅读码，并记有实现阶段运行出来的六条发现）：[`P4.4_task5_design.md`](P4.4_task5_design.md)
+- P4.4 任务 5 早停与剪枝设计稿（**已实现**，实现位置 `autotuner/research/search_pruning.py`，1690 行实现 + 2076 行用例、123 个用例；第 9 节区分实测与仅读码，并附 99 条行号引用的独立复核。**该稿 §4 曾把计划写成已落地，已就地标注并补落地映射**；审查与变异测试结果见 `P4.4_review_record.md` §六）：[`P4.4_task5_design.md`](P4.4_task5_design.md)
 - Taili 环境边界：[`taili_env_boundary.md`](taili_env_boundary.md)
 - 奖励所有权：[`taili_reward_ownership.md`](taili_reward_ownership.md)
 - 遥测契约：[`taili_telemetry_contract.md`](taili_telemetry_contract.md)

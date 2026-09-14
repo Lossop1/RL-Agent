@@ -204,7 +204,7 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 | 2 | 超参数采样器（网格/随机，含去重与重放） | 已完成 | autotuner/research/hyperparameter_sampler.py, tests/autotuner/research/test_hyperparameter_sampler.py |
 | 3 | 配置注入到训练流程 | 已完成 | autotuner/research/config_injection.py, tests/autotuner/research/test_config_injection.py |
 | 4 | 搜索试验跟踪 | 已完成 | autotuner/research/trial_ledger.py, autotuner/research/hyperparameter_search.py, tests/autotuner/research/test_trial_ledger.py, tests/autotuner/research/test_hyperparameter_search.py |
-| 5 | 早停与剪枝策略 | 已实现（89 用例通过；**未接过真实训练**，见下） | `autotuner/research/search_pruning.py`；设计稿 `docs/P4.4_task5_design.md` |
+| 5 | 早停与剪枝策略 | 已实现（123 用例通过；**未接过真实训练**，见下） | `autotuner/research/search_pruning.py`；设计稿 `docs/P4.4_task5_design.md`；审查记录 §六 |
 | 6 | 搜索结果分析与最优配置导出 | 未开始 | - |
 | 7 | 贝叶斯采样器 | 阻塞解除：任务 4 的观测反馈接口 `TrialObservationSource` 已落地，可开始 | - |
 
@@ -236,15 +236,24 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 任务 1-4 未覆盖（不属于夸大范围）：剪枝、结果分析、贝叶斯采样。前两项见下方任务 5 的说明；
 任务 6（结果分析）与任务 7（贝叶斯采样）仍未开始。
 
-任务 5 的实现位置：`autotuner/research/search_pruning.py`（1412 行）、
-`tests/autotuner/research/test_search_pruning.py`（89 个用例，全通过，与任务 4 的 66 个用例同跑 186 通过）。
+任务 5 的实现位置：`autotuner/research/search_pruning.py`（1690 行）、
+`tests/autotuner/research/test_search_pruning.py`（2076 行、123 个用例，全通过；
+与任务 4 的 66 个用例两个文件同跑 **189 passed in 75.30s**，均为 2026-09-15 实跑）。
+第二轮审查（审的是**实现**而不是设计稿）查出 7 个缺陷，全是"审计层自信地给出错误结论"而非崩溃，
+已全部修复并补 25 个用例（92→123），13 条变异验证全部杀死；
+修复内容、逐条复现方式与**明确未验证事项**见 `docs/P4.4_review_record.md` §六。
 设计稿 `docs/P4.4_task5_design.md` 是本轮三个独立设计 → 三名读码评委 → 一次合成的结果；
-第 9 节区分"本轮实测"与"本轮仅读码"，并新增了"实现阶段的实测发现"六条（运行出来的，设计稿没有）。
+第 9 节区分"本轮实测"与"本轮仅读码"（注：该节原先把一份**静态抄写的行号清单**归在"本轮实测"之下，
+2026-09-15 已改为独立小节并标注为静态阅读）。该稿的 99 条行号引用另经一次独立复核
+（94 条精确、5 条区间端点差一行，已改正）；该稿 §4 原先把**计划**写成了**已经落地**，
+已就地标注并补"计划 → 落地"映射。
 范围边界如下，写在这里是为了让只读本表的人不会误以为剪枝已经能用：
 
-- **剪枝这层是能用的；能驱动它的那条路还没有。** 仓库里今天仍**没有任何 `TrialRunner` 实现**
-  （只有 `hyperparameter_search.py:221` 的 Protocol）。`PruningTrialRunner` 是参考实现，
-  只被替身和假 runner 驱动，**未接过真实训练**。
+- **剪枝这层是能用的；能驱动它的那条路还没有。** 仓库里今天仍**没有任何接进训练流程的
+  `TrialRunner` 实现**：`hyperparameter_search.py:221` 的 `TrialRunner` 是 Protocol，
+  唯一的实现类是 `search_pruning.py` 里的 `PruningTrialRunner`，而它**只被替身和假 runner
+  驱动、没有任何调用方**（写这段时原句是"没有任何 `TrialRunner` 实现"，与下一句自相矛盾，
+  且已被实现本身证伪，2026-09-15 改正）。**未接过真实训练。**
 - 参考遥测适配器（曲线源、sink、watcher）只在 tmp_path 文件与替身 runner 上验证过，
   **未跑过 `blind_tp_env`、未跑过 GPU、未按真实 `TAILI_TELEMETRY_INTERVAL` 节奏验证过**。
 - SSH 后端不支持：它在进程退出前不同步日志（`research_remote.py:259-261`），远程试验剪不了。
@@ -252,7 +261,8 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 - `products/taili/ops/early_stop.py` 的 R1/R2/R3 **不被继承**：本轮实测其三个字段名在全仓库
   没有生产者（真实载荷的 `health` 段无 `episode_length_mean`、`reward` 段无 `mean` 键）。
 - **写台账前必须先有 `search_run` 头。** 实测（不是推断）：任何非空搜索台账若首个事件不是
-  `search_run` append，`_validate_layout`（`hyperparameter_search.py:585-594`）会让整根永久
+  `search_run` append，`_validate_layout`（`hyperparameter_search.py:574-622`，
+  `unknown_layout` 抛在 `:587`/`:592`/`:597`/`:609`）会让整根永久
   `unknown_layout`，`open_run` 自己也读不回来。所以策略记录走 `store_policy_record`，
   它的 `precondition` **无默认值**，`TrackerPruningSink` 传 `tracker._require_open`。
 
