@@ -422,6 +422,15 @@ def main(argv: list[str] | None = None) -> None:
             )
         if preflight["status"] != "pass":
             print("[TAILI_TRAIN] WARNING: bypassing unverified runtime preflight", flush=True)
+
+        # P4.2集成：安装检查点管理钩子
+        try:
+            from .checkpoint_hook import install_checkpoint_hook
+            checkpoint_dir_path = str(Path(os.environ.get("TAILI_CHECKPOINT_DIR", str(run_dir / "checkpoints"))))
+            install_checkpoint_hook(runner.agent, env.unwrapped, checkpoint_dir_path)
+        except Exception as e:
+            print(f"[TAILI_TRAIN] checkpoint hook install failed: {e}", flush=True)
+
         runner.run()
     except BaseException as exc:  # preserve failure evidence before re-raising
         failure = exc
@@ -432,6 +441,13 @@ def main(argv: list[str] | None = None) -> None:
         )
         raise
     finally:
+        # P4.2集成：训练结束时执行最终清理和能力提升
+        try:
+            from .checkpoint_hook import finalize_checkpoint_management
+            finalize_checkpoint_management(env.unwrapped, config=experiment_cfg)
+        except Exception as e:
+            print(f"[TAILI_TRAIN] checkpoint finalize failed: {e}", flush=True)
+
         checkpoints = []
         checkpoint_dir = Path(os.environ.get("TAILI_CHECKPOINT_DIR", str(run_dir / "checkpoints")))
         if checkpoint_dir.is_dir():

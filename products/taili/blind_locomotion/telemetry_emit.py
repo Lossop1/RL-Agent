@@ -169,11 +169,32 @@ class TrainingTelemetryEmitter:
             # Observability must not break training.
             return
 
-    def checkpoint(self, *, step: int, path: str, saved: bool = True) -> None:
+    def checkpoint(self, *, step: int, path: str, saved: bool = True, performance: dict[str, Any] | None = None) -> None:
+        """记录检查点保存事件，并可选地注册到CheckpointRegistry。
+
+        Args:
+            step: 训练步数
+            path: 检查点文件路径
+            saved: 是否成功保存
+            performance: 性能快照数据，包含reward_mean、terminal_rate、episode_length_mean、curriculum_phase等
+        """
         try:
             line = f"[TPCKPT] step={int(step)} path={path} saved={1 if saved else 0}"
             print(line, flush=True)
             self._append_log_line(line)
+
+            # 将检查点注册到CheckpointRegistry
+            if saved and performance is not None:
+                try:
+                    from autotuner.product.checkpoint_curator import CheckpointRegistry
+                    registry = getattr(self, "_checkpoint_registry", None)
+                    if registry is None:
+                        registry = CheckpointRegistry()
+                        self._checkpoint_registry = registry
+                    registry.register(path, int(step), performance)
+                except Exception:
+                    # 注册失败不应影响训练
+                    pass
         except Exception:
             return
 

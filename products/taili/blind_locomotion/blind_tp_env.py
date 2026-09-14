@@ -170,6 +170,9 @@ class TailiBlindTPEnv(TailiAmpEnv):
         self._prev_support_contact = None                       # 仅承重接触；立面碰撞不能进入换层链路。
         self._td_impact = _env_flag("TAILI_TD_IMPACT", bool(getattr(self.cfg, "touchdown_impact_only", False)))
         self._telemetry = TrainingTelemetryEmitter() if TrainingTelemetryEmitter is not None else None
+        # P4.2检查点管理集成
+        self._checkpoint_integration = None
+        self._latest_performance_snapshot = None
         self._hip_joint_ids, _ = self.robot.find_joints(".*_hip_joint")
         # 接触传感器覆盖整机。逐腿保留 hip/thigh/calf，足端仍走独立的承重与
         # 水平碰撞链；base 接触按当前平移命令映射到迎障腿。
@@ -3259,6 +3262,16 @@ class TailiBlindTPEnv(TailiAmpEnv):
                         health=health_payload,
                         command=command_payload,
                     )
+
+                    # P4.2集成：缓存当前步的性能快照，供检查点保存时使用
+                    import time
+                    self._latest_performance_snapshot = {
+                        "reward_mean": float(reward_payload.get("mean", 0.0)),
+                        "terminal_rate": float(health_payload.get("terminal_rate", 0.0)),
+                        "episode_length_mean": float(health_payload.get("episode_length_mean", 100.0)),
+                        "curriculum_phase": int(curriculum_payload.get("phase", 0)),
+                        "checkpoint_mtime": time.time(),
+                    }
                 else:
                     print("[TPREW] step %d rew %.3f lin_err %.3f speed %.3f gate %.2f tracking_lin %.3f stand %.3f"
                           % (self._rew_log_step, float(total.mean()), lin_err,
