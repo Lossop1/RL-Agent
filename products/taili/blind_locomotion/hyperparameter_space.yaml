@@ -1,0 +1,91 @@
+# Taili 盲走 AMP 训练的可搜索超参数空间（原子问题 P4.4）。
+#
+# 这份文件只回答两个问题：哪些配置键可以被搜索，以及每个键的取值范围。
+# 它不描述"怎么搜"（网格/随机/贝叶斯由 autotuner/research 的采样器决定），
+# 也不描述"搜出来的值怎么写进训练配置"（由配置注入负责）。
+#
+# 每个 default 必须等于 taili_blind_config.yaml 的出厂值：条件参数不生效时
+# 采样器回退到 default，若两者不一致，试验记录里的值会和真正跑的训练配置
+# 对不上。tests/autotuner/research/test_hyperparameter_space.py 校验这一点，
+# 并校验下面每个 name 都是出厂配置里真实存在的键、每个 default 落在域内。
+#
+# 取值范围的依据是 docs/archive/taili/taili_tuning_followups.md 的调参结论：
+# 出厂值都是证据驱动后的决定，因此搜索范围以出厂值为锚，只在有依据的
+# 区间内取值，而不是铺满一个"看起来很大"的区间。
+
+parameters:
+  # 跨两个数量级，用 log 网格：线性网格会把点全挤在 1e-4 以上。
+  # 1e-4 是 LR collapse 修复后的出厂值；上界 1e-3 覆盖该文档引用的
+  # AnymalTerrain 参考值 3e-4，下界 1e-5 用于探测更保守的一侧。
+  - name: skrl.agent.learning_rate
+    kind: continuous
+    low: 1.0e-5
+    high: 1.0e-3
+    default: 1.0e-4
+    log: true
+    grid_points: 3
+
+  # 熵系数决定探索强度，下限 0 表示关闭熵项。
+  - name: skrl.agent.entropy_loss_scale
+    kind: continuous
+    low: 0.0
+    high: 0.05
+    default: 0.02
+
+  - name: skrl.agent.discount_factor
+    kind: continuous
+    low: 0.95
+    high: 0.999
+    default: 0.99
+    grid_points: 4
+
+  # 当前只有唯一取值，因此采样器不会改变它：它在这里的作用是为
+  # kl_threshold 提供守卫，并标出"想换调度器就在这里加"的扩展点。
+  # 只列出已验证存在的名字——本仓库只出现过 KLAdaptiveLR。要加第二个
+  # 选项（例如固定学习率），先在部署机 isaaclab 环境里确认该名字可用，
+  # 否则等于在产品数据里断言一个没跑过的训练配置。
+  - name: skrl.agent.learning_rate_scheduler
+    kind: categorical
+    choices:
+      - KLAdaptiveLR
+    default: KLAdaptiveLR
+
+  # 只在 KLAdaptiveLR 下被读取。出厂值 0.016 在调参文档里被标注为
+  # 该文档引用的参考值 0.008 的 2 倍，且是"最宽松的可辩护取值"，
+  # 因此这里只向参考值一侧搜索，不再向上放宽。
+  - name: skrl.agent.learning_rate_scheduler_kwargs.kl_threshold
+    kind: continuous
+    low: 0.008
+    high: 0.016
+    default: 0.016
+    condition:
+      parameter: skrl.agent.learning_rate_scheduler
+      values:
+        - KLAdaptiveLR
+
+  - name: skrl.agent.mini_batches
+    kind: discrete
+    low: 4
+    high: 32
+    step: 4
+    default: 16
+
+  - name: skrl.agent.rollouts
+    kind: discrete
+    low: 24
+    high: 96
+    step: 24
+    default: 48
+
+# 逐参数独立的取值范围会产出训练器拒绝启动的组合，必须显式声明。
+# 上面两个网格共 4 x 8 = 32 种组合，其中 13 种不被本约束接受
+# （例如 rollouts 48 / mini_batches 32），采样器据此在抽样时剔除。
+#
+# 待验证：本约束的依据只是"出厂配置 48 = 3 x 16"与文档中 AnymalTerrain
+# 参考值 "24 / 6" 同样整除，两者都只说明历史上被遵守，没有证明训练器
+# 强制要求。部署机 isaaclab 环境里的 skrl 版本才是权威；放宽本约束之前
+# 应先确认该版本面对不整除的 mini_batches 是报错还是静默截断。
+constraints:
+  - kind: multiple
+    parameter: skrl.agent.rollouts
+    of: skrl.agent.mini_batches

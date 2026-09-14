@@ -32,6 +32,7 @@ roots = [
 backend = "python -m autotuner.locomotion_console"
 frontend = "locomotion-console-ui"
 training_config = "products/taili/blind_locomotion/taili_blind_config.yaml"
+hyperparameter_space = "products/taili/blind_locomotion/hyperparameter_space.yaml"
 payload_manifest = "python -m products.taili.payload.payload_manifest"
 payload_builder = "python -m products.taili.payload.build_payload"
 structure_check = "python tools/check_repository_structure.py"
