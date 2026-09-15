@@ -205,7 +205,7 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
 | 3 | 配置注入到训练流程 | 已完成 | autotuner/research/config_injection.py, tests/autotuner/research/test_config_injection.py |
 | 4 | 搜索试验跟踪 | 已完成 | autotuner/research/trial_ledger.py, autotuner/research/hyperparameter_search.py, tests/autotuner/research/test_trial_ledger.py, tests/autotuner/research/test_hyperparameter_search.py |
 | 5 | 早停与剪枝策略 | 已实现（123 用例通过；**未接过真实训练**，见下） | `autotuner/research/search_pruning.py`；设计稿 `docs/P4.4_task5_design.md`；审查记录 §六 |
-| 6 | 搜索结果分析与最优配置导出 | 已实现（71 用例通过；**未接过真实训练**，见下） | `autotuner/research/search_analysis.py`；设计稿 `docs/P4.4_task6_design.md`；审查记录 §七 |
+| 6 | 搜索结果分析与最优配置导出 | 已实现（73 用例通过；**未接过真实训练**，见下） | `autotuner/research/search_analysis.py`；设计稿 `docs/P4.4_task6_design.md`；审查记录 §七 |
 | 7 | 贝叶斯采样器 | 阻塞解除：任务 4 的观测反馈接口 `TrialObservationSource` 已落地，可开始 | - |
 
 任务 1 的实际范围：schema 定义域（continuous/discrete/categorical）、条件参数
@@ -266,23 +266,33 @@ P4.4 不是单个原子问题，按可独立验证的最小单元拆分如下。
   `unknown_layout`，`open_run` 自己也读不回来。所以策略记录走 `store_policy_record`，
   它的 `precondition` **无默认值**，`TrackerPruningSink` 传 `tracker._require_open`。
 
-任务 6 的实现位置：`autotuner/research/search_analysis.py`（1544 行，
-sha256 `2f2541749639620efd94d7c9bb88b2b9961026182672c62b382fba774cfd873c`）、
-`tests/autotuner/research/test_search_analysis.py`（1893 行、71 个用例，全通过）。
+任务 6 的实现位置：`autotuner/research/search_analysis.py`（1545 行，
+sha256 `075be749b49ab4ac4bf97a714ebe31581d53c0a15e50567aa75df3340e827ea6`）、
+`tests/autotuner/research/test_search_analysis.py`（1967 行、73 个用例，全通过）。
+两个哈希都是**本机工作区**（LF）的哈希；早先记的 `2f254174…` 是模块换行符统一为 LF **之前**
+的哈希，行数也从 1544 变 1545（补了 `canonical_metric` 这一个纯函数的名字）。
 范围：把一条搜索运行的台账读成一份可复核的分析（排名、并列计数、每个读数的状态），
 并据此导出最优配置与回执。它**不做**的事：不重排、不写台账、不碰训练。
 第二轮审查（审的是**实现**）查出 8 个缺陷，性质与任务 5 那批同类——都是"审计层自信地给出
 错误结论"而不是崩溃（把被 `top_n` 截断后的行当成全体来数并列、无法表示的整数让整份分析崩掉、
 `metrics` 里的非有限数被读成"缺失"、导出回执可能覆盖自己的证据、`yaml.YAMLError` 不是
 `ValueError` 导致导出把解析错当崩溃…），已全部修复并补 8 个用例（63→71），
-7 条变异验证全部杀死。
+7 条变异验证全部杀死。当晚又补 2 条"守卫缺失"用例（63→**73**）：`_coverage_verdict` 里
+`unstated` 早返回的顺序、以及 `export_best` 的 `injected_fingerprint` 相等守卫——
+这两处**原先删掉都不影响任何一条用例**（实测删除后仍 73 passed），补上后各自都有指名用例变红。
+同时用受控变异**证伪**了一条早先的推断：`_validate_no_trial_vanishes` 的调用被删除时
+**没有任何用例变红**（73 passed），所以"那条守卫有杀死变异的能力"是错的。
+另：`autotuner/research/search_analysis.py` 的换行符此前是 CRLF（与仓库其余文件不一致、
+且让文档里的 sha256 无法从克隆复现），已统一为 LF。
 一条**被实测证伪、因此没有改代码**的审计指控：有评委称重复的 trial index 会让 `analyze()`
 在 `TrialCensus` 上抛错。实测台账按 index 折行（同名 index 只有最后一次尝试被读回），
 重复写入后 `recorded == 1`、`run()` 正常返回、`error` 为空——指控不成立，故未动代码，
 已记入设计稿 §12.4，避免后人误以为这里"修过"。
 明确未验证：**未接过真实训练**（台账、配置与 manifest 都是真的写在盘的临时文件，
 但产出它们的训练进程是替身，没有 GPU、没有 `blind_tp_env`）；"四条承重守卫各自被删除时
-是否真有用例变红"的定律测试本轮**未跑**，设计稿 §12.3 已如实标注为未验证。
+是否真有用例变红"的定律测试本轮**仍未系统性跑过**——只跑了其中三条（M3 / M5 / M13，
+脚本 `.scratch_wf6/mut_b.py`），前两条已补守卫、第三条实测**存活**；其余承重守卫仍无变异证据，
+设计稿 §12.3 已如实标注。
 修复内容、逐条复现命令与明确未验证事项见 `docs/P4.4_review_record.md` §七。
 
 设计稿 `docs/P4.4_task4_design.md` 原先在开头写着「本文是设计提案，**尚未实现**」。该句已随
@@ -521,5 +531,6 @@ sha256 `2f2541749639620efd94d7c9bb88b2b9961026182672c62b382fba774cfd873c`）、
 - 2026-09-14：P4.4 任务 7（贝叶斯采样器）的阻塞解除：任务 4 已提供观测反馈接口 `TrialObservationSource`
 - 2026-09-14：P4.4 任务 4 的文档收尾。设计稿 `P4.4_task4_design.md` 从「尚未实现」改为「已按本文实现并验收」，并逐条订正 7 处状态或计数（规模估计实测 763/1612 行、`mechanisms.json` 实测 13 个且 0 个入库、`content_hash` 实测 27 处、A12 判据由「grep 无输出」改为 AST 遍历并说明 grep 为何不可能满足、验收编号 A33 撞号改标 A42、附录的「不声明任何代码已存在」）。收尾后重跑：研究层 338 passed、`check_repository_structure.py` 末行 errors=0、§10.4 的三条一次性命令均符合预期。每条订正的可复核命令见 docs/P4.4_review_record.md §4.4.1
 - 2026-09-15：P4.4 完成第 5 个原子任务（早停与剪枝策略）：`search_pruning.py`（1690 行）+ 123 个用例。**本条为事后补记**：任务 5 完成时只更新了本表的状态列与本节的说明段，漏了这一行，2026-09-15 补上。第二轮审查（审实现）查出 7 个缺陷并补 25 个用例（92→123），13 条变异全部杀死；见 docs/P4.4_review_record.md §六
-- 2026-09-15：P4.4 完成第 6 个原子任务（搜索结果分析与最优配置导出）：`search_analysis.py`（1544 行）+ 71 个用例。第二轮审查（审实现）查出 8 个缺陷并补 8 个用例（63→71），7 条变异全部杀死；一条"重复 index 会让 `analyze()` 抛错"的审计指控经实测证伪，未改代码，记入设计稿 §12.4。见 docs/P4.4_review_record.md §七
+- 2026-09-15：P4.4 完成第 6 个原子任务（搜索结果分析与最优配置导出）：`search_analysis.py`（1545 行）+ 73 个用例。第二轮审查（审实现）查出 8 个缺陷并补 8 个用例（63→71），7 条变异全部杀死；一条"重复 index 会让 `analyze()` 抛错"的审计指控经实测证伪，未改代码，记入设计稿 §12.4。见 docs/P4.4_review_record.md §七
+- 2026-09-15：任务 6 当晚追补（§七 的 7.7）：审计另报两处"守卫存在但无任何用例钉住"，受控变异逐条确认后补用例（63→**73**）。`M5`（`_coverage_verdict` 里 `unstated` 早返回的顺序）与 `M3`（`export_best` 的 `injected_fingerprint` 相等守卫）在补之前**删掉也全绿**，补后各自有指名用例变红；`M3` 另实测其真实作用是"清理动作"（删掉后 `best.yaml` 会留在盘上而没有回执）。同时用同一脚本**证伪**了一条此前写进文档的推断：删掉 `_validate_no_trial_vanishes()` 的调用时**没有任何用例变红**（73 passed），早先据 `.scratch_wf6/m13.log` 得出的"该守卫能杀死变异"是错的，那次的红是并发会话清空台账文件造成的假象。变异脚本改为**在内存里重编译、不写盘**（`.scratch_wf6/mut_b.py`），避免重演 21:24 那次事故。另把 `search_analysis.py` 的换行符从 CRLF 统一为 LF（哈希随之重算）
 - 2026-09-15：补记一条过程事故（不是代码缺陷）：`search_analysis.py` 被一个**还在后台跑的变异循环**反复改写（把变异写进模块、跑用例、再写回原文，`--basetemp=t6m9…t6m13` 轮转）。21:24 查明并终止（`Get-CimInstance Win32_Process` 看到该 bash 树在跑 pytest，对文件每 4 秒采样一次哈希可见它在干净版与变异版之间来回跳；杀掉进程树后连续 20 秒稳定）。**它咬了两次**：一次是模块上留着变异（靠设计稿 §12 那张 sha256 表对不上才发现——1541 行/`3e52aa9d…` 对 1544 行/`2f254174…`），一次是**第一次提交 `0cbd369` 装进去的就是它写下的 M9 变异**，已 `git reset --mixed HEAD~3` 撤销三个提交、从 `.scratch_wf6/mutate_backup.py` 还原并重提。留在这里的原因：`.scratch_wf6/` 是未跟踪的临时目录，删掉之后"当前文件是否就是被验过的那份"只有 §12 的哈希表能回答，所以那张表不是装饰；而且**跑会改工作区的脚本时不能让循环留在后台**，收尾前必须先确认没有写者

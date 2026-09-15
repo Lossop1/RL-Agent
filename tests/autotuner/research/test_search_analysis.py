@@ -305,13 +305,22 @@ def _crashed_search(tmp_path: Path, outcomes: list[TrialOutcome], *, fail_at: in
 
 
 def _hand_driven(
-    tmp_path: Path, *, space: SearchSpaceSchema | None = None, label: str = "hand"
+    tmp_path: Path,
+    *,
+    space: SearchSpaceSchema | None = None,
+    plan: SearchPlan | None = None,
+    label: str = "hand",
 ) -> _Search:
     """A tracker on a fresh root whose trials the test materialises itself.
 
     ``begin_trial`` is public and supported, so everything built here goes in through the front
     door; only the *closing* record is ever written by hand in the tests below, and each such test
     says why.
+
+    ``plan`` defaults to a random plan with ``budget=2``.  It is a parameter because the two grid
+    rows of the coverage verdict are only reachable through a grid plan, and a test that pins the
+    order of those rows has to hand-drive a grid (``test_a_grid_closed_without_the_exhausted_flag_
+    reports_unstated``).
     """
     space = space if space is not None else _taili_space()
     source = _copy_config(tmp_path, label)
@@ -319,7 +328,7 @@ def _hand_driven(
     tracker = SearchTracker(
         store=store,
         space=space,
-        plan=SearchPlan.for_random(space, seed=7, budget=2),
+        plan=plan if plan is not None else SearchPlan.for_random(space, seed=7, budget=2),
         source_config=load_config_file(source),
         source_config_path=source,
         work_root=tmp_path / f"work_{label}",
@@ -996,6 +1005,33 @@ def test_a_close_without_the_exhausted_flag_reports_unstated(tmp_path):
     assert "was exhausted" in report.coverage.detail
 
 
+def test_a_grid_closed_without_the_exhausted_flag_reports_unstated(tmp_path):
+    """The same unstated verdict, but for a grid: it outranks the two grid rows below it.
+
+    ``unstated`` is decided before the plan kind is looked at, and until this test no *grid* plan
+    ever reached it -- ``_hand_driven`` defaulted to a random plan and the grid tests above all go
+    through ``_search``, which closes with a real ``SamplerStats``.  Measured consequence: moving
+    the unstated early return below the two grid rows keeps all 71 pre-existing tests green while
+    turning this one red, and the wrong answer it produces is ``budget_truncated_the_grid`` -- a
+    budget cut the ledger never recorded.
+    """
+    space = _grid_space()
+    plan = SearchPlan.for_grid(space, budget=4)
+    case = _hand_driven(tmp_path, space=space, plan=plan, label="gridhand")
+    assignments = _assignments(case.tracker)
+    assert len(assignments) > 1, "a one-point grid would not distinguish the two grid rows"
+    case.tracker.open_run()
+    _materialise(case, 1, assignments[0])
+    case.tracker.close_run({"proposals": 1})
+
+    report = case.report()
+    assert report.coverage.kind == "grid"
+    assert report.coverage.verdict == "unstated"
+    assert report.coverage.exhausted is None
+    assert "was exhausted" in report.coverage.detail
+    assert "never proposed" not in report.coverage.detail
+
+
 def test_the_default_sampler_stats_report_stream_ended_early(tmp_path):
     """The other half of the same measurement: the default stats are what a careless close writes."""
     case = _hand_driven(tmp_path)
@@ -1476,6 +1512,44 @@ def test_a_refusal_after_the_write_removes_the_partial_config(tmp_path):
     with pytest.raises(ExportRefusedError) as caught:
         export_best(report, ledger=case.ledger(), space=_taili_space(), output_path=destination)
     assert any("differs from the one trial" in reason for reason in caught.value.reasons)
+    assert not destination.exists()
+
+
+def test_an_export_refuses_a_config_that_does_not_reproduce_the_recorded_fingerprint(tmp_path):
+    """The last check before the artifact is built: is what I wrote what the trial actually ran?
+
+    Every other check compares the export against something *outside* the record -- the source
+    config's hash, the trial's own file on disk, the ledger's copy of the row.  This one compares
+    the injector's output against the record's own ``injected_fingerprint``, and it is the only
+    check that still works when the trial's workspace has been deleted, which is the normal end
+    state of a search someone has since cleaned up.
+
+    No public route writes a record whose fingerprint cannot be reproduced from its own
+    ``assignment``: ``begin_trial`` computes it from the injection it just performed.  So the
+    ledger is forged here -- a superseding trial record with the same id, assignment, objective
+    and status and the same *shape* of fingerprint, differing only in its value, which is what a
+    ledger written by a different injector version (or a different source config root) would hold.
+    Appended before ``close_run`` because a trial record cannot be appended after it.
+    """
+    case = _hand_driven(tmp_path, label="fpguard")
+    assignments = _assignments(case.tracker)
+    case.tracker.open_run()
+    record = _materialise(case, 1, assignments[0], objective=1.0)
+    assert record.injected_fingerprint != "0" * 64, "the forgery below would be a no-op"
+    #: ``_materialise`` returns the record ``finish`` wrote; the objective arrived in a second
+    #: append, so the forgery is built on that second record rather than on the returned one --
+    #: superseding the returned one would silently drop the objective and the export would refuse
+    #: for the wrong reason.
+    scored = _supersede(record, objective=1.0)
+    _append(case, _supersede(scored, injected_fingerprint="0" * 64), "search_trial")
+    case.tracker.close_run({"proposals": 1})
+
+    report = case.report()
+    destination = tmp_path / "out" / "best.yaml"
+    destination.parent.mkdir()
+    with pytest.raises(ExportRefusedError) as caught:
+        export_best(report, ledger=case.ledger(), space=_taili_space(), output_path=destination)
+    assert any("is not the one the winning trial ran" in reason for reason in caught.value.reasons)
     assert not destination.exists()
 
 

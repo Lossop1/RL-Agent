@@ -18,7 +18,7 @@
 - P4.4 研究层审查判定与处置：[`P4.4_review_record.md`](P4.4_review_record.md)
 - P4.4 任务 4 搜索试验跟踪设计稿（设计提案；**已按本文实现并验收**，见开头第 2 条）：[`P4.4_task4_design.md`](P4.4_task4_design.md)
 - P4.4 任务 5 早停与剪枝设计稿（**已实现**，实现位置 `autotuner/research/search_pruning.py`，1690 行实现 + 2076 行用例、123 个用例；第 9 节区分实测与仅读码，并附 99 条行号引用的独立复核。**该稿 §4 曾把计划写成已落地，已就地标注并补落地映射**；审查与变异测试结果见 `P4.4_review_record.md` §六）：[`P4.4_task5_design.md`](P4.4_task5_design.md)
-- P4.4 任务 6 结果分析与最优配置导出设计稿（**已实现**，实现位置 `autotuner/research/search_analysis.py`，1544 行实现 + 1893 行用例、71 个用例；§12 是"计划 → 落地"对照，含 8 个实现缺陷的可复核复现方式、7 条变异记录与**明确未验证清单**。**该稿 §12 的 sha256 表当天抓到过一次真事故**：模块上留有一条没被还原的变异）：[`P4.4_task6_design.md`](P4.4_task6_design.md)
+- P4.4 任务 6 结果分析与最优配置导出设计稿（**已实现**，实现位置 `autotuner/research/search_analysis.py`，1545 行实现 + 1967 行用例、73 个用例；§12 是"计划 → 落地"对照，含 8 个实现缺陷的可复核复现方式、7 条变异记录与**明确未验证清单**。**该稿 §12 的 sha256 表当天抓到过一次真事故**：模块上留有一条没被还原的变异。§12.3 另记两条"删掉也全绿"的守卫、一条被受控变异**证伪**的守卫推断）：[`P4.4_task6_design.md`](P4.4_task6_design.md)
 - Taili 环境边界：[`taili_env_boundary.md`](taili_env_boundary.md)
 - 奖励所有权：[`taili_reward_ownership.md`](taili_reward_ownership.md)
 - 遥测契约：[`taili_telemetry_contract.md`](taili_telemetry_contract.md)

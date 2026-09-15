@@ -25,8 +25,9 @@ Three things it deliberately is **not**:
 * Not a second judge of pruning.  ``prune_summary`` is not called: it reads
   ``ledger.trials(run_ref=...)`` (``search_pruning.py:988``), which in a degraded read can be a
   *different, smaller* sample than the one ranked here, and a report that audits one sample
-  while citing another is the failure this module exists to prevent.  Only the three pure
-  reading helpers are shared, so the two layers cannot disagree about what a reading *is*.
+  while citing another is the failure this module exists to prevent.  Only the four pure
+  reading helpers (``metric_value``, ``is_nonfinite``, ``reading_is_nulled``,
+  ``canonical_metric``) are shared, so the two layers cannot disagree about what a reading *is*.
 * Not a writer.  Not one line appends to the ledger, and no new record type is defined:
   writing any record before a run's ``search_run`` header makes the whole root permanently
   unreadable (measured by task 5: ``_validate_layout`` raises ``unknown_layout``,
