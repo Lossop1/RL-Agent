@@ -53,6 +53,14 @@ products/taili/payload/.build/
 .codex-tmp-askpass.cmd
 .tmp_ssh_askpass.cmd
 .latest_strategy_backup_path
+
+# ── agent scratch: throwaway scripts, probe output, temp worktrees ───────────
+# Kept on disk on purpose so past rounds stay reproducible (some committed docs
+# cite files under .scratch_wf6/ by name), but never part of the project.
+.scratch_*/
+.audit-scratch/
+.agents/
+
 *.log
 *.jsonl
 events.out.tfevents.*
