@@ -277,35 +277,120 @@
 
 ### P4.3 训练中断恢复
 - **问题**：从检查点精确恢复训练状态
-- **状态**：已完成（待远端端到端验证）
-- **说明**：单元测试完成，没有在 GPU 环境跑过集成验证
-- **阻塞**：需要GPU环境执行集成验证
+- **状态**：已完成
+- **说明**：2026-09-16 在 3060 上完成端到端实机验证，判据取**权重本身**而非奖励曲线。
+  权重确实被加载（逐位相等）、优化器动量确实续用（step 计数器 256→512）、训练确实继续
+  （policy 复现误差 0.0011 对 200 步位移 0.6665）。scheduler / curriculum / rng 三项仍为**未验证**。
+- **阻塞**：无
 - **负责人**：
 - **验收标准**：恢复后曲线连续，无性能跳变
-- **验证环境**：远程GPU服务器 (RTX 4090 24GB, 183.147.142.40:31376)
+  - **2026-09-16 订正**：这条标准**在本尺度上不可测量**，见下面的「为什么不能用曲线判定」。
+    实测替代判据：从同一检查点恢复后再跑 N 步，policy 的相对 L2 距离应 **≪ 该 N 步的正常位移**。
+    实测分离开销：复现误差 0.0011，同长度正常位移 0.6665，无关参照 1.9693（约 600 倍分离）。
+- **验证环境**：3060 机器（chuan@100.124.24.52 / 192.168.111.129），
+  nvcr.io/nvidia/isaac-lab:2.1.0 容器，载荷 `taili_blind_runtime_fixstep11_1df8dd02e35a`
+  （payload_digest `1df8dd02e35a…`），4 个并行环境
+  - **2026-09-16 订正**：此处原写「远程GPU服务器 (RTX 4090 24GB, 183.147.142.40:31376)」，
+    那是另一台机器，本轮验证**没有**在那台上跑过。
 - **实现位置**：
   - autotuner/execution/compatibility.py (兼容性检查，348行)
   - products/taili/blind_locomotion/runtime_manifest.py (状态捕获，446行)
   - products/taili/blind_locomotion/train_taili.py (恢复入口，105-226行)
   - tests/autotuner/execution/test_compatibility.py (19个测试)
   - tests/products/taili/blind_locomotion/test_runtime_manifest.py (13个测试)
-  - tools/verify_resume_continuity.py (验证工具，167行)
-  - docs/p4_3_validation_plan.md (完整验证计划)
+  - tools/verify_resume_continuity.py (旧验证工具，**空壳，不可用**，见下)
+  - tools/verify_resume_weights.py (2026-09-16 新增，权重级验证，本轮判据的实际来源)
+  - docs/p4_3_validation_plan.md (验证计划；其验收标准无阈值，订正见上)
 - **完成情况**（2026-09-13）：
   - 核心逻辑已实现：状态捕获、兼容性检查、恢复入口
   - 单元测试完成：32个测试覆盖核心路径和边缘情况
   - 验证工具就绪：checkpoint完整性检查框架
-  - 待GPU验证：9组件哈希一致性、曲线连续性
-- **已验证的9个状态组件**：
-  1. policy - actor网络权重
-  2. value - critic网络权重
-  3. optimizer - 优化器状态（动量/自适应矩）
-  4. scheduler - 学习率调度器
-  5. normalizer - 观测/值归一化器
-  6. log_std - 策略标准差参数
-  7. amp - 对抗性运动先验判别器
-  8. curriculum - 地形课程阶段/级别
-  9. rng - Python/NumPy/PyTorch/CUDA随机数状态
+- **端到端实机验证**（2026-09-16，3060）：
+  - 判据链：`--checkpoint` 是**启动器**参数（`launch_taili_train.py:207`），它把参数追加进
+    `train_args`（`:245-246`）再用 `subprocess.Popen` 起 `train_taili`（`:270`/`:362`）；
+    `train_taili.py:380` 调 `runner.agent.load(args.checkpoint)`。
+  - 四个配对运行（全部 4 envs，同一载荷）：
+
+    | 运行 | 命令要点 | 产物 |
+    |---|---|---|
+    | resumeA | 全新，400 步，`TAILI_CHECKPOINT_INTERVAL=200` | `agent_200.pt`、`agent_400.pt` |
+    | resumeD | `--checkpoint resumeA/agent_200.pt`，10 步，间隔 1 | `agent_2.pt`…`agent_10.pt` |
+    | resumeE | **对照**：同一命令、不给 `--checkpoint`，10 步，间隔 1 | `agent_2.pt`…`agent_10.pt` |
+    | resumeF | `--checkpoint resumeA/agent_200.pt`，200 步，间隔 100 | `agent_100.pt`、`agent_200.pt` |
+
+  - **判据一 · 权重被加载（逐位相等）**：`resumeD/agent_2.pt` 对 `resumeA/agent_200.pt`，
+    149 个张量**全部逐位相等**，最大绝对差 `0.000e+00`。对照 `resumeE/agent_2.pt` 对同一文件
+    则完全不相干（policy 余弦 0.0266，最大绝对差 3.072e+03）。
+    两者文件大小不同（46,648,904 vs 46,649,146 字节）→ 不是拷贝文件，是真实的 load→save 往返。
+  - **判据二 · 优化器动量续用**：resumeA 与 resumeD 各含 99 个 `optimizer/state/{i}/{exp_avg,
+    exp_avg_sq,step}` 张量且全部非零；对照 resumeE 的 optimizer state 条目为 **0**
+    （新 agent 在第一次 `optimizer.step()` 之前 state_dict 就是空的）。这是一条不依赖阈值的
+    离散判据。
+  - **判据三 · 训练确实继续**：resumeF 从 A@200 再跑 200 步后，`step` 计数器为 **512**，
+    与 resumeA 自己跑到 400 步时的 512 相同。逐组件相对 L2：
+
+    | 组件 | A@200→A@400（走 200 步） | A@400 vs F@200（复现误差） | 无关参照（E@10） |
+    |---|---|---|---|
+    | policy | 0.6665 | **0.0011** | 1.9693 |
+    | state_preprocessor | 0.6665 | **0.0005** | 1.9734 |
+    | amp_state_preprocessor | 0.6666 | **0.0000** | 1.9960 |
+    | value_preprocessor | 0.7818 | 0.2594 | 1.9996 |
+    | value | 0.0440 | 0.0620 | 0.0455 |
+    | discriminator | 0.0496 | 0.0388 | 0.1102 |
+
+    **value 与 discriminator 两行在本判据下不可用**：它们初值的范数就压过了训练带来的位移
+    （value 的无关参照 0.0455 甚至小于它 200 步的位移 0.0440）。这两项的证据在判据一里——
+    那里它们是逐位相等的。
+  - **未验证明细**：`.pt` 检查点里**根本不含** scheduler / curriculum / rng，
+    `_resume_parity` 自己的注释也写明「Scheduler, curriculum and RNG cannot be proven from a
+    legacy .pt file」。复现不是逐位（policy 相对 L2 0.0011 而非 0），最合理的解释是 rollout
+    buffer 与 RNG 不在检查点内，**但这是推测，未验证**。
+- **9 个状态组件的实际证据强度**（2026-09-16 订正）：
+  1. policy - actor网络权重 —— **已实测**：逐位相等；再跑 200 步后复现误差 0.0011
+  2. value - critic网络权重 —— **已实测**：逐位相等（`value` 单独看复现误差，判据不可用，见上）
+  3. optimizer - 优化器状态（动量/自适应矩）—— **已实测**：逐位相等 + 99 个张量全非零 + step 256→512
+  4. scheduler - 学习率调度器 —— **未验证**：不在 `.pt` 里；`restored.scheduler=true` 的
+     依据只是「父清单记过这个字段」，不是测量
+  5. normalizer - 观测/值归一化器 —— **已实测**：`state_preprocessor` 逐位相等、复现误差 0.0005
+  6. log_std - 策略标准差参数 —— **已实测**：作为 `policy/actor.log_std_param` 随 policy 逐位相等
+  7. amp - 对抗性运动先验判别器 —— **已实测**：`discriminator` 与 `amp_state_preprocessor` 逐位相等
+  8. curriculum - 地形课程阶段/级别 —— **未验证**：不在 `.pt` 里，同 scheduler
+  9. rng - Python/NumPy/PyTorch/CUDA随机数状态 —— **未验证**：不在 `.pt` 里，同 scheduler
+  - **`resume_edge.restored` 不等于实测**：那 9 个 `true` 是「按键名别名在检查点里找到了对应项」
+    再叠加「父清单里记过这个字段」推出来的合理性检查，不是对权重的测量。
+  - **一处反证**：`optimization_state.fields` 里 scheduler / curriculum / rng 三项的 sha256
+    （`014da526…` / `afc1cf8a…` / `b40e85f7…`）在 resumeA（全新 400 步）、resumeE（全新 10 步）、
+    resumeD（恢复）**三个运行里一字不差**。这三个摘要不携带任何运行信息，不能拿来当恢复证据。
+    其余字段随运行不同而不同（capture 在 `agent.load()` 之后、训练之前执行，见 `train_taili.py:385`）。
+  - **未解释**：resumeA 与 resumeE 同为全新跑、同一配置（`config_digest` 均为 `aae96caa…`）、
+    同一载荷，但两者 `optimization_state.fields.policy.sha256` 不同（`d096ec4a…` vs `2726d410…`），
+    而其余 8 个字段相同。**现象记录在此，原因未查明**；它不影响上面的权重级结论
+    （那是直接对张量做的比较），但它说明「全新跑的网络初值并不完全可复现」。
+- **为什么不能用曲线判定**（2026-09-16 实测）：
+  - 原验收标准「恢复后曲线连续，无性能跳变」全仓**没有任何数值阈值**。
+  - 实测噪声底：resumeA 这一条**没被打断**的跑，相邻采样点相对差的中位数就有 **0.180**，
+    85% 的相邻点差值超过 10%。也就是说 10% 量级的「跳变」在正常训练里遍地都是。
+  - 对照实验：resumeB（恢复）均值 -7.663 与 resumeC（对照）均值 -7.262 相差 0.401，
+    而 21 个采样点上的标准误约 0.44、单点摆幅约 ±4。**这个设计区分不了恢复与全新开始。**
+  - 结论：曲线判据在本尺度上不可用，应改用上面的权重级判据。曲线只能作为辅助观感。
+- **新发现（结构上成立，未实测）**：**复用同一个 run id 会让身份门禁自证**。
+  `train_taili.py:294-309` 只在 `runtime_manifest.json` **不存在**时才写初始清单
+  （含本周期的 `resume_checkpoint` 与 `seed`）；而 `:359` 又从**同一路径**把清单读回来当
+  `current_manifest`。于是第二次用同一个 run id 时，读到的是上一轮的清单。
+  本轮实验每次都换新 run id（resumeA…F），所以上面的证据不受影响。
+  **未实测**：没有实际跑过一次复用 run id 的训练去确认后果。
+- **复核方式**：上面所有数字都可用仓库里的 `tools/verify_resume_weights.py` 独立复跑
+  （要在容器内跑，因为需要 torch）：
+  ```
+  /workspace/isaaclab/_isaac_sim/python.sh tools/verify_resume_weights.py \
+      run/taili_runs/resumeA/checkpoints/agent_200.pt \
+      run/taili_runs/resumeA/checkpoints/agent_400.pt \
+      run/taili_runs/resumeF/checkpoints/agent_200.pt \
+      run/taili_runs/resumeE/checkpoints/agent_10.pt \
+      --label 父运行@200 父运行@400 F_恢复后跑200步 E_对照跑10步
+  ```
+  脚本头部写明了判读方法，以及 value / discriminator 两组为什么在本方法下不可用。
+- **旧验证工具不可用**：`tools/verify_resume_continuity.py` 是空壳，不能当验证工具用。
 - **注**：P4.2检查点管理系统的GPU环境部署验证作为独立验证任务记录在 docs/P4.3_gpu_deployment_summary.md 和 docs/P4.3_remote_testing_instructions.md，不与本训练恢复功能混淆
 
 ### P4.4 超参数搜索空间
@@ -770,15 +855,14 @@ grep -cE '^### P[0-9]\.[0-9]' docs/atomic_problems.md                     # 32
 grep -E '^- \*\*状态\*\*：' docs/atomic_problems.md | sed 's/^- \*\*状态\*\*：//' | sort | uniq -c
 ```
 
-第二条命令 2026-09-16 的实测输出：
+第二条命令 2026-09-16 的实测输出（P4.3 转入「已完成」之后重跑）：
 
 ```
-      3 已修复
-     19 已完成
-      1 已完成（待远端端到端验证）
+     20 已完成
       7 未开始
-      1 进行中
+      3 已修复
       1 部分完成
+      1 进行中
 ```
 
 **状态词表**（只用这 6 个值，`状态` 行里不带括号内的解释——解释放 `子进度` 等字段，
@@ -794,13 +878,18 @@ grep -E '^- \*\*状态\*\*：' docs/atomic_problems.md | sed 's/^- \*\*状态\*\
 | 已修复 | 针对某个具体故障，修复有对照实验支撑 |
 
 - **总计**：32 个原子问题（P1.1-P1.5、P2.1-P2.5、P3.1-P3.5、P4.1-P4.8、P5.1-P5.4、P6.1-P6.5）
-- **已完成**：19 (含 P4.2，2026-09-16 端到端跑通后由「待远端端到端验证」转入)
-- **已完成（待远端端到端验证）**：1 (P4.3)
+- **已完成**：20 (含 P4.2 与 P4.3，均为 2026-09-16 端到端跑通后由「待远端端到端验证」转入)
+- **已完成（待远端端到端验证）**：0
 - **已修复**：3 (P4.6、P4.7、P4.8)
 - **部分完成**：1 (P6.1，步骤 1-3 完成，步骤 4-6 待运行时环境)
 - **进行中**：1 (P4.4，7 个原子任务均已落地，但全链路未接真实训练)
 - **未开始**：7 (P6.4、P5.3、P5.4、P3.3、P1.1、P1.2、P1.5)
 - **阻塞**：5 个问题被其他问题阻塞
+
+**2026-09-16 订正（第四次）**：P4.3 由「已完成（待远端端到端验证）」转入「已完成」，
+依据是 3060 上的权重级端到端验证（见 P4.3「端到端实机验证」）。「已完成（待远端端到端验证）」
+这个状态值**当前没有任何条目在用**，但保留在词表里。同时订正了 P4.3 的 `验证环境`——
+它此前写的是另一台机器（RTX 4090 / 183.147.142.40），本轮没在那台上跑过。
 
 **2026-09-16 订正（第三次）**：本节此前写「总计 31」，且 P4.8 的状态行写的是
 `已修复（本地已验证）；远端端到端复跑见「验收结果」`——带括号和分号的自由文本，
@@ -905,7 +994,9 @@ python3 -c "v=[int(x) for x in open('ladder_long_512.vram') if x.strip()];print(
 
 ### 需要优先完成的问题
 1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、**4** 个训练入口迁移，订正见 P6.1），步骤4-6待GPU运行时环境
-2. **P4.3 训练恢复**：单元测试已完成（32个测试），核心逻辑已实现，待GPU环境执行集成验证
+2. ~~**P4.3 训练恢复**：待GPU环境执行集成验证~~ —— 2026-09-16 已在 3060 上完成权重级端到端验证，
+   转入「已完成」。**遗留两项未验证**：scheduler / curriculum / rng 三项状态不在 `.pt` 检查点内，
+   恢复与否无从证明；且「复用同一 run id 会让身份门禁自证」这一条只在源码上成立、未实测
 3. **P4.4 超参数搜索**：已拆为 7 个原子任务，任务 1-4（搜索空间、采样器、配置注入、试验跟踪）、任务 5、6（早停剪枝、结果分析与最优配置导出）与任务 7（贝叶斯采样器）全部完成。可复用research_scheduler.py作为试验执行后端。**全链路仍未接过真实训练**：仓库里至今没有任何接进训练流程的 `TrialRunner` 实现，任务 5、6、7 都只在替身 runner 与临时文件上验证过；任务 7 的模块与文档都**不做效能声明**（本轮没有"自适应 vs 随机"的对比读数，探针读数反而不利于该说法）
 4. **P6.4 接触力校准**：需要真实硬件数据
 
@@ -981,9 +1072,22 @@ python3 -c "v=[int(x) for x in open('ladder_long_512.vram') if x.strip()];print(
   新增用例：钩子 9 条（其中 4 条专门钉 `write_checkpoint` 路径）、快照 3 条（另改写旧用例 1 条）、回填 2 条，
   均做过反证（去掉修复则变红）。**未验证**：清理阈值（90 GB）与保留策略只有单元测试覆盖，
   240 步只落一个检查点，`last_cleanup_step: -1`，没有一次真实训练跑到过阈值。
+- 2026-09-16：**P4.3 端到端实机验证完成**，状态转入「已完成」。判据从奖励曲线换成权重本身：
+  ① `resumeD/agent_2.pt` 对 `resumeA/agent_200.pt` 149 个张量逐位相等（最大绝对差 `0.000e+00`），
+  对照 `resumeE`（不给 `--checkpoint`）则完全不相干（policy 余弦 0.0266）；
+  ② 优化器 state 条目 resumeD 99 个全非零 vs resumeE 0 个，step 计数器 256→512；
+  ③ 从 A@200 再跑 200 步，policy 复现误差 0.0011，而同长度正常位移 0.6665、无关参照 1.9693。
+  **同时订正原验收标准**：「恢复后曲线连续，无性能跳变」在这套遥测上不可测量——
+  一条没被打断的跑，相邻采样点相对差中位数就有 0.180、85% 超 10%；且 resumeB 与 resumeC
+  的均值差 0.401 落在标准误 0.44 之内，这个设计区分不了恢复与全新开始。
+  **遗留未验证**：scheduler / curriculum / rng 不在 `.pt` 内；
+  `resume_edge.restored` 的 9 个 `true` 是键名匹配推出来的合理性检查而非测量；
+  「复用同一 run id 会让身份门禁自证」只在源码上成立、未实测；
+  `tools/verify_resume_continuity.py` 是空壳。
 - 2026-09-16：P4.8 验收结果填写完毕，状态由带括号的自由文本归并为 `已修复`，
   使它能被进度统计的 `uniq -c` 数到（此前它在这条统计里是隐身的）。同时订正本节此前
-  写下的"总计 31"，补入 P4.8 后为 32。P4.3 仍是「已完成（待远端端到端验证）」。
+  写下的"总计 31"，补入 P4.8 后为 32。（当时写的「P4.3 仍是『已完成（待远端端到端验证）』」
+  在同日晚些时候被推翻——见本页更早那条 P4.3 端到端验证记录。）
   另订正 P4.7「最近完成」里的"远端 smoke12 / ladder_n4 实测 rc=0"——那两次运行实际是
   `status: failed`，属读错证据，已在原处标注。
 - 2026-09-16：补测 3060 的显存阶梯，并把 P4.2 的端到端证据补到**默认**
