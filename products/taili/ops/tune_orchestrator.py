@@ -7,9 +7,39 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+# 数据根目录的兜底值：只在配置和环境变量都读不到时使用（即旧机器的布局）。
+FALLBACK_DATA_ROOT = "/root/gpufree-data"
+
+
+def _default_data_root() -> str:
+    """机器数据根目录：环境变量 > 产品配置 > 旧机器路径。
+
+    这里的远端命令都要拼数据目录，拼之前统一走这个函数取，命令里不写死机器路径；
+    换机器只改配置。取值不是绝对路径或带 `..` 时退回旧路径，断言构不出半截路径。
+    """
+    value = os.environ.get("TAILI_DATA_ROOT", "")
+    if not value:
+        try:
+            from products.taili.blind_locomotion.taili_blind_config import (
+                get_config_value,
+                load_taili_blind_config,
+            )
+
+            value = str(
+                get_config_value(load_taili_blind_config(), "runtime.data_root", "") or ""
+            )
+        except Exception:  # noqa: BLE001 - 配置读不到时退到旧路径，不阻断命令构造
+            value = ""
+    value = value.strip()
+    if not value.startswith("/") or ".." in value.split("/"):
+        return FALLBACK_DATA_ROOT
+    return value.rstrip("/")
+
 
 # ── gate → reward lever（键、单轮步长、上限）。步长小且有界，避免一次改动覆盖多个原因。 ──
 GATE_LEVERS: dict[str, list[tuple[str, float, float]]] = {
@@ -138,7 +168,7 @@ class TuningDriver:
         self,
         ssh_json: str = "config/ssh.json",
         python: str = "/opt/conda/envs/isaaclab/bin/python",
-        data_root: str = "/root/gpufree-data",
+        data_root: str = "",
         log=print,
     ):
         from products.taili.ops.acceptance_run import _ssh_from_json
@@ -147,7 +177,7 @@ class TuningDriver:
         self.ssh_json, self.python, self.data_root, self.log = (
             ssh_json,
             python,
-            data_root,
+            data_root or _default_data_root(),
             log,
         )
 
@@ -315,6 +345,7 @@ def run_campaign(
     from_checkpoint: str,
     *,
     ssh_json: str = "config/ssh.json",
+    data_root: str = "",
     terrains: list[str] | None = None,
     stamp_fn=None,
     log=print,
@@ -332,7 +363,7 @@ def run_campaign(
 
     terrains = terrains or ["flat"]
     stamp_fn = stamp_fn or (lambda: time.strftime("%Y%m%d_%H%M%S"))
-    d = TuningDriver(ssh_json=ssh_json, log=log)
+    d = TuningDriver(ssh_json=ssh_json, data_root=data_root, log=log)
     # 训练入口要求绝对 checkpoint 路径；验收入口则允许只传文件名，因此这里统一展开。
     if from_checkpoint and not from_checkpoint.startswith("/"):
         from_checkpoint = (
@@ -469,6 +500,7 @@ def produce_policy(
     steps_per_iter: int = 18000,
     num_envs: int = 1024,
     ssh_json: str = "config/ssh.json",
+    data_root: str = "",
     report_path: str = "/tmp/policy_report.json",
     log=print,
 ) -> dict[str, Any]:
@@ -487,7 +519,8 @@ def produce_policy(
         remote = _ssh_from_json(ssh_json)
         try:
             raw = remote.exec_out(
-                "cat /root/gpufree-data/taili_runs/BEST_CHECKPOINT.json 2>/dev/null"
+                f"cat {data_root or _default_data_root()}/taili_runs/BEST_CHECKPOINT.json"
+                " 2>/dev/null"
             )
             best = _json.loads(raw or "{}") if raw.strip() else {}
         finally:
@@ -515,6 +548,7 @@ def produce_policy(
         from_run,
         from_checkpoint,
         ssh_json=ssh_json,
+        data_root=data_root,
         terrains=FULL_BATTERY,
         log=log,
     )
@@ -546,6 +580,11 @@ def main(argv=None) -> int:
     ap.add_argument("--steps-per-iter", type=int, default=18000)
     ap.add_argument("--num-envs", type=int, default=1024)
     ap.add_argument("--config", default="config/ssh.json")
+    ap.add_argument(
+        "--data-root",
+        default="",
+        help="远端数据根目录；留空则取 TAILI_DATA_ROOT 环境变量或产品配置里的 runtime.data_root",
+    )
     ap.add_argument("--terrains", nargs="*", default=["flat"])
     ap.add_argument("--out", default="")
     ap.add_argument(
@@ -562,6 +601,7 @@ def main(argv=None) -> int:
             steps_per_iter=a.steps_per_iter,
             num_envs=a.num_envs,
             ssh_json=a.config,
+            data_root=a.data_root,
             report_path=a.out or "/tmp/policy_report.json",
         )
         print(json.dumps(summary.get("deliverable", {}), indent=2))
@@ -570,7 +610,12 @@ def main(argv=None) -> int:
         max_iters=a.max_iters, steps_per_iter=a.steps_per_iter, num_envs=a.num_envs
     )
     summary = run_campaign(
-        camp, a.from_run, a.from_checkpoint, ssh_json=a.config, terrains=a.terrains
+        camp,
+        a.from_run,
+        a.from_checkpoint,
+        ssh_json=a.config,
+        data_root=a.data_root,
+        terrains=a.terrains,
     )
     print(json.dumps(summary, indent=2))
     if a.out:

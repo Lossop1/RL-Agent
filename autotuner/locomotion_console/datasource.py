@@ -664,7 +664,8 @@ class RealDataSource(RunDataSource):
                     mem[key] = parsed
         disks: list[RemoteDiskInfo] = []
         disk_raw = remote.exec_out(
-            "df -h /root/gpufree-data /root /tmp 2>/dev/null | awk 'NR>1 {print $6\"|\"$2\"|\"$3\"|\"$4\"|\"$5}'",
+            self._disk_probe_command()
+            + " 2>/dev/null | awk 'NR>1 {print $6\"|\"$2\"|\"$3\"|\"$4\"|\"$5}'",
             timeout=8,
         ) or ""
         seen_mounts: set[str] = set()
@@ -763,7 +764,7 @@ class RealDataSource(RunDataSource):
                 "uptime -p",
                 "cat /proc/loadavg",
                 "free -m",
-                "df -h /root/gpufree-data /root /tmp",
+                self._disk_probe_command(),
                 "tmux list-sessions",
                 "ps -eo pid,etime,pcpu,pmem,cmd",
                 "nvidia-smi --query-gpu ...",
@@ -990,6 +991,22 @@ class RealDataSource(RunDataSource):
         if not root.startswith("/") or ".." in root.split("/"):
             return "/root/gpufree-data/training_payloads"
         return root.rstrip("/")
+
+    def _data_root(self) -> str:
+        """产品声明的数据根目录。
+
+        远端命令里凡是要提到机器上的数据目录，都从这里取，不写死某一台机器的路径：
+        换机器只改配置，不改代码、也不用靠 bind mount 把路径硬凑成一致的。
+        取值不是绝对路径或带 `..` 时退回旧路径，保证命令里不会出现半截路径。
+        """
+        root = str(self._deployment_config().get("data_root") or "").strip()
+        if not root.startswith("/") or ".." in root.split("/"):
+            return "/root/gpufree-data"
+        return root.rstrip("/")
+
+    def _disk_probe_command(self) -> str:
+        """探测远端磁盘的命令。挂载点列表的第一项跟着 `_data_root()` 走。"""
+        return f"df -h {self._data_root()} /root /tmp"
 
     def _payload_entrypoint_filename(self, role: str, fallback: str) -> str:
         """取得 payload 内入口文件名，禁止把源码模块路径当成远程路径。"""
