@@ -42,6 +42,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from autotuner.research.bayesian_sampler import BayesianPolicy, bayesian_plan
 from autotuner.research.config_injection import inject_into_file, load_config_file
 from autotuner.research.hyperparameter_sampler import (
     SamplerStats,
@@ -339,6 +340,19 @@ def _hand_driven(
 
 def _assignments(tracker: SearchTracker) -> tuple[dict[str, Any], ...]:
     return build_sampler(tracker.space, tracker.plan).collect()
+
+
+def _random_points(space: SearchSpaceSchema, *, count: int) -> tuple[dict[str, Any], ...]:
+    """Legal, distinct points of ``space``, drawn without going through the plan under test.
+
+    A bayesian plan cannot be replayed from ``(space, plan)`` -- that is exactly why it is in
+    ``NON_REPLAYABLE_SAMPLER_KINDS`` -- so a hand-driven bayesian trial has to get its assignment
+    some other way.  A random plan over the same space is a documented producer of legal points, and
+    what the read side checks is that a trial's assignment is a point of its space, not which point
+    an adaptive sampler would have chosen.  Written down so the test cannot be read as implying the
+    second.
+    """
+    return build_sampler(space, SearchPlan.for_random(space, seed=7, budget=count)).collect()
 
 
 def _value_at(mapping: dict[str, Any], dotted: str) -> Any:
@@ -1148,18 +1162,44 @@ def test_the_coverage_table_has_no_hole():
     assert produced == set(COVERAGE_VERDICTS)
 
 
-def test_a_plan_kind_this_version_does_not_know_takes_the_non_grid_rows(tmp_path):
-    """A third ``SamplerKind`` would be refused by the record validator before any reader saw it.
+def test_a_plan_kind_outside_the_vocabulary_takes_the_non_grid_rows(tmp_path):
+    """A kind this version does not know is described, not refused, by the coverage table.
 
-    Measured: ``SearchRunRecord._validate_run`` re-validates the plan it carries
-    (``hyperparameter_search.py:315``), so a ledger holding ``kind="bayesian"`` reads back as
-    ``unreadable`` -- the second half of this test pins that, because the first half's tolerance is
-    about not adding a *second* place that has to know the vocabulary, not about being able to read
-    such a ledger.
+    Measured: ``SearchPlan.kind`` is a ``Literal``, so a ledger holding ``kind="annealing"`` fails
+    to read back at all -- the second half pins that, because the first half's tolerance is about
+    not adding a *second* place that has to know the vocabulary, not about being able to read such
+    a ledger.
+
+    This test used to be written with ``"bayesian"`` as the unknown kind, and said so in its name.
+    That stopped being true when task 7 added it to ``SamplerKind``: the tolerance below and the
+    unreadability below were then true for two unrelated reasons, and the test's own name was
+    false.  ``"bayesian"`` now has two tests of its own, right here.
     """
-    assert _coverage_verdict("closed", "bayesian", True, True) == "drew_its_budget"
-    assert _coverage_verdict("closed", "bayesian", False, True) == "stream_ended_early"
+    assert _coverage_verdict("closed", "annealing", True, True) == "drew_its_budget"
+    assert _coverage_verdict("closed", "annealing", False, True) == "stream_ended_early"
 
+    case = _hand_driven(tmp_path)
+    assignments = _assignments(case.tracker)
+    case.tracker.open_run()
+    _materialise(case, 1, assignments[0], objective=1.0)
+    header = case.tracker.store.latest("search_run", f"run:{case.run_ref}")
+    assert header is not None
+    _append(case, {**header, "plan": {**header["plan"], "kind": "annealing"}}, "search_run")
+    report = case.report()
+    assert report.sample_trust == "unreadable"
+    assert "annealing" in report.error
+    assert report.coverage.verdict == "unreadable"
+
+
+def test_a_bayesian_plan_without_a_policy_reads_back_as_unreadable(tmp_path):
+    """A legal kind with an incomplete plan is still an unreadable ledger, and names the gap.
+
+    ``kind="bayesian"`` passes the ``Literal`` and then fails ``SearchPlan``'s own check that a
+    bayesian plan carries a policy.  A ledger can hold this shape without anyone hand-editing it:
+    any reader of a run whose plan was written by an older, or a different, writer sees it.  The
+    point of separating it from the test above is that the reason is now about the *plan*, not about
+    the vocabulary -- and the two produce the same ``unreadable`` verdict for different causes.
+    """
     case = _hand_driven(tmp_path)
     assignments = _assignments(case.tracker)
     case.tracker.open_run()
@@ -1169,8 +1209,37 @@ def test_a_plan_kind_this_version_does_not_know_takes_the_non_grid_rows(tmp_path
     _append(case, {**header, "plan": {**header["plan"], "kind": "bayesian"}}, "search_run")
     report = case.report()
     assert report.sample_trust == "unreadable"
-    assert "bayesian" in report.error
+    assert "surrogate policy" in report.error
     assert report.coverage.verdict == "unreadable"
+
+
+def test_a_bayesian_run_that_spent_its_budget_reports_drew_its_budget(tmp_path):
+    """A real bayesian plan reads back and lands on the non-grid rows, with the caveat printed.
+
+    This is what the two tests above cost: once ``bayesian`` is a legal kind, "a ledger holding one
+    is unreadable" is no longer a safe thing to assume anywhere, and the report has to describe such
+    a run rather than fall over on it.  ``drew_its_budget`` is also the right verdict and not a
+    placeholder: an adaptive sampler with a budget of N draws exactly N points and stops, so
+    ``exhausted=True`` says it spent the budget it was given and nothing more.  The caveat is
+    asserted because it is the only place the report warns that ``exhausted`` is not coverage.
+    """
+    space = _taili_space()
+    points = _random_points(space, count=2)
+    plan = bayesian_plan(
+        space, seed=7, budget=2, policy=BayesianPolicy(direction="maximize")
+    )
+    case = _hand_driven(tmp_path, space=space, plan=plan, label="bayes")
+    case.tracker.open_run()
+    _materialise(case, 1, points[0], objective=1.0)
+    _materialise(case, 2, points[1], objective=2.0)
+    _fake_close(case, proposals=2, trial_count=2, exhausted=True)
+
+    report = case.report()
+    assert report.sample_trust == "counts_checked"
+    assert report.coverage.kind == "bayesian"
+    assert report.coverage.exhausted is True
+    assert report.coverage.verdict == "drew_its_budget"
+    assert any("not that it covered the space" in note for note in report.caveats)
 
 
 # --- E: the census, and the ledger that will not read --------------------------------------------

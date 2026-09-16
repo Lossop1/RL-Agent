@@ -19,6 +19,13 @@ Two properties are load-bearing and easy to lose:
 Parameters are drawn in dependency order, so a conditional parameter's guard is
 always placed first: whether ``kl_threshold`` is active is undecided until the
 scheduler has been chosen.
+
+A third property arrived with the adaptive sampler: **not every kind can be built
+here**.  ``SamplerKind`` names ``bayesian`` so that a plan's vocabulary is
+complete, but ``build_sampler`` refuses it, because an adaptive sampler's next
+point depends on the trials already run and this module has nowhere to read them
+from.  Refusing is the point: a silent fallback to a random draw would produce a
+search that reports itself as adaptive and is not.
 """
 from __future__ import annotations
 
@@ -37,7 +44,7 @@ from .research_ledger import content_hash
 
 SAMPLER_SCHEMA_VERSION = "rl-agent.hyperparameter-sampler/v1"
 
-SamplerKind = Literal["grid", "random"]
+SamplerKind = Literal["grid", "random", "bayesian"]
 
 _MAX_ATTEMPTS_DEFAULT = 1_000
 
@@ -74,6 +81,16 @@ class SearchPlan(BaseModel):
     fingerprint is the record a space cites.  ``seed`` is absent for a grid
     because a grid has no randomness to reproduce: recording one would suggest
     the sequence depended on it.
+
+    ``policy`` carries the adaptive sampler's knobs, and only its shape is checked
+    here.  The policy's own schema lives in ``bayesian_sampler``, which imports
+    *this* module, so validating its fields here would close an import cycle; the
+    factory ``bayesian_sampler.bayesian_plan`` is the construction path that
+    checks them.  What this module checks is the part it can see: a bayesian plan
+    carries a policy, and neither of the other kinds does.  The policy is in the
+    plan rather than beside it because it decides the *sequence* -- two searches
+    differing only in their policy are two different searches, and a run reference
+    derived from the plan must not let them collide.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -85,6 +102,7 @@ class SearchPlan(BaseModel):
     seed: int | None = None
     budget: int | None = None
     max_attempts: int = _MAX_ATTEMPTS_DEFAULT
+    policy: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def _validate_plan(self) -> "SearchPlan":
@@ -98,15 +116,47 @@ class SearchPlan(BaseModel):
             raise ValueError(f"max_attempts must be at least 1, got {self.max_attempts}")
         if self.budget is not None and self.budget < 1:
             raise ValueError(f"budget must be at least 1, got {self.budget}")
+        if self.policy is not None:
+            # Checked here rather than in the policy's own validator, because the policy
+            # arrives as a plain dict and its fields are read by another module.  A value
+            # with no JSON form would survive constuction and then fail somewhere far away
+            # -- or worse, reach ``content_hash`` and be silently dropped by it, leaving a
+            # fingerprint that does not cover the plan it names.  ``allow_nan=False``
+            # closes the same hole for the floats JSON *can* write but cannot read back
+            # as themselves.
+            try:
+                json.dumps(self.policy, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"the surrogate policy must be JSON-native, and this one is not: {error}"
+                ) from error
+        # Per-kind requirements, spelled out rather than folded into one condition:
+        # a third kind that inherited the second kind's rules silently would be exactly
+        # the mistake this table makes visible.
         if self.kind == "grid":
             if self.seed is not None:
                 raise ValueError("a grid sampler has no randomness, so it takes no seed")
-        elif self.seed is None:
-            raise ValueError("a random sampler requires a seed, or it cannot be replayed")
-        elif self.budget is None:
-            # Without a budget the stream never ends, and a caller that iterates
-            # it would hang rather than finish a search.
-            raise ValueError("a random sampler requires a budget")
+            if self.policy is not None:
+                raise ValueError(
+                    "a grid sampler consults no observations, so it carries no surrogate policy"
+                )
+        else:
+            if self.seed is None:
+                raise ValueError(f"a {self.kind} sampler requires a seed, or it cannot be replayed")
+            if self.budget is None:
+                # Without a budget the stream never ends, and a caller that iterates
+                # it would hang rather than finish a search.
+                raise ValueError(f"a {self.kind} sampler requires a budget")
+            if self.kind == "bayesian" and self.policy is None:
+                raise ValueError(
+                    "a bayesian sampler requires a surrogate policy: the policy is what its "
+                    "sequence is drawn from, so a plan without one does not describe its own "
+                    "sampler"
+                )
+            if self.kind == "random" and self.policy is not None:
+                raise ValueError(
+                    "a random sampler consults no observations, so it carries no surrogate policy"
+                )
         return self
 
     @classmethod
@@ -146,6 +196,10 @@ class SearchPlan(BaseModel):
         declaration order; the *sequence* a plan replays does not, because a
         reordered declaration enumerates the same grid in a different order.
         The plan is what promises a sequence, so the promise includes the order.
+
+        ``policy`` is part of it for the same reason: two searches that differ only
+        in their adaptive policy draw different sequences, and a plan whose
+        identity ignored the policy would let one stand in for the other.
         """
         return content_hash(self.model_dump(mode="json"))
 
@@ -366,7 +420,7 @@ class RandomSampler(Sampler):
             set_parameter(
                 partial,
                 name,
-                _draw_value(self.space.spec(name), self._rng),
+                draw_value(self.space.spec(name), self._rng),
                 create_missing=True,
             )
         return partial
@@ -415,8 +469,15 @@ def _describe_dead_end(
     return "; ".join(causes) if causes else "no draw produced an assignment"
 
 
-def _draw_value(spec: HyperparameterSpec, rng: random.Random) -> Any:
-    """One value from ``spec``'s domain, uniformly over the domain's points."""
+def draw_value(spec: HyperparameterSpec, rng: random.Random) -> Any:
+    """One value from ``spec``'s domain, uniformly over the domain's points.
+
+    Public because there is exactly one definition of "how a value is drawn from a
+    domain" and two callers: :class:`RandomSampler` and the adaptive sampler's
+    candidate pool.  A second copy would be a second place for the log-uniform and
+    by-index rules to be got wrong, and the two would disagree only on the domains
+    where it is hardest to notice.
+    """
     if spec.kind == "categorical":
         return rng.choice(spec.choices)
     if spec.kind == "discrete":
@@ -434,9 +495,23 @@ def _draw_value(spec: HyperparameterSpec, rng: random.Random) -> Any:
 
 
 def build_sampler(space: SearchSpaceSchema, plan: SearchPlan) -> Sampler:
-    """The sampler a plan describes, ready to draw from ``space``."""
+    """The sampler a plan describes, ready to draw from ``space``.
+
+    A bayesian plan is refused, and refused rather than served by a fallback: this
+    function receives no observations, and an adaptive sampler's next point is a
+    function of the trials already run.  A quiet fallback to a random draw would
+    produce a search that its own record calls adaptive; the remedy is
+    ``bayesian_sampler.BayesianSampler(space, plan, observations=...)``, passed to
+    ``SearchTracker``'s ``sampler`` argument.
+    """
     if plan.kind == "grid":
         return GridSampler(space, plan)
+    if plan.kind == "bayesian":
+        raise ValueError(
+            "a bayesian sampler draws from the trials already run, and this function is given "
+            "no observations: construct BayesianSampler(space, plan, observations=...) and pass "
+            "it to SearchTracker(sampler=...)"
+        )
     return RandomSampler(space, plan)
 
 
@@ -446,5 +521,10 @@ def replay(space: SearchSpaceSchema, plan: SearchPlan) -> tuple[dict[str, Any], 
     The caller compares this against the recorded trials, keyed by
     :func:`assignment_key`; a mismatch means the space or the sampler changed
     under a record that claims to describe this search.
+
+    Only the kinds in ``hyperparameter_search.REPLAYABLE_SAMPLER_KINDS`` have a
+    sequence this can rebuild: an adaptive sampler's sequence depends on the
+    observations, so it raises here rather than returning a sequence that is
+    merely *a* sequence, and a plausible one is worse than none.
     """
     return build_sampler(space, plan).collect()

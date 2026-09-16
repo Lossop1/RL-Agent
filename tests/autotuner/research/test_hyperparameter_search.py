@@ -53,6 +53,7 @@ from autotuner.research.hyperparameter_sampler import (
     build_sampler,
 )
 from autotuner.research.hyperparameter_search import (
+    NON_REPLAYABLE_SAMPLER_KINDS,
     REPLAYABLE_SAMPLER_KINDS,
     SearchError,
     SearchIntegrityError,
@@ -518,14 +519,19 @@ def test_the_ledger_satisfies_the_observation_protocol(tmp_path):
     )
 
 
-def test_the_replayable_kind_set_matches_the_sampler_vocabulary():
-    """The replayable kind vocabulary must be identical, word for word, to the sampler vocabulary.
+def test_the_replayable_and_non_replayable_kinds_partition_the_vocabulary():
+    """Every sampler kind is decided about exactly once: in one set, and not in the other.
 
-    An adaptive sampler (task 7's Bayesian) cannot be compared as a sequence, so it has to be
-    explicitly registered as "not replayable"; forgetting to keep them in sync is fail-safe,
-    and this test guarantees that "forgetting" is always visible.
+    This replaces an assertion that read ``REPLAYABLE_SAMPLER_KINDS == frozenset(get_args(
+    SamplerKind))``.  That could only hold while every kind was replayable, and the docstring
+    directly above it already said an adaptive sampler would have to be registered as "not
+    replayable" -- the assertion contradicted its own prose the whole time it passed.  A partition
+    says what was meant: nothing falls outside both sets (a kind nobody decided about), and nothing
+    falls inside both (a kind whose replayability claim is a coin flip).
     """
-    assert REPLAYABLE_SAMPLER_KINDS == frozenset(get_args(SamplerKind))
+    kinds = frozenset(get_args(SamplerKind))
+    assert REPLAYABLE_SAMPLER_KINDS & NON_REPLAYABLE_SAMPLER_KINDS == frozenset()
+    assert REPLAYABLE_SAMPLER_KINDS | NON_REPLAYABLE_SAMPLER_KINDS == kinds
 
 
 # --- A24: directory names are unique, a crash never collides ----------------------

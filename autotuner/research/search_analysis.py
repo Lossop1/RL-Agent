@@ -812,10 +812,19 @@ def _coverage_verdict(
       rows, so a grid that does not say cannot be filed under either half of the grid story.
 
     ``kind`` is compared to ``"grid"`` and everything else -- including a kind this version has
-    never heard of -- takes the non-grid rows.  That is a real limit worth stating: a third
-    ``SamplerKind`` would already be refused by ``SearchRunRecord``'s own validator when the
-    ledger is read (it re-validates the plan, ``hyperparameter_search.py:315``), so this
-    function's tolerance is about not adding a *second* place that has to know the vocabulary.
+    never heard of -- takes the non-grid rows.  That tolerance is about not adding a *second*
+    place that has to know the vocabulary, not about kinds being unknown in practice: the
+    non-grid rows are named for what they describe, and a stream that reported itself exhausted
+    drew the whole budget it was given whatever kind drew it.
+
+    This paragraph used to end by naming a backstop that no longer exists: it said a third
+    ``SamplerKind`` "would already be refused by ``SearchRunRecord``'s own validator when the
+    ledger is read (it re-validates the plan, ``hyperparameter_search.py:315``)".  That was true
+    while ``SamplerKind`` held two kinds and false the moment task 7 added ``bayesian`` --  the
+    validator accepts it now.  The claim was removed rather than left standing, because a
+    justification that has quietly expired reads exactly like one that still holds.  The
+    behaviour it was defending is unchanged and is separately pinned by a test: a ``bayesian``
+    run reads as ``drew_its_budget``, not as a ``ValidationError``.
     """
     if run_status == "unreadable":
         return "unreadable"

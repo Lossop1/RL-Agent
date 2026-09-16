@@ -111,12 +111,21 @@ TrialStatus = Literal["pending", "running", "succeeded", "failed", "pruned", "st
 TERMINAL_TRIAL_STATUSES: frozenset[str] = frozenset({"succeeded", "failed", "pruned", "stopped"})
 
 #: Which sampler kinds have a sequence that can be compared against a replay.  An adaptive
-#: sampler (task 7's Bayesian one) picks each next point from the observations so far, so
-#: replaying it against the current space necessarily differs from the record and comparing
-#: it would only produce false drift alarms.  Forgetting to register a kind fails safe (no
-#: comparison means no false alarm), and acceptance case A23's vocabulary test fails
-#: whenever ``SamplerKind`` changes, forcing an explicit decision.
+#: sampler picks each next point from the observations so far, so replaying it against the
+#: current space necessarily differs from the record and comparing it would only produce false
+#: drift alarms.  Forgetting to register a kind fails safe (no comparison means no false
+#: alarm), and acceptance case A23's vocabulary test fails whenever ``SamplerKind`` changes,
+#: forcing an explicit decision.
 REPLAYABLE_SAMPLER_KINDS: frozenset[str] = frozenset({"grid", "random"})
+
+#: The complement, named rather than left as "whatever is not above".  Two named sets that a
+#: test proves partition ``SamplerKind`` say more than one set and a subtraction: a kind added
+#: to neither is a kind nobody decided about, and the partition test fails on it.
+#:
+#: ``bayesian`` is here because its sequence is a function of the trials already run, not of
+#: the plan alone.  That is a statement about replayability, not a defect: the sequence is
+#: still reproducible from the ledger, just not from ``(space, plan)``.
+NON_REPLAYABLE_SAMPLER_KINDS: frozenset[str] = frozenset({"bayesian"})
 
 
 class SearchError(Exception):
@@ -1143,6 +1152,21 @@ class SearchTracker:
         directory is made and before the runner is entered, so a closed search costs nothing
         when someone asks it to run a trial again.
         """
+        if self.plan.kind in NON_REPLAYABLE_SAMPLER_KINDS and self.max_in_flight > 1:
+            # An adaptive sampler's next point is a function of the results already recorded.
+            # This loop runs trials one at a time whatever ``max_in_flight`` says, so the
+            # sequence in the ledger would still be adaptive -- but the header would declare
+            # a batch size that the adaptive property cannot survive once anyone acts on it
+            # (within a batch, every point is drawn before any of them has a result).  A
+            # reader cannot tell the two apart, so the combination is refused rather than
+            # recorded with a caveat.  Refused before ``open_run``, so nothing is written.
+            raise SearchError(
+                f"this plan is adaptive ({self.plan.kind}) and the tracker was built with "
+                f"max_in_flight={self.max_in_flight}: an adaptive sampler draws its next point "
+                f"from the trials already finished, which a batch destroys -- every point in a "
+                f"batch is drawn before any of them has a result. Run it with max_in_flight=1, "
+                f"or use a plan whose sequence does not depend on the observations"
+            )
         self.open_run()
         if self._sampler is not None and self._sampler.stats.proposals:
             # A sampler handed in by the caller is stateful: ``proposals()`` advances it and
