@@ -250,9 +250,21 @@
   python3 -m json.tool /home/chuan/robot_lab/run/taili_runs/hookreal_n4/checkpoints/checkpoint_manifest.json
   python3 -c "import json,os;m=json.load(open('/home/chuan/robot_lab/run/taili_runs/hookreal_n4/checkpoints/checkpoint_manifest.json'));p,r=next(iter(m['checkpoints'].items()));print(r['checkpoint_mtime'], os.path.getmtime(p))"
   ```
-- **未验证**：「磁盘占用 < 100GB 触发清理」这条在本轮没被触发过——240 步只落了一个检查点，
-  `last_cleanup_step: -1`。清理阈值（90 GB）与保留策略目前只有单元测试覆盖，
-  没有一次真实训练跑到过阈值。
+- **端到端验证之二（2026-09-16，3060，run_id `ladder_long_512`）**：上一个用例为了
+  让 240 步的训练落盘，显式把 `TAILI_CHECKPOINT_INTERVAL` 调到了 200，走的是**非默认**路径。
+  这一档用**默认**间隔（2000，来源 `blind_tp_env.py:3115` 的
+  `os.environ.get("TAILI_CHECKPOINT_INTERVAL", "2000")`）跑满 2000 步，即产品实际会走的路径：
+  - `status: complete`、`errors: []`；`[CheckpointHook] finalized ... promoted 2 checkpoints`；
+    `statistics: {'total_registered': 2, 'checkpoint_count': 2, 'last_cleanup_step': -1,
+    'disk_usage_gb': 0.08689182624220848}`。
+  - 磁盘上是 `agent_2000.pt` 与 `best_agent.pt`（各 46649299 字节）。
+    登记 2 条 = skrl 真写出的 2 个文件，**含 `best_` 这个标签**——这正是"调用前后比目录"
+    相对"自己拼 `agent_<t>.pt`"的差别，后者会漏掉 best 那一个。
+  - 清单里 `best_agent.pt` 记为 `step: 2000`、`reward_mean: -5.844684600830078`、
+    `episode_length_mean: 469.845703125`、`terminal_rate: 0.0`。
+- **未验证**：「磁盘占用 < 100GB 触发清理」这条在两轮里都没被触发过——240 步档只落一个
+  检查点、2000 步档两个，两轮 `last_cleanup_step` 都是 `-1`，`disk_usage_gb` 0.087。
+  清理阈值（90 GB）与保留策略目前只有单元测试覆盖，没有一次真实训练跑到过阈值。
 - **研究台账解耦**（2026-09-16）：`research_ledger` 在模块层 `import pydantic`，训练容器里没有。
   现在 `checkpoint_curator` 改为按需加载：registry / 定期清理 / 清单导出都不依赖它，
   只有能力提升在缺台账时抛具名异常 `ResearchLedgerUnavailable`，由 `finalize_training`
@@ -853,6 +865,44 @@ grep -E '^- \*\*状态\*\*：' docs/atomic_problems.md | sed 's/^- \*\*状态\*\
 - 另：`[TAILI_LAUNCH] ... rc=0 traceback=False cuda_oom=False` 这句是**启动器**
   对子进程退出码的转述，同样继承上面那个问题，不能单独当成功证据。
 
+### 3060 上的显存阶梯（2026-09-16 实测）
+
+五档同一台机器、同一份载荷 `taili_blind_runtime_fixstep11_1df8dd02e35a`
+（五档 `payload_digest` 全等于
+`1df8dd02e35a3a681920077c4a51fb8333712a403354a48356fe0219c355c11b`），
+只改 `--num_envs`。GPU 为 RTX 3060，`memory.total` 12288 MiB，空载 314-315 MiB。
+采样间隔约 1 s。脚本 `scripts/run_vram_ladder.sh`，原始读数在
+`logs/ladder_<N>_n<N>.vram`（单列 MiB）与同名 `.vram.ts`（`epoch秒 MiB` 两列）。
+
+| num_envs | total_steps | 峰值 MiB | 首→峰 | 峰→末 | status |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 240 | 8806 | +97 s | +13 s | complete |
+| 64 | 240 | 9987 | +105 s | +17 s | complete |
+| 256 | 240 | 10759 | +100 s | +18 s | complete |
+| 512 | 240 | 11065 | +106 s | +23 s | complete |
+| 512 | 2000 | 11085 | +138 s | +278 s | complete |
+
+五档 `runtime_manifest.json` 均为 `status: complete`、`errors: []`，无 OOM。
+
+读数说明：
+- **峰值出现在 +97…+138 s，不在启动瞬间**。首末两次采样都回到 314/315 MiB，
+  那是容器起停前后的空载值——所以峰值只能取整列最大值，取末尾会量到空载值。
+  `.vram` 是**单列**、不带时间戳，时间要另读 `.vram.ts`。
+- **512 档的峰值不是"还在涨"**：240 步档 11065，2000 步档 11085，步数翻 8 倍
+  只多 20 MiB；且 2000 步档的峰值在 +138 s 出现后，其后 278 s（约 1600 步）
+  再没被超过。**就本次运行而言是平台期**。
+- 余量 = 12288 - 11085 = **1203 MiB**。这个余量只在这条命令、这份载荷、
+  这套默认地形上量过；换更长训练或换地形够不够，**未验证**。
+- 4 → 512 档只多 2259 MiB，而空载到 4 档就吃掉 8491 MiB：固定开销
+  （Isaac Sim/PhysX + CUDA context）占大头，环境数不是主要成本。
+
+复核命令（在 3060 上）：
+```
+cd /home/chuan/robot_lab/logs
+python3 -c "v=[int(x) for x in open('ladder_512_n512.vram') if x.strip()];print(max(v))"   # 11065
+python3 -c "v=[int(x) for x in open('ladder_long_512.vram') if x.strip()];print(max(v))"  # 11085
+```
+
 ### 需要优先完成的问题
 1. **P6.1 多后端抽象**：步骤1-3已完成（协议定义、IsaacLab适配器、工厂函数、**4** 个训练入口迁移，订正见 P6.1），步骤4-6待GPU运行时环境
 2. **P4.3 训练恢复**：单元测试已完成（32个测试），核心逻辑已实现，待GPU环境执行集成验证
@@ -936,3 +986,17 @@ grep -E '^- \*\*状态\*\*：' docs/atomic_problems.md | sed 's/^- \*\*状态\*\
   写下的"总计 31"，补入 P4.8 后为 32。P4.3 仍是「已完成（待远端端到端验证）」。
   另订正 P4.7「最近完成」里的"远端 smoke12 / ladder_n4 实测 rc=0"——那两次运行实际是
   `status: failed`，属读错证据，已在原处标注。
+- 2026-09-16：补测 3060 的显存阶梯，并把 P4.2 的端到端证据补到**默认**
+  `TAILI_CHECKPOINT_INTERVAL` 这条路径上。四档短跑（4/64/256/512 envs，各 240 步）
+  加一档长跑（512 envs，2000 步）：峰值 8806 / 9987 / 10759 / 11065 / 11085 MiB，
+  五档全部 `status: complete`、`errors: []`、无 OOM。要点两条：峰值出现在 +97…+138 s
+  而不是启动瞬间；512 档步数翻 8 倍峰值只涨 20 MiB，且峰值出现后 278 s 没被超过，
+  所以是平台期而非持续增长。余量 1203 MiB 只在这套命令/载荷/地形上量过，
+  换条件够不够**未验证**。见「关键发现」新增的「3060 上的显存阶梯」一节。
+  **同时订正一个错误的进度判据**：早先 `scripts/run_taili.sh` 头部写过
+  "`--total-steps 576` 跑出恰好 576 条 `[TPREW]`"，并据此把条数当步数判据。
+  那是错的——`[TPREW]`/`[TPSTAT]` 的**条数被 `telemetry_interval` 节流**：
+  间隔 1 时 576 步得 576 条，间隔 10 时 576 步只 59 条、2000 步 201 条、240 步 25 条
+  （四个读数分别来自 `fixstep_n4` / `hookchk_n4` / `ladder_long_512` / `ladder_4_n4`）。
+  可靠判据是 **tqdm 末行的 `N/N`**，13 次运行的收尾行与 `--total-steps` 全部相符。
+  该脚本头部已改写并重新上传；本文正文未用过这个判据，无需改。
