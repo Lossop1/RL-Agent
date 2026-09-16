@@ -82,6 +82,17 @@ class TestBackendFactory:
         assert backend.num_envs == 4
         assert backend.device == torch.device("cpu")
 
+    def test_adapter_unwrapped_is_the_raw_env(self):
+        """unwrapped 原样交出底层环境。
+
+        IsaacLab 自带的 skrl 包装器按 env.unwrapped 判断底层类型，并把 step/reset 直接
+        发给传进来的对象。本适配器的 reset 只返回观测、step 返回四元组，契约与 skrl 期望的
+        不同，所以入口应当取 .unwrapped 交出去——这条断言盯的就是那个出口没有被改坏。
+        """
+        env = MockDirectRLEnv()
+        backend = IsaacLabAdapter(env)
+        assert backend.unwrapped is env
+
     def test_isaaclab_backend_functional(self):
         """测试IsaacLab后端功能完整性。"""
         env = MockDirectRLEnv()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
+import posixpath
 import re
 import tempfile
 from typing import Iterable
@@ -26,6 +27,14 @@ SANITIZED_ROBOT_URDF = Path(tempfile.gettempdir()) / "taili_blind_payload_robot.
 
 STATIC_FILES: tuple[tuple[str, str], ...] = (
     ("products/taili/blind_locomotion/__init__.py", f"{RUNTIME_PACKAGE}/__init__.py"),
+    ("products/taili/blind_locomotion/_torchvision_pair.py", f"{RUNTIME_PACKAGE}/_torchvision_pair.py"),
+    # 后端抽象（P6.1）随载荷发布：训练/诊断/验收入口都要 `create_backend`，
+    # 而远端只有载荷在 PYTHONPATH 上（products/taili/ops/tune_orchestrator.py:242），
+    # 少一个模块就 `ModuleNotFoundError: No module named 'autotuner'`，训练一步都跑不起来。
+    # 这三个模块内部改成相对导入，所以搬进哪个包都能用。
+    ("autotuner/simulation/simulator_protocol.py", f"{RUNTIME_PACKAGE}/taili_sim/simulator_protocol.py"),
+    ("autotuner/simulation/isaaclab_adapter.py", f"{RUNTIME_PACKAGE}/taili_sim/isaaclab_adapter.py"),
+    ("autotuner/simulation/backend_factory.py", f"{RUNTIME_PACKAGE}/taili_sim/backend_factory.py"),
     ("products/taili/blind_locomotion/blind_tp_env.py", f"{RUNTIME_PACKAGE}/blind_tp_env.py"),
     ("products/taili/blind_locomotion/blind_tp_env_cfg.py", f"{RUNTIME_PACKAGE}/blind_tp_env_cfg.py"),
     ("products/taili/blind_locomotion/taili_blind_env_cfg.py", f"{RUNTIME_PACKAGE}/taili_blind_env_cfg.py"),
@@ -41,6 +50,15 @@ STATIC_FILES: tuple[tuple[str, str], ...] = (
     ("autotuner/execution/runtime.py", f"{RUNTIME_PACKAGE}/runtime_identity.py"),
     ("autotuner/execution/hashing.py", f"{RUNTIME_PACKAGE}/execution_hashing.py"),
     ("autotuner/execution/compatibility.py", f"{RUNTIME_PACKAGE}/resume_compatibility.py"),
+    # P4.2 检查点管理。此前只有源码树在跑：训练入口 import 不到 checkpoint_hook，
+    # 被 except 吞成一行 "checkpoint hook install failed"，于是"已完成"的 P4.2
+    # 在远端其实一次都没生效（2026-09-16 smoke12 实测）。
+    # checkpoint_curator 依赖 research_ledger，后者要 pydantic（载荷构建用宿主
+    # python 有，训练容器是否有一并在 smoke 里验）。
+    ("products/taili/blind_locomotion/checkpoint_hook.py", f"{RUNTIME_PACKAGE}/checkpoint_hook.py"),
+    ("products/taili/blind_locomotion/checkpoint_integration.py", f"{RUNTIME_PACKAGE}/checkpoint_integration.py"),
+    ("autotuner/product/checkpoint_curator.py", f"{RUNTIME_PACKAGE}/checkpoint_curator.py"),
+    ("autotuner/research/research_ledger.py", f"{RUNTIME_PACKAGE}/research_ledger.py"),
     ("products/taili/blind_locomotion/launch_taili_train.py", f"{RUNTIME_PACKAGE}/launch_taili_train.py"),
     ("products/taili/blind_locomotion/train_taili.py", f"{RUNTIME_PACKAGE}/train_taili.py"),
     ("products/taili/blind_locomotion/calibrate_taili_gates.py", f"{RUNTIME_PACKAGE}/calibrate_taili_gates.py"),
@@ -91,6 +109,11 @@ OPTIONAL_STATIC_PREFIXES = (
 )
 
 GENERATED_FILES = {
+    # 源码树里 `autotuner/simulation/` 没有 __init__.py（靠 PEP 420 命名空间包），
+    # 搬进载荷后是一个普通包目录，得自己带一个。
+    f"{RUNTIME_PACKAGE}/taili_sim/__init__.py": (
+        '"""打包进载荷的仿真器后端，源在 autotuner/simulation/。"""\n'
+    ),
     "sitecustomize.py": (
         '"""当 payload 位于 PYTHONPATH 时自动注册 Taili 盲态任务。"""\n'
         "try:\n"
@@ -182,7 +205,163 @@ def validate_manifest(root: Path = ROOT) -> ValidationReport:
     _validate_yaml_contract(root, report)
     _validate_registration_contract(root, report)
     _validate_robot_asset_contract(root, report)
+    _validate_import_closure(root, report)
     return report
+
+
+def _dual_layout_groups(
+    tree: ast.AST, first_party: frozenset[str]
+) -> dict[int, list[ast.ImportFrom]]:
+    """把 ``try/except`` 里成对的导入归成组（导入节点 id -> 同组全部成员）。
+
+    ``try: from .hashing import x / except ImportError: from .execution_hashing import x``
+    是有意的双布局写法——源码树一套、载荷另一套（载荷会给模块改名），两支里只有一支
+    解析得出来。判据是**兜底分支自己有没有导入**：只有日志的兜底不成组，那正是 P4.2
+    在远端静默降级的样子，必须报出来。
+
+    载荷内包名（``taili_blind_runtime.*``）与首方绝对导入（``from autotuner... import``）
+    也算组员：前者是载荷那一支，后者是源码树那一支。
+    """
+    groups: dict[int, list[ast.ImportFrom]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        if not any(
+            isinstance(inner, (ast.Import, ast.ImportFrom))
+            for handler in node.handlers
+            for inner in ast.walk(handler)
+        ):
+            continue
+        members = [
+            inner
+            for stmt in [*node.body, *node.handlers]
+            for inner in ast.walk(stmt)
+            if isinstance(inner, ast.ImportFrom)
+            and (
+                inner.level
+                or (inner.module or "").split(".")[0] in first_party
+                or (inner.module or "").split(".")[0] == RUNTIME_PACKAGE
+            )
+        ]
+        for member in members:
+            groups[id(member)] = members
+    return groups
+
+
+def _validate_import_closure(root: Path, report: ValidationReport) -> None:
+    """载荷文件引用的模块必须也在载荷里。
+
+    STATIC_FILES 是手工白名单，漏一个模块既不会在构建时报错，也不会在导入时报错：
+    调用点通常把 ImportError 吞成一行日志，于是功能在远端静默消失。已经咬过两次——
+    P4.7 的 ``autotuner.simulation``（训练一步都起不来）、以及 P4.2 的
+    ``checkpoint_hook``（``train_taili`` 的检查点管理只打印一句 install failed）。
+
+    查三类：相对导入（``from .x import``）、首方包的裸绝对导入（载荷里没有
+    ``autotuner``/``products`` 这些名字，``sitecustomize`` 只注册 ``taili_blind_runtime``，
+    所以裸用必然在远端 ImportError）、以及漏打的包内模块。第三方导入（torch、skrl、
+    isaaclab）不管，它们由运行环境提供。
+
+    解析在**目标空间**做，不是源码树空间：有些模块进载荷时会改名
+    （``autotuner/execution/runtime.py`` -> ``runtime_identity.py``），只按源码树
+    解析会把 ``from .hashing import ...`` 这种注定在远端失败的写法判成通过。
+    """
+    dest_of: dict[str, Path] = {}
+    for src, dst in report.files:
+        dest_of[dst] = src
+    dest_files = set(dest_of)
+    dest_dirs = {posixpath.dirname(dst) for dst in dest_files}
+    first_party = frozenset({"autotuner", "products", "tools"})
+
+    def resolves(dest: str) -> bool:
+        return dest in dest_files or dest.rstrip("/") in dest_dirs
+
+    for dst in sorted(dest_files):
+        src = dest_of[dst]
+        if not dst.endswith(".py") or not src.is_file():
+            continue
+        try:
+            tree = ast.parse(src.read_text(encoding="utf-8", errors="replace"), filename=str(src))
+        except SyntaxError as exc:
+            report.errors.append(f"cannot parse {src}: {exc}")
+            continue
+        groups = _dual_layout_groups(tree, first_party)
+        base = posixpath.dirname(dst)
+
+        def candidates(node: ast.ImportFrom) -> list[str]:
+            """这条导入在目标空间里可能指向哪些模块路径（不含扩展名）。"""
+            if not node.level:
+                # `taili_blind_runtime.x.y` 在载荷里就是 `taili_blind_runtime/x/y.py`；
+                # 首方名（autotuner/products）在载荷里根本不存在，必然解析不到。
+                return [(node.module or "").replace(".", "/")]
+            anchor = base
+            for _ in range(node.level - 1):
+                anchor = posixpath.dirname(anchor)
+            if node.module is not None:
+                modules = [node.module]
+            else:
+                # `from . import x`：x 可能是子模块，也可能是包 __init__ 里的名字。
+                # 只有它确实对应一个模块文件时才当作模块来查，避免误报。
+                modules = [
+                    alias.name
+                    for alias in node.names
+                    if (src.parent / f"{alias.name}.py").is_file()
+                    or (src.parent / alias.name / "__init__.py").is_file()
+                ]
+            out = []
+            for module in modules:
+                rel = module.replace(".", "/")
+                if anchor:
+                    rel = posixpath.join(anchor, rel)
+                out.append(rel)
+            return out
+
+        def ok(node: ast.ImportFrom) -> bool:
+            # 无候选 = 这条 `from . import` 说的不是模块，无从检查，不算缺口。
+            return all(
+                resolves(f"{rel}.py") or resolves(posixpath.join(rel, "__init__.py"))
+                for rel in candidates(node)
+            )
+
+        checked: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or id(node) in checked:
+                continue
+            if node.level == 0:
+                root = (node.module or "").split(".")[0]
+                if root not in first_party and root != RUNTIME_PACKAGE:
+                    continue  # 第三方，运行环境提供
+                group = groups.get(id(node), [node])
+                checked.update(id(member) for member in group)
+                if any(ok(member) for member in group):
+                    continue
+                if root in first_party:
+                    report.errors.append(
+                        f"first-party absolute import unusable in payload: {dst} imports "
+                        f"{node.module!r}; 载荷里没有 {node.module.split('.')[0]!r} 这个包名"
+                        f"（sitecustomize 只注册 {RUNTIME_PACKAGE}），且没有兜底分支"
+                    )
+                else:
+                    report.errors.append(
+                        f"payload-internal import not packaged: {dst} imports {node.module!r} "
+                        f"-> {', '.join(candidates(node))}.py is not in the payload"
+                    )
+                continue
+            group = groups.get(id(node), [node])
+            checked.update(id(member) for member in group)
+            if any(ok(member) for member in group):
+                continue
+            if len(group) == 1:
+                report.errors.append(
+                    f"relative import not packaged: {dst} imports {node.module!r} "
+                    f"-> {', '.join(candidates(node)) or '<no module target>'}.py "
+                    f"is not in the payload"
+                )
+            else:
+                branches = "; ".join(f"{m.module!r}->{', '.join(candidates(m))}" for m in group)
+                report.errors.append(
+                    f"relative import not packaged: {dst} has no resolvable branch "
+                    f"({branches})"
+                )
 
 
 def _validate_policy_contract(root: Path, report: ValidationReport) -> None:

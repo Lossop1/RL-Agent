@@ -22,7 +22,9 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import ContactSensor, RayCaster
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+# 旧版叫 quat_apply_inverse，这个 IsaacLab 版本（0.36.21）改名为 quat_rotate_inverse。
+# 等价是数值验过的：4096 组随机单位四元数下与 quat_apply(quat_inv(q), v) 最大差 1.07e-06。
+from isaaclab.utils.math import quat_apply, quat_rotate_inverse
 from .taili_amp_env_cfg import TailiAmpEnvCfg
 from .motions import MotionLoader  # noqa: F401  # 保留兼容导入。
 from .multi_motion_loader import MultiMotionLoader
@@ -2280,7 +2282,7 @@ class TailiAmpEnv(DirectRLEnv):
     def _feet_rel_base(self, foot_pos_w, base_pos_w, base_quat_w, n_foot):
         rel = foot_pos_w - base_pos_w.unsqueeze(1)  # (M, n_foot, 3)
         q = base_quat_w.unsqueeze(1).expand(-1, n_foot, -1).reshape(-1, 4)
-        return quat_apply_inverse(q, rel.reshape(-1, 3)).reshape(-1, n_foot * 3)
+        return quat_rotate_inverse(q, rel.reshape(-1, 3)).reshape(-1, n_foot * 3)
 
     def _accumulate_curriculum_progress(self):
         """按当前命令逐步累计真实进展，避免 episode 内命令切换污染课程判定。"""
@@ -3436,7 +3438,7 @@ class TailiAmpEnv(DirectRLEnv):
             .expand(-1, self.n_feet, -1)
             .reshape(-1, 4)
         )
-        foot_vel_b = quat_apply_inverse(q, foot_vel_w3.reshape(-1, 3)).reshape(
+        foot_vel_b = quat_rotate_inverse(q, foot_vel_w3.reshape(-1, 3)).reshape(
             -1, self.n_feet, 3
         )
         foot_vel_b_xy = foot_vel_b[:, :, :2]  # (N,4,2), base frame

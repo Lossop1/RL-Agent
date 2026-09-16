@@ -186,7 +186,10 @@ class TrainingTelemetryEmitter:
             # 将检查点注册到CheckpointRegistry
             if saved and performance is not None:
                 try:
-                    from autotuner.product.checkpoint_curator import CheckpointRegistry
+                    try:  # 载荷内：checkpoint_curator 被拍平到 taili_blind_runtime/
+                        from taili_blind_runtime.checkpoint_curator import CheckpointRegistry
+                    except ImportError:  # 源码树
+                        from autotuner.product.checkpoint_curator import CheckpointRegistry
                     registry = getattr(self, "_checkpoint_registry", None)
                     if registry is None:
                         registry = CheckpointRegistry()

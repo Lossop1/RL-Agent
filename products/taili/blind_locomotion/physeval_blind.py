@@ -71,7 +71,12 @@ import torch
 import yaml
 from skrl.utils.runner.torch import Runner
 from isaaclab_rl.skrl import SkrlVecEnvWrapper
-from autotuner.simulation.backend_factory import create_backend
+try:
+    # 载荷内自带（taili_blind_runtime/taili_sim）：远端只有载荷在 PYTHONPATH 上。
+    # 用绝对路径而不是相对路径——本文件也会被 physeval_suite 当脚本直接跑（没有 __package__）。
+    from taili_blind_runtime.taili_sim.backend_factory import create_backend
+except ImportError:  # 源码树兼容：工厂住在 autotuner/simulation/
+    from autotuner.simulation.backend_factory import create_backend
 
 try:
     import taili_blind_runtime as taili_runtime  # noqa: F401
@@ -171,8 +176,11 @@ def main():
         cfg.terrain.terrain_generator.curriculum = True
     cfg.terrain.max_init_terrain_level = max(0, args.terrain_level)
 
-    env = create_backend(args.task, cfg, backend_type="isaaclab")
-    env = SkrlVecEnvWrapper(env, ml_framework="torch")
+    backend = create_backend(args.task, cfg, backend_type="isaaclab")
+    # skrl 的包装器要的是 IsaacLab 原生环境：它按 env.unwrapped 认类型，并把 step/reset
+    # 直接发给传进来的那个对象。SimulatorBackend 适配器的 reset 只返回观测、step 返回
+    # 四元组，契约不同，所以把底层环境取出来交给它。
+    env = SkrlVecEnvWrapper(backend.unwrapped, ml_framework="torch")
     if args.agent_yaml:
         ac = yaml.safe_load(open(args.agent_yaml, encoding="utf-8"))
     else:

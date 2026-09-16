@@ -15,7 +15,9 @@ import types
 
 import numpy as np
 import torch
-from isaaclab.utils.math import quat_apply_inverse
+# 旧版叫 quat_apply_inverse，这个 IsaacLab 版本（0.36.21）改名为 quat_rotate_inverse。
+# 等价是数值验过的：4096 组随机单位四元数下与 quat_apply(quat_inv(q), v) 最大差 1.07e-06。
+from isaaclab.utils.math import quat_rotate_inverse
 
 try:                                            # payload 包内导入。
     from .taili_core import (taili_obs, taili_symmetry as _taili_symmetry, taili_amp_reference,
@@ -50,6 +52,7 @@ except Exception:  # pragma: no cover - remote deployment may copy files differe
 
 try:
     from .telemetry_payloads import (
+        build_checkpoint_performance_snapshot,
         build_command_payload,
         build_curriculum_payload,
         build_health_payload,
@@ -58,6 +61,7 @@ try:
 except Exception:  # pragma: no cover - payload 包和本地源码树的导入路径不同。
     try:
         from telemetry_payloads import (
+            build_checkpoint_performance_snapshot,
             build_command_payload,
             build_curriculum_payload,
             build_health_payload,
@@ -67,6 +71,7 @@ except Exception:  # pragma: no cover - payload 包和本地源码树的导入�
         if __package__ == "taili_blind_runtime":
             raise
         from products.taili.blind_locomotion.telemetry_payloads import (
+            build_checkpoint_performance_snapshot,
             build_command_payload,
             build_curriculum_payload,
             build_health_payload,
@@ -1331,9 +1336,9 @@ class TailiBlindTPEnv(TailiAmpEnv):
         self._prev_support_contact = _support_contact_f.detach().clone()
         _rel_foot_w = foot_pos - rd.root_pos_w[:, None, :]
         _qfb = rd.root_quat_w[:, None, :].expand(-1, 4, -1).reshape(-1, 4)
-        _foot_b = quat_apply_inverse(_qfb, _rel_foot_w.reshape(-1, 3)).reshape(N, 4, 3)
+        _foot_b = quat_rotate_inverse(_qfb, _rel_foot_w.reshape(-1, 3)).reshape(N, 4, 3)
         _rel_foot_vel_w = foot_vel - rd.root_lin_vel_w[:, None, :]
-        _rel_foot_vel_rot_b = quat_apply_inverse(
+        _rel_foot_vel_rot_b = quat_rotate_inverse(
             _qfb, _rel_foot_vel_w.reshape(-1, 3)
         ).reshape(N, 4, 3)
         _foot_rel_vel_b = _rel_foot_vel_rot_b - torch.cross(
@@ -1651,7 +1656,7 @@ class TailiBlindTPEnv(TailiAmpEnv):
         )
         self._support_reference_point.copy_(_support_reference["point_w"].detach())
         self._support_reference_normal.copy_(_support_reference["normal_w"].detach())
-        _support_normal_b = quat_apply_inverse(rd.root_quat_w, self._support_reference_normal)
+        _support_normal_b = quat_rotate_inverse(rd.root_quat_w, self._support_reference_normal)
         _support_tilt_rel = torch.arccos(torch.clamp(_support_normal_b[:, 2], -1.0, 1.0))
         _support_base_h = (
             (rd.root_pos_w - self._support_reference_point) * self._support_reference_normal
@@ -2657,7 +2662,7 @@ class TailiBlindTPEnv(TailiAmpEnv):
         if _w_swing != 0.0:
             _qsw = rd.root_quat_w[:, None, :].expand(-1, 4, -1).reshape(-1, 4)
             _v_rel_w = foot_vel - rd.root_lin_vel_w[:, None, :]                           # (N,4,3)，足端相对 base 的世界速度。
-            _v_fwd_b = quat_apply_inverse(_qsw, _v_rel_w.reshape(-1, 3)).reshape(self.num_envs, 4, 3)[:, :, 0]  # 机体系前后速度。
+            _v_fwd_b = quat_rotate_inverse(_qsw, _v_rel_w.reshape(-1, 3)).reshape(self.num_envs, 4, 3)[:, :, 0]  # 机体系前后速度。
             _foot_y0 = 0.2082 * torch.tensor([1., -1., 1., -1.], device=self.device)      # FL,FR,RL,RR 的名义足端横向位置。
             _vfx_ref = self.commands[:, 0:1] - self.commands[:, 2:3] * _foot_y0[None, :]   # (N,4)，命令对应的前后摆动速率。
             _margin_sw = float(getattr(self.cfg, "swing_dir_margin", 0.15))
@@ -3263,15 +3268,17 @@ class TailiBlindTPEnv(TailiAmpEnv):
                         command=command_payload,
                     )
 
-                    # P4.2集成：缓存当前步的性能快照，供检查点保存时使用
-                    import time
-                    self._latest_performance_snapshot = {
-                        "reward_mean": float(reward_payload.get("mean", 0.0)),
-                        "terminal_rate": float(health_payload.get("terminal_rate", 0.0)),
-                        "episode_length_mean": float(health_payload.get("episode_length_mean", 100.0)),
-                        "curriculum_phase": int(curriculum_payload.get("phase", 0)),
-                        "checkpoint_mtime": time.time(),
-                    }
+                    # P4.2集成：缓存当前步的性能快照，供检查点保存时使用。
+                    # 传的是数值 phase：curriculum_payload["phase"] 是显示串（"phi0"），
+                    # 曾经直接 int() 它，导致训练第一步就崩，见 build_checkpoint_performance_snapshot。
+                    self._latest_performance_snapshot = build_checkpoint_performance_snapshot(
+                        reward_payload=reward_payload,
+                        health_payload=health_payload,
+                        phase=phase,
+                        # 这两个 payload 里都没有 episode_length_mean，得从 episode_length_buf 现算。
+                        # 不传的话登记表里会落一个假默认值，curator 的 episode_length > 100 门就形同虚设。
+                        episode_length_mean=float(self.episode_length_buf.float().mean().item()),
+                    )
                 else:
                     print("[TPREW] step %d rew %.3f lin_err %.3f speed %.3f gate %.2f tracking_lin %.3f stand %.3f"
                           % (self._rew_log_step, float(total.mean()), lin_err,

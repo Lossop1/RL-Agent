@@ -13,8 +13,10 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from autotuner.simulation.simulator_protocol import SimulatorBackend
-from autotuner.simulation.isaaclab_adapter import IsaacLabAdapter
+# 相对导入：这三个模块要能整体搬进训练载荷（taili_blind_runtime/taili_sim/）当包内模块用，
+# 写绝对路径的话搬过去就 import 不到了。
+from .simulator_protocol import SimulatorBackend
+from .isaaclab_adapter import IsaacLabAdapter
 
 # 延迟导入gymnasium，避免测试时必须安装
 try:
@@ -58,7 +60,12 @@ def create_backend(
             )
         # gym.make()是IsaacLab的标准环境创建入口
         env = gym.make(task, cfg=cfg, render_mode=render_mode)
-        return IsaacLabAdapter(env)
+        # gym.make 默认会把环境套进 PassiveEnvChecker / OrderEnforcing / TimeLimit 这几层
+        # （gymnasium 1.1.1 registration.py:805-816）。适配器要的是裸的 DirectRLEnv：
+        # 它按 IsaacLab 的 native 接口调用 `reset(env_ids=...)`，而包装器的 reset 签名是
+        # `reset(self, *, seed=None, options=None)`，关键字限定，不接 env_ids；
+        # IsaacLabAdapter 的 isinstance 检查也要求 DirectRLEnv。
+        return IsaacLabAdapter(env.unwrapped)
     elif backend_type == "mujoco":
         # MuJoCo后端待实现（P6.1步骤5）
         raise NotImplementedError("MuJoCo backend not yet implemented")

@@ -11,11 +11,54 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from autotuner.research.research_ledger import CapabilityProfile, ResearchLedgerStore
+class ResearchLedgerUnavailable(RuntimeError):
+    """研究台账拿不到（典型原因：环境里没有 pydantic）。
+
+    注册表、清理、导出清单都不需要它；只有"能力提升"要。训练容器里没有 pydantic，
+    所以那里这个异常是正常的、可预期的，不该被当成训练故障。
+    """
+
+
+def _coerce_curriculum_phase(raw: Any) -> int:
+    """把遥测里的课程阶段转成数值。
+
+    训练侧写的是显示串 ``"phi0"``（``telemetry_payloads.build_curriculum_payload``），
+    回填侧却要一个 int。别处（``build_checkpoint_performance_snapshot`` 的注释）
+    记过同一个坑：直接 ``int()`` 它会抛 ``ValueError``。这里容错到底，
+    认不出来就记 0，宁可丢一个字段也不要让回填整段崩掉。
+    """
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    match = re.search(r"-?\d+", str(raw))
+    return int(match.group()) if match else 0
+
+
+def _load_capability_profile():
+    """按需加载 ``CapabilityProfile``。
+
+    刻意不做模块级导入：``research_ledger`` 在模块层就 ``import pydantic``，而
+    IsaacLab 训练容器里没有 pydantic。放在模块层会让整个 checkpoint_curator
+    连带 checkpoint_hook 一起导不进来，把"能力提升用不了"放大成"检查点管理全废"。
+    """
+    try:  # 载荷内：两个模块被拍平到 taili_blind_runtime/
+        from .research_ledger import CapabilityProfile
+    except ImportError as payload_exc:  # 源码树：research_ledger 住在 autotuner/research/
+        try:
+            from autotuner.research.research_ledger import CapabilityProfile
+        except ImportError:
+            # 先报载荷那一支的原因，否则真因（No module named 'pydantic'）会被
+            # "No module named 'autotuner'" 盖掉，看日志的人会被带偏。
+            raise ResearchLedgerUnavailable(str(payload_exc)) from None
+    return CapabilityProfile
 
 
 @dataclass
@@ -157,12 +200,20 @@ class CheckpointRegistry:
                     reward = entry.get("reward", {})
                     health = entry.get("health", {})
                     curriculum = entry.get("curriculum", {})
+                    # 键名对着真遥测核过（2026-09-16，hookreg_n4 的 train.telemetry.jsonl）：
+                    # reward 段没有 "mean"，总数叫 "total"；health 段没有
+                    # "episode_length_mean"；curriculum 段没有 "level"（阶段级别叫
+                    # "dr_level"）。原先这几个 .get(..., 默认值) 全部落空，
+                    # 于是回填出来的性能数据清一色是常数。
+                    # curriculum["phase"] 是显示串（"phi0"），不是数字，不能直接进 int 字段。
                     step_to_perf[step] = {
-                        "reward_mean": reward.get("mean", 0.0),
+                        "reward_mean": reward.get("total", 0.0),
                         "terminal_rate": health.get("terminal_rate", 0.0),
-                        "episode_length_mean": health.get("episode_length_mean", 0.0),
-                        "curriculum_phase": curriculum.get("phase", 0),
-                        "curriculum_level": curriculum.get("level", 0),
+                        # 遥测里根本没有这一项，回填不出来。记 0.0 表示"不知道"，
+                        # 不要拿一个能过门限的常数冒充已知（register 要求这个键存在）。
+                        "episode_length_mean": 0.0,
+                        "curriculum_phase": _coerce_curriculum_phase(curriculum.get("phase")),
+                        "curriculum_level": int(curriculum.get("dr_level", 0) or 0),
                     }
         except (FileNotFoundError, json.JSONDecodeError):
             return 0
@@ -788,7 +839,8 @@ class CapabilityPromotionService:
             CapabilityProfile实例
         """
         import uuid
-        from autotuner.research.research_ledger import CapabilityProfile
+
+        CapabilityProfile = _load_capability_profile()
 
         profile = CapabilityProfile(
             id=str(uuid.uuid4()),

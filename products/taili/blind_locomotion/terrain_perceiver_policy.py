@@ -78,15 +78,21 @@ class TerrainPerceiverPolicy(GaussianMixin, Model):
 
     def compute(self, inputs, role: str = ""):
         states = inputs.get("states")
+        # 这个 "states" 是环境完整的 1638 维策略张量，不是 1407：前 1407 是可部署的盲态
+        # 切片，后面 231 维（priv 197 + 辅助标签 34）只有训练期存在，本策略不读。
+        # 之所以完整张量会走到这里：环境不启用 skrl 的 state_space 机制
+        # （taili_amp_env_cfg.py:354 `state_space = 0`），skrl 便用 observation_space 顶替，
+        # 于是模型收到的 "states" 就是那 1638 维——切片由模型自己做。
+        blind = states[:, :ACTOR_OBS]
 
         # P6.3 观测归一化：训练时更新统计量，评估时使用冻结统计量
         if self.obs_normalizer is not None:
             if self.training:
-                self.obs_normalizer.update(states)
-            states = self.obs_normalizer.normalize(states, clip_range=3.0)
+                self.obs_normalizer.update(blind)
+            blind = self.obs_normalizer.normalize(blind, clip_range=3.0)
 
-        body = states[:, :BODY_DIM]
-        history = states[:, BODY_DIM:BODY_DIM + HIST_FLAT].reshape(-1, HIST_LEN, TICK_DIM)
+        body = blind[:, :BODY_DIM]
+        history = blind[:, BODY_DIM:BODY_DIM + HIST_FLAT].reshape(-1, HIST_LEN, TICK_DIM)
         z = self.perceiver.encode(history)
         self._last_z = z
         z_actor = apply_grad_scale(z, float(self.grad_scale))

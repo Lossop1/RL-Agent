@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 
+from . import _torchvision_pair
 from .taili_blind_config import CONFIG_FILENAME
 
 TASK_IDS = (
@@ -25,6 +26,13 @@ except Exception:
 
 def _register_blind_locomotion():
     try:
+        # 必须先于 skrl：skrl 会 `import torch`，而 Isaac Sim 启动时又会把自带的
+        # torchvision（不同 CUDA 构建）接进来，两边一混就报 `torchvision::nms does not exist`。
+        # 详见 _torchvision_pair 的模块文档串。钉不住就按原样跑，不因此放弃注册。
+        try:
+            _torchvision_pair.pin_torchvision()
+        except Exception:  # noqa: BLE001 - 钉不住不阻断，真出错由 skrl/训练侧暴露
+            pass
         from skrl.utils.runner.torch import Runner
         from .terrain_perceiver_policy import terrain_perceiver_gaussian_model, terrain_perceiver_model
         from .terrain_perceiver_aux_patch import patch_amp_terrain_aux

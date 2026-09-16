@@ -17,12 +17,27 @@ import time
 from pathlib import Path
 from typing import Any
 
-from autotuner.product.checkpoint_curator import (
-    CapabilityPromotionService,
-    CheckpointCurator,
-    CheckpointRegistry,
-    CheckpointSelector,
-)
+try:  # 载荷内：两个模块被拍平到 taili_blind_runtime/
+    from .checkpoint_curator import (
+        CapabilityPromotionService,
+        CheckpointCurator,
+        CheckpointRegistry,
+        CheckpointSelector,
+        ResearchLedgerUnavailable,
+    )
+except ImportError as _payload_exc:  # 源码树：checkpoint_curator 住在 autotuner/product/
+    try:
+        from autotuner.product.checkpoint_curator import (
+            CapabilityPromotionService,
+            CheckpointCurator,
+            CheckpointRegistry,
+            CheckpointSelector,
+            ResearchLedgerUnavailable,
+        )
+    except ImportError:
+        # 两支都失败时先报载荷那一支，否则真因（例如容器里没有 pydantic）会被
+        # "No module named 'autotuner'" 盖掉。
+        raise _payload_exc from None
 
 
 class CheckpointIntegration:
@@ -149,6 +164,14 @@ class CheckpointIntegration:
                         f"[CheckpointIntegration] promoted {len(promoted_ids)} checkpoints to capability profiles",
                         flush=True,
                     )
+            except ResearchLedgerUnavailable as e:
+                # 训练容器里没有 pydantic，这里必然走到。能力提升只服务研究台账，
+                # 注册表/清理/清单导出都不依赖它，所以这是一句说明而不是故障。
+                print(
+                    f"[CheckpointIntegration] 跳过能力提升：研究台账不可用（{e}）。"
+                    "检查点清理与清单导出不受影响。",
+                    flush=True,
+                )
             except Exception as e:
                 print(f"[CheckpointIntegration] promotion failed: {e}", flush=True)
 

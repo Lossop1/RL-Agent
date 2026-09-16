@@ -266,3 +266,86 @@ def test_archive_checkpoint_creates_directory(tmp_path: Path):
     # 验证目录已创建
     assert archive_dir.exists()
     assert Path(archived_path).exists()
+
+
+def test_backfill_reads_the_keys_real_telemetry_actually_has(tmp_path: Path):
+    """回填要按真遥测的键名取值，不能靠 .get(..., 默认值) 兜底。
+
+    2026-09-16 核过 hookreg_n4 的 train.telemetry.jsonl：
+      - reward 段没有 "mean"，总数叫 "total"
+      - health 段没有 "episode_length_mean"
+      - curriculum 段没有 "level"（级别叫 "dr_level"）
+      - curriculum["phase"] 是显示串 "phi0"，不是数字
+    原先这四行全部落空，回填出来的性能清一色是常数，
+    而 curator 的评分与质量门都压在这些数上。
+    """
+    import json
+
+    telemetry = tmp_path / "train.telemetry.jsonl"
+    records = [
+        {
+            "step": 200,
+            "reward": {"total": -3.5, "lin_err": 0.4},
+            "health": {"terminal_rate": 0.125},
+            "curriculum": {"phase": "phi0", "dr_level": 2},
+        },
+        {
+            "step": 400,
+            "reward": {"total": 1.75},
+            "health": {"terminal_rate": 0.0},
+            "curriculum": {"phase": "phi3", "dr_level": 3},
+        },
+    ]
+    telemetry.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+
+    registry = CheckpointRegistry()
+    inventory = [
+        {"path": str(tmp_path / "agent_200.pt"), "step": 200, "mtime": 100.0},
+        {"path": str(tmp_path / "agent_400.pt"), "step": 400, "mtime": 200.0},
+    ]
+
+    assert registry.backfill_from_telemetry(str(telemetry), inventory) == 2
+
+    first = registry.get_performance(str(tmp_path / "agent_200.pt"))
+    assert first is not None
+    assert first["reward_mean"] == -3.5           # 不是 0.0
+    assert first["terminal_rate"] == 0.125        # 不是 0.0
+    assert first["curriculum_phase"] == 0         # "phi0" 解析成 0
+    assert first["curriculum_level"] == 2         # dr_level，不是 0
+
+    second = registry.get_performance(str(tmp_path / "agent_400.pt"))
+    assert second is not None
+    assert second["reward_mean"] == 1.75
+    assert second["curriculum_phase"] == 3
+    assert second["checkpoint_mtime"] == 200.0
+
+
+def test_backfill_survives_a_phase_it_cannot_parse(tmp_path: Path):
+    """认不出的 phase 记 0，不要让整段回填崩掉。"""
+    import json
+
+    telemetry = tmp_path / "train.telemetry.jsonl"
+    telemetry.write_text(
+        json.dumps(
+            {
+                "step": 200,
+                "reward": {"total": 1.0},
+                "health": {"terminal_rate": 0.0},
+                "curriculum": {"phase": "unexpected_string"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry = CheckpointRegistry()
+    count = registry.backfill_from_telemetry(
+        str(telemetry), [{"path": str(tmp_path / "agent_200.pt"), "step": 200, "mtime": 1.0}]
+    )
+
+    assert count == 1
+    entry = registry.get_performance(str(tmp_path / "agent_200.pt"))
+    assert entry is not None
+    assert entry["curriculum_phase"] == 0

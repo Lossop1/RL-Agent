@@ -644,7 +644,12 @@ def apply_env_config_to_cfg(env_cfg: Any, data: Mapping[str, Any] | None = None)
             _set_if_present(env_cfg, attr, recipe, key)
         phases = recipe.get("phases")
         if isinstance(phases, Mapping):
-            setattr(env_cfg, "training_phase_commands", deepcopy(dict(phases)))
+            # 键一律转成字符串。YAML 里 phases 写的是不带引号的 0:/1:，解析出来是 int，
+            # 而 IsaacLab 0.36.21 的 cfg.validate() 会遍历 cfg 上的每个 dict 并对键做
+            # key.startswith("__")，整数键直接把环境构造打成 AttributeError。
+            # 读这张表的两处（taili_blind_config.phase_command_spec、taili_amp_env 的
+            # max_training_phase 推导）本来就走 int(key)，所以对它们是透明的。
+            setattr(env_cfg, "training_phase_commands", deepcopy({str(k): v for k, v in phases.items()}))
             parsed_phase_ids = []
             for key in phases:
                 try:

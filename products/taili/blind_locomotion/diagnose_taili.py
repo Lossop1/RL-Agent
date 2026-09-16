@@ -1014,7 +1014,11 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
     from isaaclab_tasks.utils import parse_env_cfg
     from skrl.utils.runner.torch import Runner
-    from autotuner.simulation.backend_factory import create_backend
+    try:
+        # 载荷内自带（taili_blind_runtime/taili_sim）：远端只有载荷在 PYTHONPATH 上。
+        from .taili_sim.backend_factory import create_backend  # type: ignore
+    except ImportError:  # 源码树兼容：工厂住在 autotuner/simulation/
+        from autotuner.simulation.backend_factory import create_backend
 
     import taili_blind_runtime  # noqa: F401 - register task and skrl policy component
 
@@ -1116,10 +1120,13 @@ def run_diagnostic(args) -> None:  # pragma: no cover - requires IsaacLab runtim
             if hasattr(env_cfg, "reset_strategy"):
                 env_cfg.reset_strategy = "start"
             _progress(out_dir, stage="gym_make", rows_written=rows_written, active_terrain=terrain_requested)
-            env = create_backend(args.task, env_cfg, backend_type="isaaclab")
+            backend = create_backend(args.task, env_cfg, backend_type="isaaclab")
             try:
                 _progress(out_dir, stage="skrl_wrapper", rows_written=rows_written, active_terrain=terrain_requested)
-                env = SkrlVecEnvWrapper(env, ml_framework="torch")
+                # skrl 的包装器要的是 IsaacLab 原生环境：它按 env.unwrapped 认类型，并把
+                # step/reset 直接发给传进来的那个对象。SimulatorBackend 适配器的 reset 只
+                # 返回观测、step 返回四元组，契约不同，所以把底层环境取出来交给它。
+                env = SkrlVecEnvWrapper(backend.unwrapped, ml_framework="torch")
                 base = env.unwrapped
                 if suppress_strict_reset and hasattr(base.cfg, "early_termination"):
                     base.cfg.early_termination = False

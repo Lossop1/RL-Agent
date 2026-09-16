@@ -461,7 +461,10 @@ def test_real_yaml_env_sections_reach_runtime_cfg():
     assert cfg.training_command_mode == recipe["command_mode"]
     assert cfg.touchdown_impact_only == recipe["touchdown_impact_only"]
     assert cfg.init_phase == recipe["init_phase"]
-    assert cfg.training_phase_commands == recipe["phases"]
+    # 挂到 cfg 上时阶段键被转成字符串：IsaacLab 0.36.21 的 cfg.validate() 会遍历 cfg 上的
+    # 每个 dict 并对键做 key.startswith("__")，整数键直接把环境构造打成 AttributeError。
+    # 值必须逐字未变，只有键的写法变了。
+    assert cfg.training_phase_commands == {str(k): v for k, v in recipe["phases"].items()}
 
 
 def test_real_yaml_reward_keys_are_known_reward_config_fields():

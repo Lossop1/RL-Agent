@@ -272,7 +272,11 @@ def main(argv: list[str] | None = None) -> None:
 
     from isaaclab_rl.skrl import SkrlVecEnvWrapper
     from isaaclab_tasks.utils import parse_env_cfg
-    from autotuner.simulation.backend_factory import create_backend
+    try:
+        # 载荷内自带（taili_blind_runtime/taili_sim）：远端只有载荷在 PYTHONPATH 上。
+        from .taili_sim.backend_factory import create_backend  # type: ignore
+    except ImportError:  # 源码树兼容：工厂住在 autotuner/simulation/
+        from autotuner.simulation.backend_factory import create_backend
 
     import taili_blind_runtime  # noqa: F401  # registers task + skrl policy components
 
@@ -305,8 +309,11 @@ def main(argv: list[str] | None = None) -> None:
         )
         write_manifest(runtime_path, runtime)
 
-    env = create_backend(args.task, env_cfg, backend_type="isaaclab")
-    env = SkrlVecEnvWrapper(env, ml_framework="torch")
+    backend = create_backend(args.task, env_cfg, backend_type="isaaclab")
+    # skrl 的包装器要的是 IsaacLab 原生环境：它按 env.unwrapped 认类型，并把 step/reset
+    # 直接发给传进来的那个对象。SimulatorBackend 适配器的 reset 只返回观测、step 返回
+    # 四元组，契约不同，所以把底层环境取出来交给它。
+    env = SkrlVecEnvWrapper(backend.unwrapped, ml_framework="torch")
 
     experiment_cfg.setdefault("trainer", {})["close_environment_at_exit"] = False
     runner = Runner(env, experiment_cfg)

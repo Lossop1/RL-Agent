@@ -20,7 +20,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-from autotuner.simulation.simulator_protocol import SimulatorBackend
+# 相对导入：这三个模块要能整体搬进训练载荷（taili_blind_runtime/taili_sim/）当包内模块用，
+# 写绝对路径的话搬过去就 import 不到了。
+from .simulator_protocol import SimulatorBackend
 
 # IsaacLab导入延迟到运行时，避免测试时必须安装IsaacLab
 try:
@@ -89,6 +91,18 @@ class IsaacLabAdapter:
     def device(self) -> torch.device:
         """张量所在设备。"""
         return self._env.device
+
+    @property
+    def unwrapped(self) -> Any:
+        """本适配器包着的那个底层环境。
+
+        名字沿用 gymnasium 的语义：去掉包装后的基础环境。IsaacLab 自带的 skrl 包装器
+        （isaaclab_rl.skrl.SkrlVecEnvWrapper）只认原生环境——它按 ``env.unwrapped`` 判类型，
+        并把 step/reset 直接发给传进来的那个对象；而本适配器的 reset 只返回观测、step 返回
+        四元组，与 skrl 期望的 ``(obs, info)`` / 五元组不同。所以走 skrl 的入口应当取
+        ``backend.unwrapped`` 交出去，而不是把适配器本身交进去。
+        """
+        return self._env
 
     def reset(
         self, env_ids: Optional[Sequence[int]] = None

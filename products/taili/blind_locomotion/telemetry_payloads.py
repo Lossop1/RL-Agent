@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping
 
@@ -510,6 +511,39 @@ def build_curriculum_payload(
             curriculum_payload["blocked_by"] = curriculum_payload.get("blocked_by", "fall")
             curriculum_payload["next_gate"] = curriculum_payload.get("next_gate", "fall_rate")
     return curriculum_payload
+
+
+def build_checkpoint_performance_snapshot(
+    *,
+    reward_payload: Mapping[str, Any],
+    health_payload: Mapping[str, Any],
+    phase: int | None,
+    episode_length_mean: float | None = None,
+) -> dict[str, Any]:
+    """构造检查点登记用的性能快照（P4.2 的 CheckpointRegistry 消费它）。
+
+    这里**刻意收数值 phase**，而不是从 ``build_curriculum_payload`` 的返回值里取。
+    那个 payload 的 ``phase`` 是给人看的显示串（``"phi0"``），解析它就是个陷阱：
+    2026-09-16 之前写的是 ``int(curriculum_payload.get("phase", 0))``，
+    于是训练**第一步**就抛 ``ValueError: invalid literal for int() with base 10: 'phi0'``
+    （``phase is None`` 时值是空串，同样抛）。两种表示各走各的路，显示串只用来显示。
+
+    键名同样是个陷阱，2026-09-16 对着真遥测核过：
+
+    - ``reward_payload`` 里没有 ``"mean"``，总数叫 **``"total"``**。
+      原先读 ``.get("mean", 0.0)`` 于是恒为 0.0——而 curator 的评分一半权重压
+      在 reward_mean 上、质量门也拿它比阈值，等于整条择优链路在看一个常数。
+    - ``health_payload`` 里没有 ``episode_length_mean``。它由调用方从环境的
+      ``episode_length_buf`` 现算传进来；拿不到时记 0.0 而不是 100.0——
+      100.0 会让 ``episode_length > 100`` 这类门看起来通过，是编数据。
+    """
+    return {
+        "reward_mean": float(reward_payload.get("total", 0.0)),
+        "terminal_rate": float(health_payload.get("terminal_rate", 0.0)),
+        "episode_length_mean": float(episode_length_mean) if episode_length_mean is not None else 0.0,
+        "curriculum_phase": int(phase) if phase is not None else 0,
+        "checkpoint_mtime": time.time(),
+    }
 
 
 def build_health_payload(

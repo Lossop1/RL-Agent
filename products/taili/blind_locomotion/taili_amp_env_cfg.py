@@ -411,7 +411,11 @@ class TailiAmpEnvCfg(DirectRLEnvCfg):
     height_scanner: RayCasterCfg = RayCasterCfg(
         prim_path="/World/envs/env_.*/Robot/base_link",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        ray_alignment="yaw",
+        # 旧版是 ray_alignment="yaw"。IsaacLab 0.36.21（Isaac Sim 4.5）把它换成了
+        # attach_yaw_only: bool，且是必填（MISSING）。语义等价，不是猜的：
+        # 该版本 rays 用 quat_apply_yaw 而不是全姿态，文档串写的也正是
+        # "only track the yaw orientation ... useful for ray-casting height maps"。
+        attach_yaw_only=True,
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(1.6, 1.0)),
         debug_vis=False, mesh_prim_paths=["/World/ground"],
     )

@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import torch
 
-from products.taili.blind_locomotion.telemetry_payloads import _command_bucket_masks, _lagging_progress
+from products.taili.blind_locomotion.telemetry_payloads import (
+    _command_bucket_masks,
+    _lagging_progress,
+    build_checkpoint_performance_snapshot,
+    build_curriculum_payload,
+    build_reward_payload,
+)
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -484,3 +490,136 @@ def test_emitter_receives_all_four_payloads():
     assert "curriculum=curriculum_payload" in source
     assert "health=health_payload" in source
     assert "command=command_payload" in source
+
+
+def _curriculum_payload(phase):
+    """用最小替身环境调一次 build_curriculum_payload，只看 phase 字段。"""
+    env = SimpleNamespace()
+    return build_curriculum_payload(
+        env=env,
+        phase=phase,
+        dr_level=0,
+        terrain_mean=None,
+        terrain_max=None,
+        terrain_stats={},
+        terrain_type_payload={},
+        progress_gate=None,
+        progress_by_dir={},
+        raw_progress_by_dir={},
+        active_dirs=(),
+        command_payload={},
+        gait_gate=None,
+        fall_rate=None,
+    )
+
+
+def test_curriculum_payload_phase_is_a_display_string():
+    """`curriculum_payload["phase"]` 是给人看的串，不是数值。
+
+    这条钉住的是**显示约定**；谁要拿 phase 做算术，得走数值那条路
+    （见 build_checkpoint_performance_snapshot）。
+    """
+    assert _curriculum_payload(0)["phase"] == "phi0"
+    assert _curriculum_payload(3)["phase"] == "phi3"
+
+
+def test_the_checkpoint_snapshot_uses_the_numeric_phase():
+    """P4.8 回归：快照收的是数值 phase，不解析显示串。
+
+    2026-09-16 之前 blind_tp_env 写的是
+    ``int(curriculum_payload.get("phase", 0))``，在**第一步**就抛
+    ``ValueError: invalid literal for int() with base 10: 'phi0'``
+    （phase 为 None 时值是空串，同样抛；默认值 0 只在键缺失时才生效）。
+    远端 smoke12 / ladder_n4 / ladder2_n4 全因此失败。
+    """
+    snapshot = build_checkpoint_performance_snapshot(
+        reward_payload={"total": 1.5},
+        health_payload={"terminal_rate": 0.25},
+        phase=3,
+        episode_length_mean=42.0,
+    )
+    assert snapshot["curriculum_phase"] == 3
+    assert isinstance(snapshot["curriculum_phase"], int)
+    assert snapshot["reward_mean"] == 1.5
+    assert snapshot["terminal_rate"] == 0.25
+    assert snapshot["episode_length_mean"] == 42.0
+
+
+def test_the_snapshot_reads_the_reward_key_the_builder_actually_emits():
+    """回归：reward_mean 取的是 reward payload 里的 "total"，不是 "mean"。
+
+    2026-09-16 之前读的是 ``reward_payload.get("mean", 0.0)``，而
+    ``build_reward_payload`` 从来不写 "mean" 这个键（总数叫 "total"）。
+    于是 reward_mean 恒为 0.0 —— 而 checkpoint_curator 的评分一半权重压在
+    它上面、质量门也拿它比阈值（>1.5 / >0.8 / >0.5），
+    等于整条择优链路在盯着一个常数看。真遥测核过：
+    hookreg_n4 的 train.telemetry.jsonl 里 reward 段无 "mean"、有 "total"。
+
+    这里直接拿真 builder 的返回值来对，不硬编码键名假设——
+    先前那条用例正是把假设写成了契约，才让这个 bug 一路绿灯。
+    """
+    reward_payload = build_reward_payload(
+        total=torch.tensor([2.0, 4.0]),
+        lin_err=0.1,
+        speed=0.3,
+        gait=0.5,
+        base_h=torch.tensor([0.4, 0.4]),
+        upright=0.9,
+        comp={},
+        terrain_probe={},
+        reward_cfg={},
+        include_reward_cfg=False,
+    )
+    assert "total" in reward_payload
+    assert "mean" not in reward_payload
+
+    snapshot = build_checkpoint_performance_snapshot(
+        reward_payload=reward_payload,
+        health_payload={"terminal_rate": 0.0},
+        phase=None,
+        episode_length_mean=0.0,
+    )
+    assert snapshot["reward_mean"] == 3.0
+
+
+def test_the_snapshot_never_invents_a_missing_episode_length():
+    """缺 episode_length_mean 时记 0.0，不能填一个能过门限的常数。
+
+    原先默认值是 100.0，而 curator 的质量门写的是 ``episode_length > 100``：
+    一个从不存在的字段会用"刚好过门"的假值把门骗开。
+    """
+    snapshot = build_checkpoint_performance_snapshot(
+        reward_payload={"total": 0.0},
+        health_payload={"terminal_rate": 0.0},
+        phase=None,
+    )
+    assert snapshot["episode_length_mean"] == 0.0
+
+
+def test_the_health_payload_has_no_episode_length_key():
+    """把"health 里没有 episode_length_mean"这件事钉住。
+
+    将来若真给 health payload 加了这个字段，这条会红，
+    提示调用点可以不再从 episode_length_buf 现算。
+    """
+    source = TELEMETRY_PAYLOADS.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "build_health_payload":
+            assert "episode_length_mean" not in _dict_literal_keys(node)
+            return
+    raise AssertionError("build_health_payload 不见了")
+
+
+def test_the_checkpoint_snapshot_defaults_to_zero_without_a_phase():
+    snapshot = build_checkpoint_performance_snapshot(
+        reward_payload={}, health_payload={}, phase=None
+    )
+    assert snapshot["curriculum_phase"] == 0
+
+
+def test_the_display_string_is_never_parsed_as_a_number():
+    """源码级护栏：不许再出现 int(curriculum_payload[...]) 这种解析。"""
+    source = BLIND_ENV.read_text(encoding="utf-8")
+    assert "int(curriculum_payload" not in source
+    assert "build_checkpoint_performance_snapshot(" in source

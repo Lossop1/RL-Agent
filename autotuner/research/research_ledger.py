@@ -763,7 +763,10 @@ class ResearchLedgerStore:
         actor: str = "resume-proof",
     ) -> LedgerEvent:
         """仅凭运行时回执升级 resume edge；无法证明时保持 partial。"""
-        from autotuner.execution.compatibility import evaluate_resume_proof
+        try:  # 载荷内：compatibility.py 被拍平成 resume_compatibility.py
+            from .resume_compatibility import evaluate_resume_proof
+        except ImportError:  # 源码树
+            from autotuner.execution.compatibility import evaluate_resume_proof
 
         def load(value: str | os.PathLike[str] | Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(value, Mapping):
